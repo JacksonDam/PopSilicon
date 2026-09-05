@@ -1,0 +1,85 @@
+#include <wctype.h>
+#include <fnmatch.h>
+#include <libkern/OSAtomic.h>
+static pthread_t pg_threads[256];
+static uint32_t pg_thread_count=2;
+static _Thread_local uint32_t pg_thread_id;
+struct pg_thread_start {uint32_t function,argument,identifier;};
+static void *pg_run_thread(void *opaque){struct pg_thread_start t=*(struct pg_thread_start *)opaque;free(opaque);pg_thread_id=t.identifier;return (void *)(uintptr_t)compat_runtime32_call(t.function,&t.argument,1);}
+static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
+{
+#define IS(s) (strcmp(n,s)==0)
+#define RET(x) do{*r=(uint64_t)(x);return 1;}while(0)
+    if(lp32_profile()->title!=LP32_TITLE_PEGGLE)return 0;
+    if(IS("_shm_open"))RET((uint32_t)shm_open((void *)(uintptr_t)a[0],a[1],0600));
+    if(IS("_shm_unlink"))RET((uint32_t)shm_unlink((void *)(uintptr_t)a[0]));
+    if(IS("_ftruncate"))RET((uint32_t)ftruncate(a[0],(uint64_t)a[1]|((uint64_t)a[2]<<32)));
+    if(IS("_fcntl"))RET((uint32_t)fcntl(a[0],a[1],a[2]));
+    if(IS("_close"))RET((uint32_t)close(a[0]));
+    if(IS("_mmap")) {
+        static uint32_t cursor=0x71000000;size_t len=(a[1]+4095)&~4095u;uint32_t addr=__atomic_fetch_add(&cursor,(uint32_t)len,__ATOMIC_RELAXED);
+        if(addr+len>0x7b000000)RET(UINT32_MAX);
+        void *p=mmap((void *)(uintptr_t)addr,len,a[2],a[3]|MAP_FIXED,a[4],(uint64_t)a[5]|((uint64_t)a[6]<<32));RET(p==MAP_FAILED?UINT32_MAX:(uint32_t)(uintptr_t)p);
+    }
+    if(IS("_munmap"))RET((uint32_t)munmap((void *)(uintptr_t)a[0],a[1]));
+    if(IS("_time")){int32_t t=(int32_t)time(NULL);if(a[0])*(int32_t *)(uintptr_t)a[0]=t;RET((uint32_t)t);}
+    if(IS("_localtime")){time_t t=*(int32_t *)(uintptr_t)a[0];struct tm tm;localtime_r(&t,&tm);uint32_t result=compat_runtime32_allocate(44,1);memcpy((void *)(uintptr_t)result,&tm,36);((int32_t *)(uintptr_t)result)[9]=(int32_t)tm.tm_gmtoff;((uint32_t *)(uintptr_t)result)[10]=compat_runtime32_copy_cstring(tm.tm_zone);RET(result);}
+    if(IS("_asctime")){struct tm tm={0};memcpy(&tm,(void *)(uintptr_t)a[0],36);RET(compat_runtime32_copy_cstring(asctime(&tm)));}
+    if(IS("_strtod")){char *end;double v=strtod((void *)(uintptr_t)a[0],&end);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET(return_guest_double(v));}
+    if(IS("_pthread_self")){if(!pg_thread_id){pg_thread_id=1;pg_threads[1]=pthread_self();}RET(pg_thread_id);}
+    if(IS("_pthread_create")){uint32_t i=__atomic_fetch_add(&pg_thread_count,1,__ATOMIC_RELAXED);if(i>=256)RET(EAGAIN);struct pg_thread_start *t=malloc(sizeof(*t));*t=(struct pg_thread_start){a[2],a[3],i};int e=pthread_create(&pg_threads[i],NULL,pg_run_thread,t);if(e)free(t);else if(a[0])*(uint32_t *)(uintptr_t)a[0]=i;RET(e);}
+    if(IS("_pthread_join")){if(a[0]>=256||!pg_threads[a[0]])RET(ESRCH);void *v;int e=pthread_join(pg_threads[a[0]],&v);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)v;RET(e);}
+    if(IS("_pthread_cancel"))RET(a[0]<256&&pg_threads[a[0]]?pthread_cancel(pg_threads[a[0]]):ESRCH);
+    if(IS("_pthread_getschedparam")){if(a[0]>=256||!pg_threads[a[0]])RET(ESRCH);RET(pthread_getschedparam(pg_threads[a[0]],(void *)(uintptr_t)a[1],(void *)(uintptr_t)a[2]));}
+    if(IS("_pthread_attr_setdetachstate"))RET(0);
+    if(IS("_sched_get_priority_max"))RET(sched_get_priority_max(a[0]));
+    if(IS("_sched_get_priority_min"))RET(sched_get_priority_min(a[0]));
+    if(IS("_floorf"))RET(return_guest_float(floorf(guest_float(a[0]))));
+    if(IS("_fmodf"))RET(return_guest_float(fmodf(guest_float(a[0]),guest_float(a[1]))));
+    if(IS("_strncasecmp"))RET((uint32_t)strncasecmp((void *)(uintptr_t)a[0],(void *)(uintptr_t)a[1],a[2]));
+    if(IS("_fnmatch"))RET(fnmatch((void *)(uintptr_t)a[0],(void *)(uintptr_t)a[1],a[2]));
+    if(IS("_getcwd"))RET(getcwd((void *)(uintptr_t)a[0],a[1])?a[0]:0);
+    if(IS("_getenv")){const char *v=getenv((void *)(uintptr_t)a[0]);RET(v?compat_runtime32_copy_cstring(v):0);}
+    if(IS("_fflush")){FILE *f=a[0]?lock_host_file_for_guest(a[0]):NULL;int e=fflush(f);if(a[0])unlock_host_file();RET((uint32_t)e);}
+    if(IS("_feof")||IS("_fgetc")||IS("_fgets")){uint32_t h=IS("_fgets")?a[2]:a[0];FILE *f=lock_host_file_for_guest(h);if(!f)RET(IS("_fgetc")?UINT32_MAX:0);uint32_t v=IS("_feof")?feof(f):IS("_fgetc")?(uint32_t)fgetc(f):(fgets((void *)(uintptr_t)a[0],a[1],f)?a[0]:0);unlock_host_file();RET(v);}
+    if(IS("_fputc")||IS("_ungetc")){FILE *f=lock_host_file_for_guest(a[1]);if(!f)RET(UINT32_MAX);int v=IS("_fputc")?fputc(a[0],f):ungetc(a[0],f);unlock_host_file();RET((uint32_t)v);}
+    if(IS("_setjmp")||IS("__setjmp")||IS("_sigsetjmp"))RET(0); /* longjmp escapes the guest instead */
+    if(IS("_getpid"))RET(getpid());
+    if(IS("_wcslen"))RET(wcslen((void *)(uintptr_t)a[0]));
+    if(IS("_wcstombs"))RET(wcstombs((void *)(uintptr_t)a[0],(void *)(uintptr_t)a[1],a[2]));
+    if(IS("_iswspace"))RET(iswspace(a[0]));
+    if(IS("_toupper"))RET(toupper(a[0]));
+    if(IS("_tolower"))RET(tolower(a[0]));
+    if(IS("_isspace"))RET(isspace(a[0]));
+    if(IS("_isalnum"))RET(isalnum(a[0]));
+    if(IS("_isxdigit"))RET(isxdigit(a[0]));
+    if(IS("_atoi"))RET(atoi((void *)(uintptr_t)a[0]));
+    if(IS("_srandom")){srandom(a[0]);RET(0);}
+    if(IS("_random"))RET(random());
+    if(IS("_rand"))RET(rand());
+    if(IS("_atan"))RET(return_guest_double(atan(guest_double(a))));
+    if(IS("_atan2"))RET(return_guest_double(atan2(guest_double(a),guest_double(a+2))));
+    if(IS("_cbrt"))RET(return_guest_double(cbrt(guest_double(a))));
+    if(IS("_rint"))RET(return_guest_double(rint(guest_double(a))));
+    if(IS("_exp"))RET(return_guest_double(exp(guest_double(a))));
+    if(IS("_lrint"))RET((uint32_t)lrint(guest_double(a)));
+    if(IS("_ldexp"))RET(return_guest_double(ldexp(guest_double(a),(int)a[2])));
+    if(IS("_frexp"))RET(return_guest_double(frexp(guest_double(a),(void *)(uintptr_t)a[2])));
+    if(IS("_acosf"))RET(return_guest_float(acosf(guest_float(a[0]))));
+    if(IS("_atan2f"))RET(return_guest_float(atan2f(guest_float(a[0]),guest_float(a[1]))));
+    if(IS("_rintf"))RET(return_guest_float(rintf(guest_float(a[0]))));
+    if(IS("_modff"))RET(return_guest_float(modff(guest_float(a[0]),(void *)(uintptr_t)a[1])));
+    if(IS("___udivdi3")){uint64_t x=(uint64_t)a[0]|((uint64_t)a[1]<<32),y=(uint64_t)a[2]|((uint64_t)a[3]<<32);RET(x/y);}
+    if(IS("___divdi3")){int64_t x=(uint64_t)a[0]|((uint64_t)a[1]<<32),y=(uint64_t)a[2]|((uint64_t)a[3]<<32);RET(x/y);}
+    if(IS("_IncrementAtomic"))RET(__atomic_fetch_add((int32_t *)(uintptr_t)a[0],1,__ATOMIC_SEQ_CST));
+    if(IS("_DecrementAtomic"))RET(__atomic_fetch_sub((int32_t *)(uintptr_t)a[0],1,__ATOMIC_SEQ_CST));
+    if(IS("_OSAtomicCompareAndSwap32Barrier")){int32_t expected=a[0];RET(__atomic_compare_exchange_n((int32_t *)(uintptr_t)a[2],&expected,a[1],false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST));}
+    if(IS("_OSAtomicOr32Barrier"))RET(__atomic_or_fetch((uint32_t *)(uintptr_t)a[1],a[0],__ATOMIC_SEQ_CST));
+    if(IS("_OSAtomicTestAndClearBarrier")){uint8_t *p=(void *)(uintptr_t)(a[1]+a[0]/8);uint8_t mask=0x80>>(a[0]%8);RET((__atomic_fetch_and(p,(uint8_t)~mask,__ATOMIC_SEQ_CST)&mask)!=0);}
+    if(IS("_OSSpinLockTry")){int32_t expected=0;RET(__atomic_compare_exchange_n((int32_t *)(uintptr_t)a[0],&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED));}
+    if(IS("_OSSpinLockUnlock")){__atomic_store_n((int32_t *)(uintptr_t)a[0],0,__ATOMIC_RELEASE);RET(0);}
+    if(IS("_pthread_mutexattr_destroy")||IS("_pthread_setcancelstate")||IS("_pthread_setcanceltype"))RET(0);
+    return 0;
+#undef RET
+#undef IS
+}
