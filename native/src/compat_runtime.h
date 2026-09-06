@@ -4,6 +4,7 @@
 #include "macho_loader.h"
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 void compat_runtime32_struct_return(void);
@@ -60,6 +61,8 @@ extern int compat_runtime32_frame_profile_enabled;
 void compat_runtime32_take_frame_profile(
     struct compat_runtime32_frame_profile *out);
 void compat_runtime32_report_import_profile(unsigned top);
+/* Top imports since the previous call (one frame); prints when `print`. */
+void compat_runtime32_frame_import_delta(bool print, unsigned top);
 
 /* Mode guards: how many times a thread arrived at a 64-bit pad still in
    i386 mode (to64) or at the i386 landing trampoline still in x86_64 mode

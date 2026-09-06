@@ -1425,6 +1425,7 @@ static uint64_t frame_pacer_choose_interval(double display_fps, uint64_t work_ns
 /* Called after flushBuffer.  Sleeps until the next presentation slot when
    the frame finished early.  The next slot is always one interval after the
    actual presentation, so a slow frame is never followed by a rushed one. */
+extern _Thread_local uint64_t lp32_pacer_wait_ns;
 static void frame_pacer_wait(NSWindow *window)
 {
     static uint64_t next_slot_ns;
@@ -1452,7 +1453,11 @@ static void frame_pacer_wait(NSWindow *window)
         if (!timebase.denom) mach_timebase_info(&timebase);
         uint64_t wait_ns = next_slot_ns - now_ns;
         uint64_t wait_ticks = wait_ns * timebase.denom / timebase.numer;
-        mach_wait_until(mach_absolute_time() + wait_ticks);
+        /* mach_wait_until returns early when a signal lands (a profiler's
+           SIGPROF, for instance); keep waiting until the slot. */
+        uint64_t deadline = mach_absolute_time() + wait_ticks;
+        while (mach_absolute_time() < deadline) mach_wait_until(deadline);
+        lp32_pacer_wait_ns += wait_ns;
         /* Schedule from the slot, not the wake-up time, so the few hundred
            microseconds the kernel oversleeps do not accumulate into a
            slower cadence. */
@@ -2232,6 +2237,27 @@ static void present_frame_with_stats(NSOpenGLContext *context,
         uint64_t frame_ns = now_ns - stats.last_swap_ns;
         uint64_t bridge_ns = profile.dispatch_ns > stats.last_flush_ns ?
             profile.dispatch_ns - stats.last_flush_ns : 0;
+        /* LP32_FRAME_STATS_SLOW=<ms>: dump the imports of any frame whose CPU
+           time (excluding the previous flush/pacer wait) exceeds the limit. */
+        static int64_t slow_frame_ns = -1;
+        if (slow_frame_ns < 0) {
+            const char *text = getenv("LP32_FRAME_STATS_SLOW");
+            slow_frame_ns = text && text[0] ? (int64_t)(strtod(text, NULL) * 1e6) : 0;
+        }
+        if (slow_frame_ns > 0) {
+            /* frame_ns already runs from the previous flush's end, so it is
+               the frame's CPU time (no flush or pacer wait inside). */
+            uint64_t cpu_ns = frame_ns;
+            bool slow = (int64_t)cpu_ns >= slow_frame_ns;
+            if (slow) {
+                fprintf(stderr,
+                        "compat32: slow frame t=%.3f swap=%llu cpu=%.2fms bridge=%.2fms imports=%llu\n",
+                        now_ns / 1e9, (unsigned long long)objc_bridge_swap_count,
+                        cpu_ns / 1e6, bridge_ns / 1e6,
+                        (unsigned long long)profile.calls);
+            }
+            compat_runtime32_frame_import_delta(slow, 14);
+        }
         ++stats.frames;
         stats.frame_ns_total += frame_ns;
         if (frame_ns > stats.frame_ns_max) stats.frame_ns_max = frame_ns;
@@ -2265,7 +2291,7 @@ static void present_frame_with_stats(NSOpenGLContext *context,
             struct audio_bridge32_worker_stats worker = {0};
             audio_bridge32_worker_statistics(&worker);
             fprintf(stderr,
-                    "compat32: frames swap=%llu n=%llu fps=%.1f "
+                    "compat32: frames t=%.3f swap=%llu n=%llu fps=%.1f "
                     "present(avg=%.2f max=%.2f) "
                     "frame(avg=%.2f max=%.2f ms >20ms=%llu >34ms=%llu) "
                     "sleep(avg=%.2f) "
@@ -2280,6 +2306,7 @@ static void present_frame_with_stats(NSOpenGLContext *context,
                     "audio-stream(silent=%llu gaps=%llu gap-frames=%llu "
                     "cb-max=%.2f backlog-max=%llu behind=%llu) "
                     "audio-hold(frames=%llu held=%.0fms renders=%llu)\n",
+                    now_ns / 1e9,
                     (unsigned long long)objc_bridge_swap_count,
                     (unsigned long long)stats.frames,
                     present_seconds > 0 ? frames / present_seconds : 0.0,
@@ -4759,6 +4786,13 @@ FAST_GL(glBindBuffer)
     return 0;
 }
 
+FAST_GL(glGetUniformLocation)
+{
+    (void)return_address;
+    return (uint32_t)glGetUniformLocation(arguments[0],
+                                          (const GLchar *)(uintptr_t)arguments[1]);
+}
+
 FAST_GL(glActiveTexture)
 {
     (void)return_address;
@@ -4927,6 +4961,12 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"glActiveTextureARB", fast_glActiveTexture},
         {"glClientActiveTexture", fast_glClientActiveTexture},
         {"glClientActiveTextureARB", fast_glClientActiveTexture},
+        /* Bejeweled 3 imports the underscore symbols directly (Peggle
+           resolves these by name at run time); each explosion frame issues
+           thousands of them. */
+        {"_glActiveTexture", fast_glActiveTexture},
+        {"_glClientActiveTexture", fast_glClientActiveTexture},
+        {"_glGetUniformLocation", fast_glGetUniformLocation},
         {"glBlendEquation", fast_glBlendEquation},
         {"glBlendEquationEXT", fast_glBlendEquation},
         {"glBlendFuncSeparate", fast_glBlendFuncSeparate},

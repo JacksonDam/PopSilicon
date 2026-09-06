@@ -68,6 +68,10 @@ enum {
     kImportThunkSize = 16,
     kDynamicThunksOffset = 0x5000,
     kDynamicThunkCapacity = 1792,
+    /* Native i386 stubs for hot trivial imports (native_stubs.s), bound
+       straight into the import thunks: the dynamic thunks end at 0xc000. */
+    kNativeStubsOffset = 0xc000,
+    kNativeStubsSize = 0x1000,
     kHost64PadsOffset = 0xd000,
     kReturn64Offset = kHost64PadsOffset + 0x000,
     kGateway64Offset = kHost64PadsOffset + 0x040,
@@ -1088,6 +1092,64 @@ static void start_code_churn_if_requested(void)
     }
 }
 
+#include "native_stubs.inc"
+
+/* Binds every import whose base name has a native stub to i386 code placed in
+   the bridge page, so the call never leaves compatibility mode.  Each stub is
+   a leaf with the same cdecl contract as the host handler it replaces.
+   LP32_NO_NATIVE_STUBS keeps the host path (A/B testing, diagnostics: the
+   frame statistics no longer see these calls once they are native). */
+static void bind_native_stubs(uint8_t *code)
+{
+    if (getenv("LP32_NO_NATIVE_STUBS")) return;
+    enum { kStubCount = sizeof(lp32_native_stubs) / sizeof(lp32_native_stubs[0]) };
+    const uint8_t *placed_code[kStubCount];
+    uint32_t placed_address[kStubCount];
+    unsigned placed = 0, bound = 0;
+    uint32_t cursor = kNativeStubsOffset;
+    for (unsigned index = 0; index < current_image->import_count; ++index) {
+        const struct macho_import32 *import = &current_image->imports[index];
+        if (import->kind != MACHO_IMPORT32_STUB) continue;
+        const char *dollar = strchr(import->name, '$');
+        size_t base_length = dollar ? (size_t)(dollar - import->name) : strlen(import->name);
+        const struct lp32_native_stub *stub = NULL;
+        for (unsigned candidate = 0; candidate < kStubCount; ++candidate) {
+            const char *name = lp32_native_stubs[candidate].import_name;
+            if (strlen(name) == base_length && memcmp(name, import->name, base_length) == 0) {
+                stub = &lp32_native_stubs[candidate];
+                break;
+            }
+        }
+        if (!stub) continue;
+        uint32_t address = 0;
+        for (unsigned slot = 0; slot < placed; ++slot) {
+            if (placed_code[slot] == stub->code) { address = placed_address[slot]; break; }
+        }
+        if (!address) {
+            if (cursor + stub->size > kNativeStubsOffset + kNativeStubsSize) {
+                fprintf(stderr, "compat32: native stub page full; %s stays bridged\n", import->name);
+                continue;
+            }
+            memcpy(code + cursor, stub->code, stub->size);
+            address = kBridgeCodeBase + cursor;
+            cursor += (uint32_t)((stub->size + 15) & ~(size_t)15);
+            placed_code[placed] = stub->code;
+            placed_address[placed] = address;
+            ++placed;
+        }
+        uint8_t *thunk = code + kImportThunksOffset + index * kImportThunkSize;
+        uint32_t thunk_address = kBridgeCodeBase + kImportThunksOffset + index * kImportThunkSize;
+        thunk[0] = 0xe9; /* jmp rel32 to the native stub */
+        emit_u32(thunk + 1, address - (thunk_address + 5));
+        memset(thunk + 5, 0xcc, kImportThunkSize - 5);
+        ++bound;
+    }
+    if (bound) {
+        fprintf(stderr, "compat32: bound %u imports to %u native i386 stubs (%u bytes)\n",
+                bound, placed, cursor - kNativeStubsOffset);
+    }
+}
+
 static int build_transition_bridge(void)
 {
     uint8_t *code = (void *)(uintptr_t)kBridgeCodeBase;
@@ -1176,6 +1238,7 @@ static int build_transition_bridge(void)
         thunk[6] = 0x2d;
         emit_u32(thunk + 7, kBridgeCodeBase + kGatewayFarPointerOffset);
     }
+    bind_native_stubs(code);
 
     uint32_t *data_cell = (void *)(uintptr_t)kBridgeDataBase;
     size_t data_cells = 0;
@@ -2638,6 +2701,9 @@ static uint8_t *import_stage_slot(uint32_t import_id)
  */
 int compat_runtime32_frame_profile_enabled;
 static _Thread_local struct compat_runtime32_frame_profile frame_profile;
+/* Time the bridge frame pacer deliberately slept inside the current import
+   (set by frame_pacer_wait); excluded from the slow-import report. */
+_Thread_local uint64_t lp32_pacer_wait_ns;
 
 static inline uint64_t profile_now(void)
 {
@@ -2993,15 +3059,70 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         slow_import_threshold_ns = text && text[0] ?
             (int64_t)(strtod(text, NULL) * 1e6) : 0;
     }
+    uint64_t paced = lp32_pacer_wait_ns;
+    lp32_pacer_wait_ns = 0;
+    if (elapsed > paced) elapsed -= paced; else elapsed = 0;
     if (slow_import_threshold_ns > 0 && (int64_t)elapsed >= slow_import_threshold_ns) {
         fprintf(stderr,
-                "compat32: slow import %s %.1fms on thread %#llx from 0x%08" PRIx32
+                "compat32: slow import t=%.3f %s %.1fms on thread %#llx from 0x%08" PRIx32
                 " args=%08x %08x %08x\n",
-                name, (double)elapsed / 1e6,
+                (double)start / 1e9, name, (double)elapsed / 1e6,
                 (unsigned long long)pthread_mach_thread_np(pthread_self()),
                 return_address, arguments[0], arguments[1], arguments[2]);
     }
     return result;
+}
+
+/* Per-frame view of the import profile: keeps a snapshot of the per-import
+   counters at the previous call and, when `print` is set, reports the top
+   entries by time accumulated since then (LP32_FRAME_STATS_SLOW: the imports
+   of one slow frame). */
+void compat_runtime32_frame_import_delta(bool print, unsigned top)
+{
+    static uint64_t *last_calls, *last_ns;
+    size_t static_count = current_image ? current_image->import_count : 0;
+    size_t total = static_count + kDynamicThunkCapacity;
+    if (!last_calls) {
+        last_calls = calloc(total, sizeof(*last_calls));
+        last_ns = calloc(total, sizeof(*last_ns));
+        if (!last_calls || !last_ns) return;
+    }
+    struct import_profile_entry *entries[2] = {
+        import_profile_table, dynamic_import_profile_table,
+    };
+    size_t counts[2] = {static_count, kDynamicThunkCapacity};
+    if (print) {
+        for (unsigned rank = 0; rank < top; ++rank) {
+            uint64_t best_ns = 0;
+            size_t best_table = 0, best_index = 0;
+            for (unsigned table = 0; table < 2; ++table) {
+                for (size_t index = 0; index < counts[table]; ++index) {
+                    size_t slot = table ? static_count + index : index;
+                    if (!entries[table]) continue;
+                    uint64_t delta = entries[table][index].ns - last_ns[slot];
+                    if (delta > best_ns) {
+                        best_ns = delta; best_table = table; best_index = index;
+                    }
+                }
+            }
+            if (!best_ns) break;
+            size_t slot = best_table ? static_count + best_index : best_index;
+            struct import_profile_entry *entry = &entries[best_table][best_index];
+            fprintf(stderr, "compat32:   slow-frame %-40s calls=%-7llu time=%6.2fms\n",
+                    entry->name ? entry->name : "?",
+                    (unsigned long long)(entry->calls - last_calls[slot]),
+                    (double)best_ns / 1e6);
+            last_ns[slot] = entry->ns; /* exclude from the next rank */
+        }
+    }
+    for (unsigned table = 0; table < 2; ++table) {
+        if (!entries[table]) continue;
+        for (size_t index = 0; index < counts[table]; ++index) {
+            size_t slot = table ? static_count + index : index;
+            last_calls[slot] = entries[table][index].calls;
+            last_ns[slot] = entries[table][index].ns;
+        }
+    }
 }
 
 void compat_runtime32_report_import_profile(unsigned top)
@@ -3125,6 +3246,104 @@ static uint64_t fast_memset(const uint32_t *arguments, uint32_t return_address)
     return arguments[0];
 }
 
+static uint64_t fast_pow(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_double(pow(guest_double(arguments), guest_double(arguments + 2)));
+}
+
+static uint64_t fast_atan2(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_double(atan2(guest_double(arguments), guest_double(arguments + 2)));
+}
+
+static uint64_t fast_fmod(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_double(fmod(guest_double(arguments), guest_double(arguments + 2)));
+}
+
+static uint64_t fast_powf(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_float(powf(guest_float(arguments[0]), guest_float(arguments[1])));
+}
+
+static uint64_t fast_atan2f(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_float(atan2f(guest_float(arguments[0]), guest_float(arguments[1])));
+}
+
+static uint64_t fast_fmodf(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_float(fmodf(guest_float(arguments[0]), guest_float(arguments[1])));
+}
+
+static uint64_t fast_tanf(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    return return_guest_float(tanf(guest_float(arguments[0])));
+}
+
+static uint64_t fast_malloc(const uint32_t *arguments, uint32_t return_address)
+{
+    return guest_allocate_at(arguments[0], false, return_address);
+}
+
+static uint64_t fast_calloc(const uint32_t *arguments, uint32_t return_address)
+{
+    uint64_t size = (uint64_t)arguments[0] * arguments[1];
+    return size <= SIZE_MAX ? guest_allocate_at((size_t)size, true, return_address) : 0;
+}
+
+static uint64_t fast_realloc(const uint32_t *arguments, uint32_t return_address)
+{
+    return guest_reallocate(arguments[0], arguments[1], return_address);
+}
+
+static uint64_t fast_free(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    guest_deallocate(arguments[0]);
+    return 0;
+}
+
+static uint64_t fast_mach_absolute_time(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)arguments;
+    (void)return_address;
+    return mach_absolute_time();
+}
+
+/* libgcc 64-bit division helpers: both operands are 64-bit stack values,
+   the result returns in edx:eax. */
+static uint64_t fast_udivdi3(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    uint64_t a = arguments[0] | ((uint64_t)arguments[1] << 32);
+    uint64_t b = arguments[2] | ((uint64_t)arguments[3] << 32);
+    return b ? a / b : 0;
+}
+
+static uint64_t fast_umoddi3(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    uint64_t a = arguments[0] | ((uint64_t)arguments[1] << 32);
+    uint64_t b = arguments[2] | ((uint64_t)arguments[3] << 32);
+    return b ? a % b : 0;
+}
+
+static uint64_t fast_divdi3(const uint32_t *arguments, uint32_t return_address)
+{
+    (void)return_address;
+    int64_t a = (int64_t)(arguments[0] | ((uint64_t)arguments[1] << 32));
+    int64_t b = (int64_t)(arguments[2] | ((uint64_t)arguments[3] << 32));
+    return b ? (uint64_t)(a / b) : 0;
+}
+
 static uint64_t fast_logf(const uint32_t *arguments, uint32_t return_address)
 {
     (void)return_address;
@@ -3197,6 +3416,25 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
         {"___memset_chk", fast_memset},
         {"_logf", fast_logf},
         {"_expf", fast_expf},
+        {"_pow", fast_pow},
+        {"_atan2", fast_atan2},
+        {"_fmod", fast_fmod},
+        {"_powf", fast_powf},
+        {"_atan2f", fast_atan2f},
+        {"_fmodf", fast_fmodf},
+        {"_tanf", fast_tanf},
+        {"_malloc", fast_malloc},
+        {"__Znwm", fast_malloc},
+        {"__Znam", fast_malloc},
+        {"_calloc", fast_calloc},
+        {"_realloc", fast_realloc},
+        {"_free", fast_free},
+        {"__ZdlPv", fast_free},
+        {"__ZdaPv", fast_free},
+        {"_mach_absolute_time", fast_mach_absolute_time},
+        {"___udivdi3", fast_udivdi3},
+        {"___umoddi3", fast_umoddi3},
+        {"___divdi3", fast_divdi3},
         {"_pthread_mutex_lock", fast_pthread_mutex_lock},
         {"_pthread_mutex_trylock", fast_pthread_mutex_trylock},
         {"_pthread_mutex_unlock", fast_pthread_mutex_unlock},
