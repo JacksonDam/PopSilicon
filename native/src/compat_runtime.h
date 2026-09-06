@@ -52,6 +52,9 @@ struct compat_runtime32_frame_profile {
     uint64_t objc_ns;
     uint64_t lock_wait_ns;
     uint64_t lock_waits;
+    /* Time inside the guest's own sleeping imports (usleep, nanosleep,
+       condition waits): the game's frame limiter, not bridge overhead. */
+    uint64_t sleep_ns;
 };
 extern int compat_runtime32_frame_profile_enabled;
 void compat_runtime32_take_frame_profile(

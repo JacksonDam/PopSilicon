@@ -2573,6 +2573,23 @@ static uint8_t dynamic_import_stage_table[kDynamicThunkCapacity];
 static lp32_fast_import_fn *fast_import_table;
 static lp32_fast_import_fn dynamic_fast_import_table[kDynamicThunkCapacity];
 static bool fast_imports_disabled;
+/* Imports that block on purpose (the game's frame limiter and worker waits);
+   LP32_FRAME_STATS reports their time as "sleep" rather than bridge time. */
+static uint8_t *import_sleep_table;
+static bool import_name_is_sleep(const char *name)
+{
+    static const char *const prefixes[] = {
+        "_usleep", "_nanosleep", "_sleep", "_select", "_sem_wait",
+        "_pthread_cond_wait", "_pthread_cond_timedwait", "_mach_wait_until",
+        "_MPWaitOnSemaphore", "_MPWaitOnQueue", "_pthread_join", "_poll",
+    };
+    for (size_t index = 0; index < sizeof(prefixes) / sizeof(prefixes[0]); ++index) {
+        size_t length = strlen(prefixes[index]);
+        if (strncmp(name, prefixes[index], length) == 0 &&
+            (name[length] == '\0' || name[length] == '$')) return true;
+    }
+    return false;
+}
 
 /* Per-import time accounting for LP32_FRAME_STATS (racy across threads by
    design; it is diagnostic only). */
@@ -2830,6 +2847,13 @@ int compat_runtime32_initialize(struct macho_image32 *image)
                                   sizeof(*import_profile_table));
     fast_import_table = calloc(image->import_count ? image->import_count : 1,
                                sizeof(*fast_import_table));
+    import_sleep_table = calloc(image->import_count ? image->import_count : 1,
+                                sizeof(*import_sleep_table));
+    if (import_sleep_table) {
+        for (uint32_t index = 0; index < image->import_count; ++index) {
+            import_sleep_table[index] = import_name_is_sleep(image->imports[index].name);
+        }
+    }
     fast_imports_disabled = getenv("LP32_NO_FAST_IMPORTS") != NULL;
     const char *reuse_text = getenv("LP32_GUEST_HEAP_REUSE");
     guest_heap_reuse = !(reuse_text && strcmp(reuse_text, "0") == 0);
@@ -2946,7 +2970,13 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         dispatch_import_chained(import_id, name, arguments, return_address,
                                 fast_slot);
     uint64_t elapsed = profile_now() - start;
-    frame_profile.dispatch_ns += elapsed;
+    if (import_sleep_table && (import_id & UINT32_C(0x80000000)) == 0 &&
+        current_image && import_id < current_image->import_count &&
+        import_sleep_table[import_id]) {
+        frame_profile.sleep_ns += elapsed;
+    } else {
+        frame_profile.dispatch_ns += elapsed;
+    }
     ++frame_profile.calls;
     struct import_profile_entry *entry = import_profile_slot(import_id);
     if (entry) {
@@ -4050,7 +4080,16 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             fprintf(stderr, "compat32: usleep(%" PRIu32 ") from 0x%08" PRIx32 "\n",
                     arguments[0], return_address);
         }
-        return (uint32_t)usleep(arguments[0]);
+        /* usleep(3) returns early on any signal; the guest ignores the
+           result, so an interrupted sleep would shorten its frame limiter.
+           Sleep the full request regardless. */
+        struct timespec request = {
+            (time_t)(arguments[0] / 1000000u),
+            (long)(arguments[0] % 1000000u) * 1000L,
+        };
+        while (nanosleep(&request, &request) != 0 && errno == EINTR) {
+        }
+        return 0;
     }
     if (import_is(name, "_OSAtomicAdd32") ||
         import_is(name, "_OSAtomicAdd32Barrier")) {

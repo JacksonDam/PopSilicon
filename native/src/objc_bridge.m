@@ -151,6 +151,8 @@ static char gl_program_dump_directory[PATH_MAX];
 
 static void arm_pending_gl_trace(void);
 static void trace_gl_frame_boundary(void);
+static void present_frame_with_stats(NSOpenGLContext *context,
+                                     NSWindow *window, bool pace);
 
 /*
  * Finder launches discard stderr.  Rendering diagnostics therefore need a
@@ -2181,9 +2183,19 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
         glPixelStorei(GL_PACK_ALIGNMENT, old_pack_alignment);
     }
     trace_gl_frame_boundary();
+    present_frame_with_stats([self openGLContext], [self window], true);
+}
+
+/* Presents one frame and keeps the frame-pacing statistics.  Shared by the
+   bridge's own OpenGLView and the guest's direct NSOpenGLContext flushBuffer
+   messages (Bejeweled 3 never goes through the bridge view).  `pace` runs the
+   bridge frame pacer after the flush. */
+static void present_frame_with_stats(NSOpenGLContext *context,
+                                     NSWindow *window, bool pace)
+{
     if (!compat_runtime32_frame_profile_enabled) {
-        [[self openGLContext] flushBuffer];
-        frame_pacer_wait([self window]);
+        [context flushBuffer];
+        if (pace) frame_pacer_wait(window);
         audio_bridge32_note_frame_presented();
         return;
     }
@@ -2202,6 +2214,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
         uint64_t calls_total, calls_max;
         uint64_t dispatch_ns_total, dispatch_ns_max;
         uint64_t audio_ns_total, audio_ns_max;
+        uint64_t sleep_ns_total;
         uint64_t objc_ns_total;
         uint64_t lock_wait_ns_total, lock_wait_ns_max, lock_waits_total;
         uint64_t last_flush_ns;
@@ -2229,6 +2242,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
         stats.dispatch_ns_total += bridge_ns;
         if (bridge_ns > stats.dispatch_ns_max) stats.dispatch_ns_max = bridge_ns;
         stats.audio_ns_total += profile.audio_ns;
+        stats.sleep_ns_total += profile.sleep_ns;
         if (profile.audio_ns > stats.audio_ns_max) stats.audio_ns_max = profile.audio_ns;
         stats.objc_ns_total += profile.objc_ns > stats.last_flush_ns ?
             profile.objc_ns - stats.last_flush_ns : 0;
@@ -2254,6 +2268,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
                     "compat32: frames swap=%llu n=%llu fps=%.1f "
                     "present(avg=%.2f max=%.2f) "
                     "frame(avg=%.2f max=%.2f ms >20ms=%llu >34ms=%llu) "
+                    "sleep(avg=%.2f) "
                     "flush(avg=%.2f max=%.2f) "
                     "imports(avg=%.0f max=%llu) "
                     "bridge(avg=%.2f max=%.2f objc=%.2f audio=%.2f audio-max=%.2f) "
@@ -2265,7 +2280,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
                     "audio-stream(silent=%llu gaps=%llu gap-frames=%llu "
                     "cb-max=%.2f backlog-max=%llu behind=%llu) "
                     "audio-hold(frames=%llu held=%.0fms renders=%llu)\n",
-                    (unsigned long long)swap_count,
+                    (unsigned long long)objc_bridge_swap_count,
                     (unsigned long long)stats.frames,
                     present_seconds > 0 ? frames / present_seconds : 0.0,
                     (double)stats.present_ns_total / frames / 1e6,
@@ -2274,6 +2289,7 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
                     (double)stats.frame_ns_max / 1e6,
                     (unsigned long long)stats.frames_over_20ms,
                     (unsigned long long)stats.frames_over_34ms,
+                    (double)stats.sleep_ns_total / frames / 1e6,
                     (double)stats.flush_ns_total / frames / 1e6,
                     (double)stats.flush_ns_max / 1e6,
                     (double)stats.calls_total / frames,
@@ -2339,8 +2355,8 @@ static NSOpenGLPixelFormat *legacy_pixel_format(void)
     /* The pacer wait is folded into "flush" so bridge time stays
        dispatch - flush. */
     uint64_t flush_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
-    [[self openGLContext] flushBuffer];
-    frame_pacer_wait([self window]);
+    [context flushBuffer];
+    if (pace) frame_pacer_wait(window);
     uint64_t flush_end = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     audio_bridge32_note_frame_presented();
     stats.last_flush_ns = flush_end - flush_start;
@@ -6883,6 +6899,49 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             fprintf(stderr, "compat32: objc swap=%llu %s receiver=%s\n",
                     (unsigned long long)objc_bridge_swap_count, selector_name,
                     receiver ? class_getName(object_getClass(receiver)) : "(none)");
+        }
+        /* Bejeweled 3 presents by messaging its NSOpenGLContext directly
+           rather than through the bridge's OpenGLView.  Route those messages
+           through the shared present path (frame statistics, the audio hold
+           clock, optional pacing) and apply the swap-interval policy the CGL
+           path already applies for Peggle. */
+        if (selector_name && receiver &&
+            [receiver isKindOfClass:[NSOpenGLContext class]]) {
+            NSOpenGLContext *gl_context = (NSOpenGLContext *)receiver;
+            if (strcmp(selector_name, "flushBuffer") == 0) {
+                /* Same policy as the bridge view: the game's swap-interval
+                   request was replaced by the bridge pacer (unless
+                   LP32_HONOR_SWAP_INTERVAL), which frame_pacer_wait honours.
+                   Bejeweled 3 then presents at 60 fps while its 100 Hz
+                   simulation runs several updates per draw, at half the CPU
+                   of an unpaced 100 fps loop. */
+                ++objc_bridge_swap_count;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+                NSWindow *gl_window = [[gl_context view] window];
+#pragma clang diagnostic pop
+                present_frame_with_stats(gl_context, gl_window, true);
+                *result = 0;
+                return 1;
+            }
+            if (strcmp(selector_name, "setValues:forParameter:") == 0) {
+                const GLint *values = (const GLint *)(uintptr_t)arguments[2];
+                NSOpenGLContextParameter parameter =
+                    (NSOpenGLContextParameter)(int32_t)arguments[3];
+                GLint override_value = 0;
+                if (parameter == NSOpenGLContextParameterSwapInterval && values &&
+                    frame_pacer_takes_over_swap_interval(*values)) {
+                    values = &override_value;
+                }
+                if (getenv("LP32_TRACE_DISPLAY")) {
+                    fprintf(stderr,
+                            "compat32: NSOpenGLContext setValues parameter=%d "
+                            "value=%d\n", (int)parameter, values ? *values : -1);
+                }
+                if (values) [gl_context setValues:values forParameter:parameter];
+                *result = 0;
+                return 1;
+            }
         }
         /* Unattended test runs must never take focus away from the user: the
            game activates itself and makes its window key at startup, so answer
