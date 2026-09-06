@@ -2,6 +2,12 @@
 #include <fnmatch.h>
 #include <libkern/OSAtomic.h>
 static pthread_t pg_threads[256];
+/* Synchronous emulation of POSIX AIO (Bejeweled 3 streams its pak with
+   aio_read): the read is performed immediately and its result remembered per
+   aiocb for aio_error/aio_return.  i386 struct aiocb (off_t is only 4-byte
+   aligned on i386, so it packs tightly after the fd): aio_fildes@0,
+   aio_offset (8 bytes)@4, aio_buf@12, aio_nbytes@16. */
+static struct { uint32_t cb; long res; } pg_aio[64];
 static uint32_t pg_thread_count=2;
 static _Thread_local uint32_t pg_thread_id;
 struct pg_thread_start {uint32_t function,argument,identifier;};
@@ -16,6 +22,16 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_ftruncate"))RET((uint32_t)ftruncate(a[0],(uint64_t)a[1]|((uint64_t)a[2]<<32)));
     if(IS("_fcntl"))RET((uint32_t)fcntl(a[0],a[1],a[2]));
     if(IS("_close"))RET((uint32_t)close(a[0]));
+    if(IS("_open")||IS("_open$UNIX2003"))RET((uint32_t)open((const char *)(uintptr_t)a[0],(int)a[1],(mode_t)a[2]));
+    if(IS("_read")||IS("_read$UNIX2003"))RET((uint32_t)read((int)a[0],(void *)(uintptr_t)a[1],a[2]));
+    if(IS("_write")||IS("_write$UNIX2003"))RET((uint32_t)write((int)a[0],(const void *)(uintptr_t)a[1],a[2]));
+    if(IS("_lseek")){off_t off=(off_t)((uint64_t)a[1]|((uint64_t)a[2]<<32));RET((uint64_t)lseek((int)a[0],off,(int)a[3]));}
+    if(IS("_pread")){off_t off=(off_t)((uint64_t)a[3]|((uint64_t)a[4]<<32));RET((uint32_t)pread((int)a[0],(void *)(uintptr_t)a[1],a[2],off));}
+    if(IS("_aio_read")||IS("_aio_write")){uint32_t cb=a[0];const uint8_t *p=(const void *)(uintptr_t)cb;int fd=*(const int *)(p+0);off_t off=(off_t)(*(const uint32_t *)(p+4)|((uint64_t)*(const uint32_t *)(p+8)<<32));uint32_t buf=*(const uint32_t *)(p+12);uint32_t nb=*(const uint32_t *)(p+16);long got=IS("_aio_read")?(long)pread(fd,(void *)(uintptr_t)buf,nb,off):(long)pwrite(fd,(const void *)(uintptr_t)buf,nb,off);int slot=-1;for(int i=0;i<64;i++)if(pg_aio[i].cb==cb){slot=i;break;}if(slot<0)for(int i=0;i<64;i++)if(!pg_aio[i].cb){slot=i;break;}if(slot>=0){pg_aio[slot].cb=cb;pg_aio[slot].res=got;}RET(0);}
+    if(IS("_aio_error"))RET(0); /* all reads complete synchronously */
+    if(IS("_aio_return")){uint32_t cb=a[0];long got=-1;for(int i=0;i<64;i++)if(pg_aio[i].cb==cb){got=pg_aio[i].res;pg_aio[i].cb=0;break;}RET((uint32_t)got);}
+    if(IS("_aio_suspend"))RET(0);
+    if(IS("_aio_cancel"))RET(2); /* AIO_ALLDONE */
     if(IS("_mmap")) {
         static uint32_t cursor=0x71000000;size_t len=(a[1]+4095)&~4095u;uint32_t addr=__atomic_fetch_add(&cursor,(uint32_t)len,__ATOMIC_RELAXED);
         if(addr+len>0x7b000000)RET(UINT32_MAX);
@@ -24,8 +40,36 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_munmap"))RET((uint32_t)munmap((void *)(uintptr_t)a[0],a[1]));
     if(IS("_time")){int32_t t=(int32_t)time(NULL);if(a[0])*(int32_t *)(uintptr_t)a[0]=t;RET((uint32_t)t);}
     if(IS("_localtime")){time_t t=*(int32_t *)(uintptr_t)a[0];struct tm tm;localtime_r(&t,&tm);uint32_t result=compat_runtime32_allocate(44,1);memcpy((void *)(uintptr_t)result,&tm,36);((int32_t *)(uintptr_t)result)[9]=(int32_t)tm.tm_gmtoff;((uint32_t *)(uintptr_t)result)[10]=compat_runtime32_copy_cstring(tm.tm_zone);RET(result);}
+    if(IS("_gmtime")){time_t t=*(int32_t *)(uintptr_t)a[0];struct tm tm;gmtime_r(&t,&tm);uint32_t result=compat_runtime32_allocate(44,1);memcpy((void *)(uintptr_t)result,&tm,36);((int32_t *)(uintptr_t)result)[9]=(int32_t)tm.tm_gmtoff;((uint32_t *)(uintptr_t)result)[10]=compat_runtime32_copy_cstring(tm.tm_zone);RET(result);}
+    if(IS("_gmtime_r")||IS("_localtime_r")){if(!a[1])RET(0);time_t t=*(int32_t *)(uintptr_t)a[0];struct tm tm;if(IS("_gmtime_r"))gmtime_r(&t,&tm);else localtime_r(&t,&tm);memcpy((void *)(uintptr_t)a[1],&tm,36);((int32_t *)(uintptr_t)a[1])[9]=(int32_t)tm.tm_gmtoff;((uint32_t *)(uintptr_t)a[1])[10]=compat_runtime32_copy_cstring(tm.tm_zone);RET(a[1]);}
     if(IS("_asctime")){struct tm tm={0};memcpy(&tm,(void *)(uintptr_t)a[0],36);RET(compat_runtime32_copy_cstring(asctime(&tm)));}
+    if(IS("_strftime")){struct tm tm={0};if(a[3]){memcpy(&tm,(void *)(uintptr_t)a[3],36);tm.tm_gmtoff=((int32_t *)(uintptr_t)a[3])[9];uint32_t z=((uint32_t *)(uintptr_t)a[3])[10];tm.tm_zone=z?(char *)(uintptr_t)z:(char *)"";}size_t n=strftime((char *)(uintptr_t)a[0],a[1],(const char *)(uintptr_t)a[2],&tm);RET((uint32_t)n);}
+    if(IS("_mktime")){struct tm tm={0};if(a[0]){memcpy(&tm,(void *)(uintptr_t)a[0],36);tm.tm_gmtoff=((int32_t *)(uintptr_t)a[0])[9];}RET((uint32_t)(int32_t)mktime(&tm));}
     if(IS("_strtod")){char *end;double v=strtod((void *)(uintptr_t)a[0],&end);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET(return_guest_double(v));}
+    if(IS("_strtol")){char *end;long v=strtol((const char *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint32_t)v);}
+    if(IS("_strtoul")){char *end;unsigned long v=strtoul((const char *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint32_t)v);}
+    if(IS("_strtoll")||IS("_strtoq")){char *end;long long v=strtoll((const char *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint64_t)v);}
+    if(IS("_strtoull")||IS("_strtouq")){char *end;unsigned long long v=strtoull((const char *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint64_t)v);}
+    if(IS("_atoll")||IS("_atoq"))RET((uint64_t)atoll((const char *)(uintptr_t)a[0]));
+    if(IS("_strcasecmp"))RET((uint32_t)strcasecmp((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
+    if(IS("_strncasecmp"))RET((uint32_t)strncasecmp((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]));
+    /* Wide-char string helpers: i386 and host wchar_t are both 4 bytes and
+       guest memory maps 1:1 in low address space, so host wcs* operate on the
+       guest pointers/values directly. */
+    if(IS("_wcslen"))RET((uint32_t)wcslen((const wchar_t *)(uintptr_t)a[0]));
+    if(IS("_wcschr"))RET((uint32_t)(uintptr_t)wcschr((const wchar_t *)(uintptr_t)a[0],(wchar_t)a[1]));
+    if(IS("_wcsrchr"))RET((uint32_t)(uintptr_t)wcsrchr((const wchar_t *)(uintptr_t)a[0],(wchar_t)a[1]));
+    if(IS("_wcscmp"))RET((uint32_t)wcscmp((const wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1]));
+    if(IS("_wcsncmp"))RET((uint32_t)wcsncmp((const wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1],a[2]));
+    if(IS("_wcscpy")){wcscpy((wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1]);RET(a[0]);}
+    if(IS("_wcsncpy")){wcsncpy((wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1],a[2]);RET(a[0]);}
+    if(IS("_wcscat")){wcscat((wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1]);RET(a[0]);}
+    if(IS("_wmemcpy")){wmemcpy((wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1],a[2]);RET(a[0]);}
+    if(IS("_wmemmove")){wmemmove((wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1],a[2]);RET(a[0]);}
+    if(IS("_wmemset")){wmemset((wchar_t *)(uintptr_t)a[0],(wchar_t)a[1],a[2]);RET(a[0]);}
+    if(IS("_wcstol")){wchar_t *end;long v=wcstol((const wchar_t *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint32_t)v);}
+    if(IS("_wcstoul")){wchar_t *end;unsigned long v=wcstoul((const wchar_t *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint32_t)v);}
+    if(IS("_wcstod")){wchar_t *end;double v=wcstod((const wchar_t *)(uintptr_t)a[0],&end);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET(return_guest_double(v));}
     if(IS("_pthread_self")){if(!pg_thread_id){pg_thread_id=1;pg_threads[1]=pthread_self();}RET(pg_thread_id);}
     if(IS("_pthread_create")){uint32_t i=__atomic_fetch_add(&pg_thread_count,1,__ATOMIC_RELAXED);if(i>=256)RET(EAGAIN);struct pg_thread_start *t=malloc(sizeof(*t));*t=(struct pg_thread_start){a[2],a[3],i};int e=pthread_create(&pg_threads[i],NULL,pg_run_thread,t);if(e)free(t);else if(a[0])*(uint32_t *)(uintptr_t)a[0]=i;RET(e);}
     if(IS("_pthread_join")){if(a[0]>=256||!pg_threads[a[0]])RET(ESRCH);void *v;int e=pthread_join(pg_threads[a[0]],&v);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)v;RET(e);}
@@ -47,6 +91,19 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_getpid"))RET(getpid());
     if(IS("_wcslen"))RET(wcslen((void *)(uintptr_t)a[0]));
     if(IS("_wcstombs"))RET(wcstombs((void *)(uintptr_t)a[0],(void *)(uintptr_t)a[1],a[2]));
+    if(IS("_mbstowcs")){
+        wchar_t *dst=(wchar_t *)(uintptr_t)a[0];
+        const unsigned char *src=(const void *)(uintptr_t)a[1];
+        size_t n=a[2];
+        if(!src)RET((uint32_t)-1);
+        size_t i=0;
+        /* Byte->wchar 1:1 (Latin-1), matching how the guest itself widens its
+           strings; avoids C-locale mbstowcs failing on extended bytes.  A NULL
+           destination requests only the length. */
+        if(dst){ for(;i<n && src[i];++i) dst[i]=(wchar_t)src[i]; if(i<n) dst[i]=0; }
+        else { while(src[i]) ++i; }
+        RET((uint32_t)i);
+    }
     if(IS("_iswspace"))RET(iswspace(a[0]));
     if(IS("_toupper"))RET(toupper(a[0]));
     if(IS("_tolower"))RET(tolower(a[0]));
@@ -89,6 +146,11 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_OSAtomicTestAndClearBarrier")){uint8_t *p=(void *)(uintptr_t)(a[1]+a[0]/8);uint8_t mask=0x80>>(a[0]%8);RET((__atomic_fetch_and(p,(uint8_t)~mask,__ATOMIC_SEQ_CST)&mask)!=0);}
     if(IS("_OSSpinLockTry")){int32_t expected=0;RET(__atomic_compare_exchange_n((int32_t *)(uintptr_t)a[0],&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED));}
     if(IS("_OSSpinLockUnlock")){__atomic_store_n((int32_t *)(uintptr_t)a[0],0,__ATOMIC_RELEASE);RET(0);}
+    if(IS("_OSSpinLockLock")){int32_t expected;do{expected=0;}while(!__atomic_compare_exchange_n((int32_t *)(uintptr_t)a[0],&expected,1,false,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED));RET(0);}
+    if(IS("_OSAtomicOr32Barrier"))RET(__atomic_or_fetch((uint32_t *)(uintptr_t)a[1],a[0],__ATOMIC_SEQ_CST));
+    if(IS("_OSAtomicAnd32Barrier"))RET(__atomic_and_fetch((uint32_t *)(uintptr_t)a[1],a[0],__ATOMIC_SEQ_CST));
+    if(IS("_OSAtomicTestAndClearBarrier")){uint32_t n=a[0];uint8_t *p=(uint8_t *)(uintptr_t)a[1];uint8_t mask=(uint8_t)(0x80>>(n&7));uint8_t old=__atomic_fetch_and(&p[n>>3],(uint8_t)~mask,__ATOMIC_SEQ_CST);RET((old&mask)!=0);}
+    if(IS("_OSAtomicTestAndSetBarrier")){uint32_t n=a[0];uint8_t *p=(uint8_t *)(uintptr_t)a[1];uint8_t mask=(uint8_t)(0x80>>(n&7));uint8_t old=__atomic_fetch_or(&p[n>>3],mask,__ATOMIC_SEQ_CST);RET((old&mask)!=0);}
     if(IS("_pthread_mutexattr_destroy")||IS("_pthread_setcancelstate")||IS("_pthread_setcanceltype"))RET(0);
     return 0;
 #undef RET

@@ -82,4 +82,10 @@ void compat_runtime32_set_diagnostic_sink(void (*sink)(const char *line));
 typedef uint64_t (*lp32_fast_import_fn)(const uint32_t *arguments,
                                         uint32_t return_address);
 
+/* Return a floating-point result to the guest (x87 st0), for bridges outside
+   compat_runtime.c (e.g. objc_msgSend_fpret).  Returns the eax:edx value the
+   import handler should return (0). */
+uint64_t compat_runtime32_return_double(double value);
+uint64_t compat_runtime32_return_float(float value);
+
 #endif

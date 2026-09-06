@@ -10,6 +10,13 @@ static int peggle_bass_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS(BASS_GetInfo))RET(BASS_GetInfo((void *)(uintptr_t)a[0]));
     if(IS(BASS_Free))RET(BASS_Free());
     if(IS(BASS_Stop))RET(BASS_Stop());
+    if(IS(BASS_Start))RET(BASS_Start());
+    if(IS(BASS_ChannelGetLength))RET(BASS_ChannelGetLength(a[0],a[1]));
+    /* BASS_ChannelSetSync needs a SYNCPROC callback that BASS invokes from its
+       own (host) thread; a guest function pointer cannot run there without a
+       trampoline.  Return a non-zero sync handle without registering one so
+       the game proceeds (loop/end syncs simply do not fire). */
+    if(IS(BASS_ChannelSetSync))RET(1);
     if(IS(BASS_StreamCreateFile))RET(BASS_StreamCreateFile(a[0],(void *)(uintptr_t)a[1],(uint64_t)a[2]|((uint64_t)a[3]<<32),(uint64_t)a[4]|((uint64_t)a[5]<<32),a[6]));
     if(IS(BASS_MusicLoad))RET(BASS_MusicLoad(a[0],(void *)(uintptr_t)a[1],(uint64_t)a[2]|((uint64_t)a[3]<<32),a[4],a[5],a[6]));
     if(IS(BASS_StreamFree))RET(BASS_StreamFree(a[0]));

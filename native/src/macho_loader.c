@@ -402,7 +402,22 @@ static int map_segments(const struct source_file *source,
         cursor += command->cmdsize;
     }
 
-    cursor = source->bytes + sizeof(*header);
+    image->header = (const void *)(uintptr_t)image->min_address;
+    return 0;
+}
+
+/*
+ * Apply each segment's final protection.  This runs AFTER collect_imports so
+ * that external relocations (which dyld applies in place, including text
+ * relocations that land in the read-only __TEXT segment — Bejeweled 3 has
+ * thousands) can be written while every segment is still writable.
+ */
+static int protect_segments(const struct source_file *source,
+                            struct macho_image32 *image)
+{
+    (void)image;
+    const struct mach_header *header = (const void *)source->bytes;
+    const uint8_t *cursor = source->bytes + sizeof(*header);
     for (uint32_t index = 0; index < header->ncmds; ++index) {
         const struct load_command *command = (const void *)cursor;
         if (command->cmd == LC_SEGMENT) {
@@ -415,8 +430,6 @@ static int map_segments(const struct source_file *source,
         }
         cursor += command->cmdsize;
     }
-
-    image->header = (const void *)(uintptr_t)image->min_address;
     return 0;
 }
 
@@ -432,7 +445,10 @@ int macho_image32_load(const char *path, struct macho_image32 *image)
     }
     if (result == 0) result = verify_address_hole(image->min_address, image->max_address);
     if (result == 0) result = map_segments(&source, image);
+    /* Relocations (incl. text relocations) are applied while every segment is
+       still writable; only then is each segment set to its final protection. */
     if (result == 0) result = collect_imports(image);
+    if (result == 0) result = protect_segments(&source, image);
 
     int saved_errno = errno;
     munmap((void *)source.bytes, source.size);

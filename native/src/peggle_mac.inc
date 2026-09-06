@@ -63,6 +63,8 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_CFStringGetTypeID")) RET(CFStringGetTypeID());
     if (IS("_CFDataGetTypeID")) RET(CFDataGetTypeID());
     if (IS("_CFNumberGetTypeID")) RET(CFNumberGetTypeID());
+    if (IS("_CFBooleanGetTypeID")) RET(CFBooleanGetTypeID());
+    if (IS("_CFURLCreateFromFileSystemRepresentation")) RET(pg_cf_register(CFURLCreateFromFileSystemRepresentation(NULL, P(1), a[2], a[3])));
     if (IS("_CFDataCreate")) RET(pg_cf_register(CFDataCreate(NULL, P(1), a[2])));
     if (IS("_CFDataGetLength")) RET([O(0) length]);
     if (IS("_CFDataGetBytes")) { [O(0) getBytes:P(3) range:NSMakeRange(a[1], a[2])]; RET(0); }
@@ -71,6 +73,14 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_CFPreferencesCopyAppValue")) RET(pg_cf_register(CFPreferencesCopyAppValue((CFStringRef)O(0), CFSTR("local.peggle.compat"))));
     if (IS("_CFPreferencesSetAppValue")) { CFPreferencesSetAppValue((CFStringRef)O(0), (CFTypeRef)O(1), CFSTR("local.peggle.compat")); RET(0); }
     if (IS("_CFPreferencesAppSynchronize")) RET(CFPreferencesAppSynchronize(CFSTR("local.peggle.compat")));
+    /* Bejeweled 3 uses the lower-level CFPreferences API (with explicit
+       user/host domains) rather than Peggle's App* helpers.  Pin every call
+       to the same private application domain so all three games share one
+       isolated preferences store. */
+    if (IS("_CFPreferencesCopyKeyList")) RET(pg_cf_register(CFPreferencesCopyKeyList(CFSTR("local.peggle.compat"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost)));
+    if (IS("_CFPreferencesCopyValue")) RET(pg_cf_register(CFPreferencesCopyValue((CFStringRef)O(0), CFSTR("local.peggle.compat"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost)));
+    if (IS("_CFPreferencesSetValue")) { CFPreferencesSetValue((CFStringRef)O(0), (CFTypeRef)O(1), CFSTR("local.peggle.compat"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost); RET(0); }
+    if (IS("_CFPreferencesSynchronize")) RET(CFPreferencesSynchronize(CFSTR("local.peggle.compat"), kCFPreferencesCurrentUser, kCFPreferencesAnyHost));
     if (IS("_CFLocaleCopyCurrent")) RET(pg_cf_register(CFLocaleCopyCurrent()));
     if (IS("_CFNumberFormatterCreate")) RET(pg_cf_register(CFNumberFormatterCreate(NULL, (CFLocaleRef)O(1), a[2])));
     if (IS("_CFNumberFormatterCreateStringWithValue")) RET(pg_cf_register(CFNumberFormatterCreateStringWithValue(NULL, (CFNumberFormatterRef)O(1), a[2], P(3))));

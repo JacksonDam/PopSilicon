@@ -33,6 +33,28 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         while (first!=last) { first-=4; *(uint32_t *)(uintptr_t)dst=*(uint32_t *)(uintptr_t)first; dst+=4; }
         PG_RETURN(dst);
     }
+    /* std::__detail::_List_node_base::transfer(first, last): splice the guest
+       list nodes [first, last) in front of `this`.  Node layout on i386 is
+       { _M_next @0; _M_prev @4 }; replicate libstdc++'s pointer surgery on the
+       guest's own nodes (all pointers are guest 32-bit addresses). */
+    if (strcmp(name,"__ZNSt15_List_node_base8transferEPS_S0_")==0 ||
+        strcmp(name,"__ZNSt8__detail15_List_node_base9_M_transferEPS0_S1_")==0) {
+        uint32_t self=a[0], first=a[1], last=a[2];
+        if (self!=last) {
+#define PG_LNEXT(n) (*(uint32_t *)(uintptr_t)((n)+0))
+#define PG_LPREV(n) (*(uint32_t *)(uintptr_t)((n)+4))
+            PG_LNEXT(PG_LPREV(last))  = self;
+            PG_LNEXT(PG_LPREV(first)) = last;
+            PG_LNEXT(PG_LPREV(self))  = first;
+            uint32_t tmp = PG_LPREV(self);
+            PG_LPREV(self)  = PG_LPREV(last);
+            PG_LPREV(last)  = PG_LPREV(first);
+            PG_LPREV(first) = tmp;
+#undef PG_LNEXT
+#undef PG_LPREV
+        }
+        PG_RETURN(0);
+    }
     if (peggle_tree_dispatch(name, a, out)) return 1;
     if (peggle_cxx_dispatch(name, a, out)) return 1;
     if (strncmp(name,"__ZNSaI",7)==0) PG_RETURN(0); /* empty allocator */
@@ -44,7 +66,19 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
     if (strcmp(name,"__ZSt9use_facetISt8numpunctIcEERKT_RKSt6locale")==0) {
         static uint32_t facet; if(!facet){facet=compat_runtime32_allocate(64,1);uint32_t v=compat_runtime32_allocate(64,1);*(uint32_t *)(uintptr_t)facet=v;for(int i=0;i<16;i++)((uint32_t *)(uintptr_t)v)[i]=compat_runtime32_guest_callback("_pg_decimal_point");} PG_RETURN(facet);
     }
+    /* numpunct<wchar_t> (Bejeweled 3): same fake facet; L'.' is also 0x2e. */
+    if (strcmp(name,"__ZSt9use_facetISt8numpunctIwEERKT_RKSt6locale")==0) {
+        static uint32_t wfacet; if(!wfacet){wfacet=compat_runtime32_allocate(64,1);uint32_t v=compat_runtime32_allocate(64,1);*(uint32_t *)(uintptr_t)wfacet=v;for(int i=0;i<16;i++)((uint32_t *)(uintptr_t)v)[i]=compat_runtime32_guest_callback("_pg_decimal_point");} PG_RETURN(wfacet);
+    }
     if (strcmp(name,"_pg_decimal_point")==0) PG_RETURN('.');
+    /* ctype<char>/ctype<wchar_t> (Bejeweled 3 number/string streams).  A crude
+       facet whose every vtable slot is an identity callback: widen(c)->c,
+       narrow(c,dflt)->c, toupper/tolower->c.  Enough for ASCII stream I/O. */
+    if (strcmp(name,"__ZSt9use_facetISt5ctypeIcEERKT_RKSt6locale")==0 ||
+        strcmp(name,"__ZSt9use_facetISt5ctypeIwEERKT_RKSt6locale")==0) {
+        static uint32_t cfacet; if(!cfacet){cfacet=compat_runtime32_allocate(64,1);uint32_t v=compat_runtime32_allocate(64,1);*(uint32_t *)(uintptr_t)cfacet=v;for(int i=0;i<16;i++)((uint32_t *)(uintptr_t)v)[i]=compat_runtime32_guest_callback("_pg_ctype_identity");} PG_RETURN(cfacet);
+    }
+    if (strcmp(name,"_pg_ctype_identity")==0) PG_RETURN(a[0]);
     if (strstr(name,"basic_stringstream") || strstr(name,"basic_ostringstream") || strstr(name,"basic_stringbuf")) {
         bool init = strstr(name,"C1E") != NULL, destroy = strstr(name,"D1E") != NULL;
         bool stringbuf = strstr(name,"basic_stringbuf") != NULL;
@@ -55,11 +89,27 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         if(slot<0 && stringbuf) return 0;
         if(destroy){if(slot>=0){guest_string_dispose_object(pg_streams[slot].text);compat_runtime32_deallocate(pg_streams[slot].text);pg_streams[slot].obj=0;}PG_RETURN(0);}
         if(strstr(name,"3strEv")){compat_runtime32_struct_return();PG_RETURN(pg_string_set(a[0],slot>=0?guest_string_data(pg_streams[slot].text):"",slot>=0?guest_string_length(pg_streams[slot].text):0,1,true));}
+        /* str(const string&) setter: this is a[0], the replacement string a[1]. */
+        if(strstr(name,"3strERK")){int s2=-1;for(int i=0;i<64;i++)if(pg_streams[i].obj && a[0]>=pg_streams[i].obj && a[0]<pg_streams[i].obj+32){s2=i;break;}if(s2>=0)pg_string_set(pg_streams[s2].text,guest_string_data(a[1]),guest_string_length(a[1]),1,false);PG_RETURN(0);}
     }
     if (strcmp(name,"__ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc")==0 || strcmp(name,"__ZNSolsEi")==0) {
         char number[64];const char *value=(void *)(uintptr_t)a[1];if(strcmp(name,"__ZNSolsEi")==0){snprintf(number,sizeof(number),"%d",(int)a[1]);value=number;}
         for(int i=0;i<64;i++)if(pg_streams[i].obj && a[0]>=pg_streams[i].obj && a[0]<pg_streams[i].obj+32){uint32_t obj=pg_streams[i].text;size_t n=guest_string_length(obj),v=strlen(value);char *b=malloc(n+v+1);memcpy(b,guest_string_data(obj),n);memcpy(b+n,value,v+1);pg_string_set(obj,b,n+v,1,false);free(b);PG_RETURN(a[0]);}
         fputs(value,stdout);PG_RETURN(a[0]);
+    }
+    /* operator<<(ostream&, const std::string&): append the guest string's bytes
+       (which may contain NULs) to the stream buffer. */
+    if (strcmp(name,"__ZStlsIcSt11char_traitsIcESaIcEERSt13basic_ostreamIT_T0_ES7_RKSbIS4_S5_T1_E")==0) {
+        const char *value=guest_string_data(a[1]);size_t v=guest_string_length(a[1]);
+        for(int i=0;i<64;i++)if(pg_streams[i].obj && a[0]>=pg_streams[i].obj && a[0]<pg_streams[i].obj+32){uint32_t obj=pg_streams[i].text;size_t n=guest_string_length(obj);char *b=malloc(n+v);memcpy(b,guest_string_data(obj),n);memcpy(b+n,value,v);pg_string_set(obj,b,n+v,1,false);free(b);PG_RETURN(a[0]);}
+        if(value)fwrite(value,1,v,stdout);PG_RETURN(a[0]);
+    }
+    /* operator<<(ostream&, manipulator): std::endl/std::flush.  Treat as endl
+       (append a newline); std::flush would add nothing but is rare on the
+       string streams the game builds. */
+    if (strcmp(name,"__ZNSolsEPFRSoS_E")==0) {
+        for(int i=0;i<64;i++)if(pg_streams[i].obj && a[0]>=pg_streams[i].obj && a[0]<pg_streams[i].obj+32){uint32_t obj=pg_streams[i].text;size_t n=guest_string_length(obj);char *b=malloc(n+1);memcpy(b,guest_string_data(obj),n);b[n]='\n';pg_string_set(obj,b,n+1,1,false);free(b);PG_RETURN(a[0]);}
+        PG_RETURN(a[0]);
     }
     bool wide = strstr(name,"SbIwSt11char_traitsIwESaIwEE") != NULL;
     bool str = wide || strncmp(name,"__ZNSs",6)==0 || strncmp(name,"__ZNKSs",7)==0;
@@ -72,6 +122,15 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         if (strncmp(op,"C1EPK",5)==0) {const void *s=(void *)(uintptr_t)a[1];PG_RETURN(pg_string_set(obj,s,wide?wcslen(s):strlen(s),w,true));}
         if (strncmp(op,"C1ERK",5)==0) PG_RETURN(pg_string_set(obj,guest_string_data(a[1]),guest_string_length(a[1]),w,true));
         if (strcmp(op,"C1EmcRKSaIcE")==0) {char *s=malloc(a[1]);memset(s,a[2],a[1]);pg_string_set(obj,s,a[1],1,true);free(s);PG_RETURN(obj);}
+        /* Wide fill ctor: basic_string(size_type n, wchar_t c, allocator) --
+           n copies of the wide character c (Bejeweled 3's keyDown: builds a
+           one-character wstring from the typed key). */
+        if (strcmp(op,"C1EmwRKS1_")==0 || strcmp(op,"C2EmwRKS1_")==0) {
+            size_t len=a[1]; uint32_t ch=a[2];
+            char *s=malloc((len+1)*w);
+            for(size_t i=0;i<len;i++) memcpy(s+i*w,&ch,w);
+            pg_string_set(obj,s,len,w,true); free(s); PG_RETURN(obj);
+        }
         if (strcmp(op,"6substrEmm")==0) { /* nontrivial class result: hidden output precedes this */
             compat_runtime32_struct_return();const char *src=guest_string_data(a[1]);size_t len_src=guest_string_length(a[1]);size_t pos=a[2]<len_src?a[2]:len_src,len=a[3]<len_src-pos?a[3]:len_src-pos;PG_RETURN(pg_string_set(a[0],src+pos*w,len,w,true));
         }

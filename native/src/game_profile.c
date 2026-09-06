@@ -31,6 +31,23 @@ static const struct lp32_game_profile peggle_nights_profile = {
     .main_address = 0,
 };
 
+/* Bejeweled 3 1.1.12.4196 (PopCap, 2010; original i386 Mac executable).  Same
+   "Sexy" engine, newer/larger; the Steam copy is not Valve-DRM-wrapped but
+   links libsteam_api.dylib (SteamAPI shims live in the runtime).  main is
+   derived from the crt start stub. */
+static const struct lp32_game_profile bejeweled3_profile = {
+    .title = LP32_TITLE_BEJEWELED3,
+    .name = "Bejeweled3",
+    .display_name = "Bejeweled 3",
+    .log_directory = "Bejeweled3",
+    .image_file = "Bejeweled3.image",
+    .entry_eip = 0x000020e0,
+    .image_end = 0x00b427c4,
+    /* The crt stub calls main directly (call main; mov [esp],eax; call exit;
+       hlt), which the generic derivation doesn't recognise, so pin it. */
+    .main_address = 0x00194a10,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -43,6 +60,7 @@ static const struct lp32_game_profile unknown_profile = {
 static const struct lp32_game_profile *const known_profiles[] = {
     &peggle_profile,
     &peggle_nights_profile,
+    &bejeweled3_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -67,6 +85,8 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
         strcasecmp(name, "Peggle Deluxe") == 0) return &peggle_profile;
     if (strcasecmp(name, "PeggleNights") == 0 ||
         strcasecmp(name, "Peggle Nights") == 0) return &peggle_nights_profile;
+    if (strcasecmp(name, "Bejeweled3") == 0 ||
+        strcasecmp(name, "Bejeweled 3") == 0) return &bejeweled3_profile;
     return NULL;
 }
 

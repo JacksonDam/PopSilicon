@@ -5,11 +5,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define MACHO_IMAGE32_MAX_IMPORTS 1024
+/* Sized for the largest supported title: Bejeweled 3 has ~3.7k indirect
+   symbols and thousands of external relocations against undefined symbols
+   (many references share a symbol), well beyond Peggle's counts. */
+#define MACHO_IMAGE32_MAX_IMPORTS 4096
 /* External relocations against undefined symbols (vtable slots holding
    ___cxa_pure_virtual, CF constant-string isa pointers, RTTI vtables); the
    runtime supplies their values once its thunk table exists. */
-#define MACHO_IMAGE32_MAX_RELOCATIONS 512
+#define MACHO_IMAGE32_MAX_RELOCATIONS 8192
 
 enum macho_import32_kind {
     MACHO_IMPORT32_POINTER,

@@ -47,7 +47,17 @@ struct Game: Identifiable, Hashable {
         imageFileName: "PeggleNights.image"
     )
 
-    static let all: [Game] = [.deluxe, .nights]
+    static let bejeweled3 = Game(
+        id: "com.popcap.Bejeweled3",
+        displayName: "Bejeweled 3",
+        steamFolder: "Bejeweled 3",
+        steamAppName: "Bejeweled 3.app",
+        executableName: "Bejeweled3",
+        outputAppName: "Bejeweled3.app",
+        imageFileName: "Bejeweled3.image"
+    )
+
+    static let all: [Game] = [.deluxe, .nights, .bejeweled3]
 
     /// The game whose original bundle identifier matches this dropped app.
     static func matching(bundleIdentifier: String?) -> Game? {

@@ -11,7 +11,9 @@
 #import <Carbon/Carbon.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
+#import <OpenGL/glext.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <malloc/malloc.h>
 
 #include <dlfcn.h>
@@ -70,8 +72,62 @@ static NSEvent *current_proxy_event;
 static bool logged_proxy_exhaustion;
 static uint64_t objc_bridge_swap_count;
 
+/*
+ * O(1) object -> proxy-index map (open addressing, append-only).  The
+ * persistent proxy pool can fill with long-lived objects (e.g. a title that
+ * hands out thousands of NSNotification objects during load), after which a
+ * linear scan of all kProxyCapacity entries ran on every bridge call and
+ * showed up as steady per-frame CPU.  Keyed by the host object pointer; each
+ * slot stores index+1 (0 = empty).  Never deletes, so a present key is always
+ * reached before an empty slot; register_proxy_with_handle's in-place edits
+ * only add keys (stale ones are rejected by the proxies[] re-check).
+ */
+enum { kProxyHashSize = 1u << 13, kProxyHashMask = kProxyHashSize - 1 };
+static uint32_t proxy_object_hash[kProxyHashSize];
+
+static inline uint32_t proxy_hash_pointer(const void *pointer)
+{
+    uintptr_t value = (uintptr_t)pointer >> 4;
+    return (uint32_t)((value * 2654435761u) & kProxyHashMask);
+}
+
+static void proxy_object_hash_insert(uint32_t index)
+{
+    uint32_t slot = proxy_hash_pointer((const void *)proxies[index].object);
+    for (uint32_t probe = 0; probe < kProxyHashSize; ++probe) {
+        if (proxy_object_hash[slot] == 0) {
+            proxy_object_hash[slot] = index + 1;
+            return;
+        }
+        slot = (slot + 1) & kProxyHashMask;
+    }
+    /* Table saturated: leave it; proxy_for_object falls back to appending. */
+}
+
+static int32_t proxy_object_hash_find(id object)
+{
+    uint32_t slot = proxy_hash_pointer((const void *)object);
+    for (uint32_t probe = 0; probe < kProxyHashSize; ++probe) {
+        uint32_t stored = proxy_object_hash[slot];
+        if (stored == 0) return -1;
+        if (proxies[stored - 1].object == object) return (int32_t)(stored - 1);
+        slot = (slot + 1) & kProxyHashMask;
+    }
+    return -1;
+}
+
 /* Section ranges of the loaded guest image (class-name refs, CF constants). */
 #define bridge_image (compat_runtime32_image())
+
+/* Guest-defined Objective-C class synthesis (objc_guest_class.inc, included
+   below).  Forward-declared so object_for_receiver / proxy_for_object can map
+   a synthesized instance's guest block to and from its host companion. */
+id guest_companion_for_block(uint32_t block);
+uint32_t guest_block_for_companion(id obj);
+static bool guest_objc_msgsend(const uint32_t *arguments, uint32_t avail, uint64_t *out);
+static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint32_t avail, uint64_t *out);
+bool guest_objc_super_init(uint32_t receiver, const char *selector,
+                           const uint32_t *init_args, uint64_t *out);
 static GLuint trace_vertex_program;
 static GLuint trace_fragment_program;
 
@@ -452,12 +508,15 @@ static uint32_t event_proxy_for_object(id object)
 static uint32_t proxy_for_object(id object)
 {
     if (!object) return 0;
+    /* A synthesized guest-class companion maps back to its guest block so the
+       guest keeps a single stable identity for the object. */
+    uint32_t guest_block = guest_block_for_companion(object);
+    if (guest_block) return guest_block;
     if ([object isKindOfClass:[NSEvent class]]) {
         return event_proxy_for_object(object);
     }
-    for (uint32_t index = 0; index < proxy_count; ++index) {
-        if (proxies[index].object == object) return proxies[index].handle;
-    }
+    int32_t existing = proxy_object_hash_find(object);
+    if (existing >= 0) return proxies[existing].handle;
     if (proxy_count >= kProxyCapacity) {
         if (!logged_proxy_exhaustion) {
             fprintf(stderr,
@@ -473,6 +532,7 @@ static uint32_t proxy_for_object(id object)
     proxies[proxy_count].handle = handle;
     proxies[proxy_count].object = object;
     if (proxy_object_is_retained(object)) [object retain];
+    proxy_object_hash_insert(proxy_count);
     ++proxy_count;
     return handle;
 }
@@ -585,6 +645,7 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
         if (proxies[index].object == object || proxies[index].handle == handle) {
             proxies[index].object = object;
             proxies[index].handle = handle;
+            proxy_object_hash_insert(index);
             return handle;
         }
     }
@@ -600,6 +661,7 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
     proxies[proxy_count].handle = handle;
     proxies[proxy_count].object = object;
     if (proxy_object_is_retained(object)) [object retain];
+    proxy_object_hash_insert(proxy_count);
     ++proxy_count;
     return handle;
 }
@@ -607,14 +669,30 @@ static uint32_t register_proxy_with_handle(id object, uint32_t handle)
 static id object_for_receiver(uint32_t receiver)
 {
     if (!receiver) return nil;
+    /* A synthesized guest-class instance resolves to its host companion so
+       host Cocoa and inherited-method dispatch see a real host object. */
+    id companion = guest_companion_for_block(receiver);
+    if (companion) return companion;
     for (uint32_t index = 0; index < event_proxy_count; ++index) {
         if (event_proxies[index].handle == receiver) {
             return event_proxies[index].object;
         }
     }
-    for (uint32_t index = 0; index < proxy_count; ++index) {
-        if (proxies[index].handle == receiver) {
+    /* proxy_for_object hands out sequential kProxyBase-relative handles, so the
+       common reverse lookup is O(1) arithmetic instead of a scan of the full
+       pool.  Handles registered with an arbitrary value (register_proxy_with_
+       handle, used once for the activation delegate) fall outside this range
+       and take the linear path. */
+    if (receiver >= kProxyBase && receiver < kProxyLimit) {
+        uint32_t index = (receiver - kProxyBase) / kProxyStride;
+        if (index < proxy_count && proxies[index].handle == receiver) {
             return proxies[index].object;
+        }
+    } else {
+        for (uint32_t index = 0; index < proxy_count; ++index) {
+            if (proxies[index].handle == receiver) {
+                return proxies[index].object;
+            }
         }
     }
 
@@ -728,7 +806,15 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
                 break;
             }
             case '^': {
-                void *value = (void *)(uintptr_t)guest_arguments[word];
+                /* Opaque-pointer args (e.g. a CGImageRef for
+                   -[NSBitmapImageRep initWithCGImage:]) arrive as CF handles
+                   into pg_cf_table; unwrap them to the real host object.  A
+                   genuine guest buffer pointer is not a handle and passes
+                   through identity-mapped. */
+                id handle_object = peggle_object_for_handle(guest_arguments[word]);
+                void *value = handle_object
+                    ? (void *)handle_object
+                    : (void *)(uintptr_t)guest_arguments[word];
                 [invocation setArgument:&value atIndex:index];
                 break;
             }
@@ -814,6 +900,24 @@ static bool invoke_simple_message(id receiver, const char *selector_name,
         case 'i': case 'l': { int32_t value = 0; [invocation getReturnValue:&value]; *guest_result = (uint32_t)value; return true; }
         case 'I': case 'L': { uint32_t value = 0; [invocation getReturnValue:&value]; *guest_result = value; return true; }
         case 'q': case 'Q': { uint64_t value = 0; [invocation getReturnValue:&value]; *guest_result = value; return true; }
+        case '{': {
+            /* A struct <= 8 bytes (NSPoint/NSSize: two CGFloats) is returned
+               in EDX:EAX on i386, not through the stret hidden pointer.  The
+               host returns two doubles (16 bytes); narrow to two guest floats
+               and pack them into the 64-bit result the gateway splits across
+               EDX:EAX (first field low/EAX, second high/EDX). */
+            if ([signature methodReturnLength] == 2 * sizeof(CGFloat)) {
+                CGFloat pair[2] = {0, 0};
+                [invocation getReturnValue:pair];
+                float first = (float)pair[0], second = (float)pair[1];
+                uint32_t low, high;
+                memcpy(&low, &first, sizeof(low));
+                memcpy(&high, &second, sizeof(high));
+                *guest_result = (uint64_t)low | ((uint64_t)high << 32);
+                return true;
+            }
+            return false;
+        }
         default: return false;
     }
 }
@@ -1467,10 +1571,23 @@ static void activate_game_application(void)
             if (window && ![window isKeyWindow]) [window makeKeyAndOrderFront:nil];
         }];
     }
+    [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
     if (@available(macOS 14.0, *)) {
         [NSApp activate];
     } else {
         [NSApp activateIgnoringOtherApps:YES];
+    }
+    /* A terminal-launched process may not truly become frontmost, so the real
+       NSApplicationDidBecomeActive is never posted and games that create their
+       window from -applicationDidBecomeActive: stall.  Post it once directly so
+       the delegate's observer fires.  isActive-gated AppKit internals still see
+       the real state; this only drives the app delegate. */
+    static bool posted_active;
+    if (!posted_active) {
+        posted_active = true;
+        [[NSNotificationCenter defaultCenter]
+            postNotificationName:NSApplicationDidBecomeActiveNotification
+                          object:NSApp];
     }
 }
 
@@ -4717,6 +4834,24 @@ FAST_GL(glStencilMask){ (void)return_address; glStencilMask(arguments[0]); retur
 FAST_GL(glStencilOp)  { (void)return_address; glStencilOp(arguments[0], arguments[1], arguments[2]); return 0; }
 FAST_GL(glGetIntegerv){ (void)return_address; glGetIntegerv(arguments[0], (GLint *)(uintptr_t)arguments[1]); return 0; }
 FAST_GL(glGetFloatv)  { (void)return_address; glGetFloatv(arguments[0], (GLfloat *)(uintptr_t)arguments[1]); return 0; }
+/* Hot per-draw entry points on Bejeweled 3's board (client-array sprites).
+   Kept on the fast path so the thousands of calls per frame skip the name
+   chains -- these were choppy going through the slow dispatcher. */
+FAST_GL(glDrawElements) { (void)return_address; glDrawElements(arguments[0], (GLsizei)arguments[1], arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
+FAST_GL(glVertexPointer) { (void)return_address; glVertexPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
+FAST_GL(glColorPointer) { (void)return_address; glColorPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
+FAST_GL(glTexCoordPointer) { (void)return_address; glTexCoordPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
+FAST_GL(glNormalPointer) { (void)return_address; glNormalPointer(arguments[0], (GLsizei)arguments[1], (const void *)(uintptr_t)arguments[2]); return 0; }
+FAST_GL(glEnableClientState) { (void)return_address; glEnableClientState(arguments[0]); return 0; }
+FAST_GL(glDisableClientState) { (void)return_address; glDisableClientState(arguments[0]); return 0; }
+FAST_GL(glLoadMatrixf) { (void)return_address; glLoadMatrixf((const GLfloat *)(uintptr_t)arguments[0]); return 0; }
+/* Shader uniforms are updated every frame by Bejeweled 3's flame/ripple GLSL
+   effects; keep them on the fast path too. */
+FAST_GL(glUseProgram) { (void)return_address; glUseProgram(arguments[0]); return 0; }
+FAST_GL(glUniform1i) { (void)return_address; glUniform1i((GLint)arguments[0], (GLint)arguments[1]); return 0; }
+FAST_GL(glUniform4fv) { (void)return_address; glUniform4fv((GLint)arguments[0], (GLsizei)arguments[1], (const GLfloat *)(uintptr_t)arguments[2]); return 0; }
+FAST_GL(glUniformMatrix4fv) { (void)return_address; glUniformMatrix4fv((GLint)arguments[0], (GLsizei)arguments[1], (GLboolean)arguments[2], (const GLfloat *)(uintptr_t)arguments[3]); return 0; }
+FAST_GL(glBindFramebufferEXT) { (void)return_address; glBindFramebufferEXT(arguments[0], arguments[1]); return 0; }
 
 #undef FAST_GL
 
@@ -4769,6 +4904,19 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"_glStencilOp", fast_glStencilOp},
         {"_glGetIntegerv", fast_glGetIntegerv},
         {"_glGetFloatv", fast_glGetFloatv},
+        {"_glDrawElements", fast_glDrawElements},
+        {"_glVertexPointer", fast_glVertexPointer},
+        {"_glColorPointer", fast_glColorPointer},
+        {"_glTexCoordPointer", fast_glTexCoordPointer},
+        {"_glNormalPointer", fast_glNormalPointer},
+        {"_glEnableClientState", fast_glEnableClientState},
+        {"_glDisableClientState", fast_glDisableClientState},
+        {"_glLoadMatrixf", fast_glLoadMatrixf},
+        {"_glUseProgram", fast_glUseProgram},
+        {"_glUniform1i", fast_glUniform1i},
+        {"_glUniform4fv", fast_glUniform4fv},
+        {"_glUniformMatrix4fv", fast_glUniformMatrix4fv},
+        {"_glBindFramebufferEXT", fast_glBindFramebufferEXT},
     };
     for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
         if (strcmp(import_name, table[index].name) == 0) {
@@ -4779,6 +4927,7 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
 }
 
 #include "peggle_mac.inc"
+#include "objc_guest_class.inc"
 
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result)
@@ -5656,6 +5805,175 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         glBindFramebuffer(arguments[0], arguments[1]);
         *result = 0; return 1;
     }
+    /* Bejeweled 3's renderer (unlike Peggle's fixed-function path) drives
+       EXT framebuffer objects, GLSL shaders and client-state vertex arrays.
+       Guest pointers are identity-mapped into the host address space, so they
+       forward directly; the calls below complete the legacy-profile GL surface
+       the game needs.  Deprecation is silenced file-wide (GL_SILENCE_DEPRECATION). */
+    if (LP32_NAME_IS(import_name, import_length, "_glGenFramebuffersEXT")) {
+        glGenFramebuffersEXT((GLsizei)arguments[0], (GLuint *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glBindFramebufferEXT")) {
+        glBindFramebufferEXT(arguments[0], arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDeleteFramebuffersEXT")) {
+        glDeleteFramebuffersEXT((GLsizei)arguments[0], (const GLuint *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGenRenderbuffersEXT")) {
+        glGenRenderbuffersEXT((GLsizei)arguments[0], (GLuint *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glBindRenderbufferEXT")) {
+        glBindRenderbufferEXT(arguments[0], arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDeleteRenderbuffersEXT")) {
+        glDeleteRenderbuffersEXT((GLsizei)arguments[0], (const GLuint *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glRenderbufferStorageEXT")) {
+        glRenderbufferStorageEXT(arguments[0], arguments[1], (GLsizei)arguments[2],
+                                 (GLsizei)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glFramebufferRenderbufferEXT")) {
+        glFramebufferRenderbufferEXT(arguments[0], arguments[1], arguments[2], arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glFramebufferTexture2DEXT")) {
+        glFramebufferTexture2DEXT(arguments[0], arguments[1], arguments[2], arguments[3],
+                                  (GLint)arguments[4]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCheckFramebufferStatusEXT")) {
+        *result = glCheckFramebufferStatusEXT(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCreateShader")) {
+        *result = glCreateShader(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCreateProgram")) {
+        *result = glCreateProgram(); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCompileShader")) {
+        glCompileShader(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glAttachShader")) {
+        glAttachShader(arguments[0], arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLinkProgram")) {
+        glLinkProgram(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glUseProgram")) {
+        glUseProgram(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDeleteShader")) {
+        glDeleteShader(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetShaderiv")) {
+        glGetShaderiv(arguments[0], arguments[1], (GLint *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetProgramiv")) {
+        glGetProgramiv(arguments[0], arguments[1], (GLint *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetUniformLocation")) {
+        *result = (uint32_t)glGetUniformLocation(arguments[0],
+                                                 (const GLchar *)(uintptr_t)arguments[1]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glUniform1i")) {
+        glUniform1i((GLint)arguments[0], (GLint)arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glUniform4fv")) {
+        glUniform4fv((GLint)arguments[0], (GLsizei)arguments[1],
+                     (const GLfloat *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glUniformMatrix4fv")) {
+        glUniformMatrix4fv((GLint)arguments[0], (GLsizei)arguments[1],
+                           (GLboolean)arguments[2], (const GLfloat *)(uintptr_t)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glShaderSource")) {
+        GLsizei count = (GLsizei)arguments[1];
+        const uint32_t *guest_strings = (const void *)(uintptr_t)arguments[2];
+        const uint32_t *guest_lengths = (const void *)(uintptr_t)arguments[3];
+        const GLchar **strings = NULL;
+        GLint *lengths = NULL;
+        if (count > 0 && guest_strings) {
+            strings = malloc(sizeof(*strings) * (size_t)count);
+            if (guest_lengths) lengths = malloc(sizeof(*lengths) * (size_t)count);
+            for (GLsizei i = 0; i < count; ++i) {
+                strings[i] = (const GLchar *)(uintptr_t)guest_strings[i];
+                if (lengths) lengths[i] = (GLint)guest_lengths[i];
+            }
+        }
+        glShaderSource(arguments[0], count, strings, lengths);
+        free((void *)strings); free(lengths);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glActiveTexture")) {
+        glActiveTexture(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glClientActiveTexture")) {
+        glClientActiveTexture(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glEnableClientState")) {
+        glEnableClientState(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDisableClientState")) {
+        glDisableClientState(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glVertexPointer")) {
+        glVertexPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2],
+                        (const void *)(uintptr_t)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glColorPointer")) {
+        glColorPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2],
+                       (const void *)(uintptr_t)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTexCoordPointer")) {
+        glTexCoordPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2],
+                          (const void *)(uintptr_t)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glNormalPointer")) {
+        glNormalPointer(arguments[0], (GLsizei)arguments[1],
+                        (const void *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLoadMatrixf")) {
+        glLoadMatrixf((const GLfloat *)(uintptr_t)arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDepthRange")) {
+        glDepthRange(*(const double *)(const void *)&arguments[0],
+                     *(const double *)(const void *)&arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDrawElements")) {
+        glDrawElements(arguments[0], (GLsizei)arguments[1], arguments[2],
+                       (const void *)(uintptr_t)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDrawBuffers")) {
+        glDrawBuffers((GLsizei)arguments[0], (const GLenum *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetTexImage")) {
+        glGetTexImage(arguments[0], (GLint)arguments[1], arguments[2], arguments[3],
+                      (void *)(uintptr_t)arguments[4]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTexSubImage2D")) {
+        glTexSubImage2D(arguments[0], (GLint)arguments[1], (GLint)arguments[2],
+                        (GLint)arguments[3], (GLsizei)arguments[4], (GLsizei)arguments[5],
+                        arguments[6], arguments[7], (const void *)(uintptr_t)arguments[8]);
+        *result = 0; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "glCheckFramebufferStatus") ||
         LP32_NAME_IS(import_name, import_length, "glCheckFramebufferStatusEXT")) {
         *result = glCheckFramebufferStatus(arguments[0]);
@@ -6469,9 +6787,55 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
 
+    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSendSuper")) {
+        /* struct objc_super { id receiver; Class super_class; } in guest mem.
+           Route the message to the host superclass by re-dispatching to the
+           receiver with guest overrides suppressed (g_force_super). */
+        const uint32_t *super = (const void *)(uintptr_t)arguments[0];
+        if (!super) { *result = 0; return 1; }
+        /* A window/view guest instance running its designated initializer:
+           create the real AppKit companion now (see guest_objc_super_init). */
+        {
+            const char *sel = (const char *)(uintptr_t)arguments[1];
+            if (sel && guest_objc_super_init(super[0], sel, arguments + 2, result))
+                return 1;
+        }
+        uint32_t newargs[16];
+        newargs[0] = super[0];
+        for (unsigned i = 1; i < 16; ++i) newargs[i] = arguments[i];
+        int prev = g_force_super;
+        g_force_super = 1;
+        int handled = objc_bridge32_dispatch("_objc_msgSend", newargs, result);
+        g_force_super = prev;
+        return handled;
+    }
+
     if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend")) {
-        id receiver = object_for_receiver(arguments[0]);
+        /* Guest-defined classes (Bejeweled 3's SexyApplicationDelegate/Window/
+           OpenGLView) are synthesized on demand; handle their class and
+           instance messages before the general host path. */
+        if (guest_objc_msgsend(arguments, 16, result)) return 1;
         const char *selector_name = (const char *)(uintptr_t)arguments[1];
+        /* NSAutoreleasePool: this bridge already drains host temporaries at the
+           end of every dispatch, so the guest's own pools are redundant.  A
+           real pool would be created inside the bridge's transient
+           @autoreleasepool, get drained when that pops, then be double-freed by
+           the guest's own -drain ("invalid autorelease pool" abort).  Make the
+           guest pool a no-op sentinel instead. */
+        enum { kAutoreleasePoolSentinel = 0xFACE9001u };
+        if (arguments[0] == kAutoreleasePoolSentinel) {
+            *result = (selector_name && strcmp(selector_name, "init") == 0)
+                ? kAutoreleasePoolSentinel : 0;
+            return 1;
+        }
+        if (selector_name &&
+            (strcmp(selector_name, "alloc") == 0 ||
+             strcmp(selector_name, "allocWithZone:") == 0) &&
+            object_for_receiver(arguments[0]) == (id)objc_getClass("NSAutoreleasePool")) {
+            *result = kAutoreleasePoolSentinel;
+            return 1;
+        }
+        id receiver = object_for_receiver(arguments[0]);
         static int trace_selectors = -1;
         if (trace_selectors < 0) {
             trace_selectors = getenv("LP32_TRACE_OBJC_SELECTORS") != NULL;
@@ -6619,6 +6983,26 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             *result = proxy_for_object(value);
             return 1;
         }
+        if (strcmp(selector_name, "enterFullScreenMode:withOptions:") == 0) {
+            /* Bejeweled 3 asks NSView to go fullscreen with options that
+               capture the display and disable process switching, which locks
+               the operator out (no Cmd-Tab) and hides the surface from screen
+               capture.  Present fullscreen on the current Space instead:
+               auto-hide the dock/menu bar but keep switching enabled and do
+               not grab all screens. */
+            NSScreen *screen = object_for_argument(arguments[2]);
+            if (!screen) screen = preferred_game_screen();
+            NSDictionary *options = @{
+                NSFullScreenModeApplicationPresentationOptions :
+                    @(NSApplicationPresentationAutoHideDock |
+                      NSApplicationPresentationAutoHideMenuBar),
+                NSFullScreenModeAllScreens : @NO,
+            };
+            BOOL entered = [(NSView *)receiver enterFullScreenMode:screen
+                                                       withOptions:options];
+            *result = entered ? 1 : 0;
+            return 1;
+        }
         if (strcmp(selector_name,
                    "initFullscreen:openGLDisplayMask:sampleBuffers:samples:") == 0) {
             const float *rect = (const void *)(arguments + 2);
@@ -6651,6 +7035,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                         until ? [[until description] UTF8String] : "(nil)",
                         mode ? [[mode description] UTF8String] : "(nil)",
                         arguments[5]);
+                /* The guest pumps events instead of running -[NSApplication
+                   run], so nothing activates the app.  Games (Bejeweled 3)
+                   create their window from -applicationDidBecomeActive:, which
+                   AppKit only sends once the app is active.  Activate now so
+                   the pump delivers NSApplicationDidBecomeActive and the guest
+                   delegate proceeds.  (For titles whose view drives activation
+                   this is a harmless second activate.) */
+                activate_game_application();
             }
             {
                 /* Apple events wait in the Carbon high-level event queue
@@ -6679,7 +7071,64 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return invoked;
     }
 
+    if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend_fpret")) {
+        /* Float/double-returning message (e.g. -[NSScreen backingScaleFactor]).
+           The guest reads the result from x87 st0, so return it through the
+           fp-result path, not *result. */
+        id receiver = object_for_receiver(arguments[0]);
+        const char *selector_name = (const char *)(uintptr_t)arguments[1];
+        if (!arguments[0] || !receiver || !selector_name) {
+            *result = compat_runtime32_return_double(0.0);
+            return 1;
+        }
+        SEL selector = sel_registerName(selector_name);
+        if (![receiver respondsToSelector:selector]) {
+            *result = compat_runtime32_return_double(0.0);
+            return 1;
+        }
+        NSMethodSignature *signature = [receiver methodSignatureForSelector:selector];
+        NSInvocation *invocation = [NSInvocation invocationWithMethodSignature:signature];
+        [invocation setTarget:receiver];
+        [invocation setSelector:selector];
+        /* Marshal leading integer/pointer/object args (fpret getters are
+           usually 0-arg; a few take an int). */
+        for (NSUInteger i = 2; i < [signature numberOfArguments] && i < 6; ++i) {
+            const char *t = skip_type_qualifiers([signature getArgumentTypeAtIndex:i]);
+            if (*t == '@' || *t == '#') { id v = object_for_argument(arguments[i]); [invocation setArgument:&v atIndex:i]; }
+            else if (*t == '^' || *t == '*' || *t == ':') { void *v = (void *)(uintptr_t)arguments[i]; [invocation setArgument:&v atIndex:i]; }
+            else { int v = (int)arguments[i]; [invocation setArgument:&v atIndex:i]; }
+        }
+        @try { [invocation invoke]; }
+        @catch (NSException *e) {
+            fprintf(stderr, "compat32: fpret %s raised %s\n", selector_name, [[e reason] UTF8String]);
+            *result = compat_runtime32_return_double(0.0);
+            return 1;
+        }
+        const char *rt = skip_type_qualifiers([signature methodReturnType]);
+        if (*rt == 'f') { float f = 0; [invocation getReturnValue:&f]; *result = compat_runtime32_return_float(f); }
+        else { double d = 0; [invocation getReturnValue:&d]; *result = compat_runtime32_return_double(d); }
+        return 1;
+    }
+
     if (LP32_NAME_IS(import_name, import_length, "_objc_msgSend_stret")) {
+        /* A struct-returning method defined by a synthesized guest class
+           (e.g. -[SexyWindow contentRectForContent:preferred:safe:min:...])
+           dispatches to the guest IMP.  Do this before setting the caller's
+           callee-pop, because the guest call runs its own imports through the
+           gateway and would otherwise consume the pending pop. */
+        {
+            uint64_t guest_result = 0;
+            if (guest_objc_msgsend_stret(arguments, 16, &guest_result)) {
+                *result = guest_result;
+                compat_runtime32_struct_return();
+                return 1;
+            }
+        }
+        /* i386 struct-return functions pop the hidden struct pointer (ret $4);
+           tell the gateway to advance the guest ESP by 4 so the caller's stack
+           stays balanced.  Without this every stret call (e.g. -[NSScreen
+           frame]) leaks 4 bytes and eventually corrupts a return address. */
+        compat_runtime32_struct_return();
         struct guest_rect *destination = (void *)(uintptr_t)arguments[0];
         id receiver = object_for_receiver(arguments[1]);
         const char *selector_name = (const char *)(uintptr_t)arguments[2];
@@ -6713,6 +7162,77 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             rect = [NSWindow contentRectForFrameRect:input
                                            styleMask:arguments[7]];
         } else {
+            /* General host struct-return path for a geometry selector the
+               fixed cases above do not name (e.g. -[NSView bounds]/frame, or
+               -[NSWindow convert...] with a point/rect argument).  Invoke it
+               through its real signature, marshalling the guest argument words
+               (i386 CGFloat is 32-bit, passed as plain stack words), and repack
+               the returned CGFloat struct into the guest's packed-float layout. */
+            id host_receiver = object_for_receiver(arguments[1]);
+            SEL sel = arguments[2]
+                ? sel_registerName((const char *)(uintptr_t)arguments[2]) : NULL;
+            NSMethodSignature *signature =
+                (host_receiver && sel && [host_receiver respondsToSelector:sel])
+                    ? [host_receiver methodSignatureForSelector:sel] : nil;
+            const char *return_type = signature ? [signature methodReturnType] : NULL;
+            if (signature && return_type && return_type[0] == '{') {
+                NSInvocation *invocation =
+                    [NSInvocation invocationWithMethodSignature:signature];
+                [invocation setSelector:sel];
+                [invocation setTarget:host_receiver];
+                const uint32_t *guest_args = arguments + 3;
+                size_t word = 0;
+                bool ok = true;
+                for (NSUInteger i = 2; ok && i < [signature numberOfArguments]; ++i) {
+                    const char *t = skip_type_qualifiers([signature getArgumentTypeAtIndex:i]);
+                    switch (*t) {
+                        case '@': case '#': { id v = object_for_argument(guest_args[word]); [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case ':': { SEL v = guest_args[word] ? sel_registerName((const char *)(uintptr_t)guest_args[word]) : (SEL)0; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case '*': case '^': { id ho = peggle_object_for_handle(guest_args[word]); void *v = ho ? (void *)ho : (void *)(uintptr_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'c': { int8_t v = (int8_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'C': case 'B': { uint8_t v = (uint8_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 's': { int16_t v = (int16_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'S': { uint16_t v = (uint16_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'i': case 'l': { int32_t v = (int32_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'I': case 'L': { uint32_t v = guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'q': { int64_t v = (int32_t)guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'Q': { uint64_t v = guest_args[word]; [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'f': { float v; memcpy(&v, &guest_args[word], sizeof(v)); [invocation setArgument:&v atIndex:i]; word += 1; break; }
+                        case 'd': { double v; memcpy(&v, &guest_args[word], sizeof(v)); [invocation setArgument:&v atIndex:i]; word += 2; break; }
+                        case '{': {
+                            const float *fields = (const float *)&guest_args[word];
+                            if (strncmp(t, "{CGRect=", 8) == 0 || strncmp(t, "{_NSRect=", 9) == 0) {
+                                NSRect v = NSMakeRect(fields[0], fields[1], fields[2], fields[3]);
+                                [invocation setArgument:&v atIndex:i]; word += 4;
+                            } else if (strncmp(t, "{CGPoint=", 9) == 0 || strncmp(t, "{_NSPoint=", 10) == 0) {
+                                NSPoint v = NSMakePoint(fields[0], fields[1]);
+                                [invocation setArgument:&v atIndex:i]; word += 2;
+                            } else if (strncmp(t, "{CGSize=", 8) == 0 || strncmp(t, "{_NSSize=", 9) == 0) {
+                                NSSize v = NSMakeSize(fields[0], fields[1]);
+                                [invocation setArgument:&v atIndex:i]; word += 2;
+                            } else { ok = false; }
+                            break;
+                        }
+                        default: ok = false; break;
+                    }
+                }
+                if (ok) {
+                    [invocation invoke];
+                    NSUInteger length = [signature methodReturnLength];
+                    float *out = (float *)destination;
+                    if (length == sizeof(NSRect)) {
+                        NSRect value; [invocation getReturnValue:&value];
+                        out[0] = (float)value.origin.x; out[1] = (float)value.origin.y;
+                        out[2] = (float)value.size.width; out[3] = (float)value.size.height;
+                        *result = 0; return 1;
+                    }
+                    if (length == sizeof(NSSize)) {  /* also NSPoint (both 2 CGFloats) */
+                        NSSize value; [invocation getReturnValue:&value];
+                        out[0] = (float)value.width; out[1] = (float)value.height;
+                        *result = 0; return 1;
+                    }
+                }
+            }
             return 0;
         }
         destination->x = (float)rect.origin.x;
@@ -6730,6 +7250,9 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
 {
     if (!strcmp(import_name,"_kCFBundleVersionKey")) return proxy_for_object((id)kCFBundleVersionKey);
     if (!strcmp(import_name,"_kCFPreferencesCurrentApplication")) return proxy_for_object(@"local.peggle.compat");
+    if (!strcmp(import_name,"_kCFPreferencesAnyHost")) return proxy_for_object((id)kCFPreferencesAnyHost);
+    if (!strcmp(import_name,"_kCFPreferencesCurrentUser")) return proxy_for_object((id)kCFPreferencesCurrentUser);
+    if (!strcmp(import_name,"_kCFPreferencesAnyApplication")) return proxy_for_object((id)kCFPreferencesAnyApplication);
     const size_t import_length = strlen(import_name);
     if (LP32_NAME_IS(import_name, import_length, "_NSApp")) {
         return proxy_for_object([NSApplication sharedApplication]);

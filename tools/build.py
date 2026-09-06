@@ -91,6 +91,13 @@ GAMES = {
         'bundle_identifier': 'local.peggle.nights',
         'bundle_name': 'PeggleNights',
     },
+    'com.popcap.Bejeweled3': {
+        'display_name': 'Bejeweled 3',
+        'image_file': 'Bejeweled3.image',
+        'output_name': 'Bejeweled3.app',
+        'bundle_identifier': 'local.bejeweled3.silicon',
+        'bundle_name': 'Bejeweled3',
+    },
 }
 
 
@@ -100,7 +107,7 @@ def game_for_source(info: dict) -> dict:
     if not game:
         raise SystemExit(
             f'unsupported game bundle: {identifier or "(no identifier)"}.\n'
-            'Supported: Peggle Deluxe and Peggle Nights.')
+            'Supported: Peggle Deluxe, Peggle Nights, and Bejeweled 3.')
     return game
 
 

@@ -133,6 +133,31 @@ static int peggle_audio_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         }
         RET((uint16_t)status);
     }
+    if (IS("_OpenComponent")) {
+        AudioComponent component = pg_component(a[0]);
+        AudioUnit unit = NULL;
+        OSStatus status = component ? AudioComponentInstanceNew(component, &unit) : (OSStatus)-3000;
+        RET(status == noErr ? guest_handle_for_unit(unit, NULL) : 0);
+    }
+    if (IS("_OpenDefaultComponent")) {
+        AudioComponentDescription description = {0};
+        description.componentType = a[0];
+        description.componentSubType = a[1];
+        AudioComponent component = AudioComponentFindNext(NULL, &description);
+        AudioUnit unit = NULL;
+        OSStatus status = component ? AudioComponentInstanceNew(component, &unit) : (OSStatus)-3000;
+        RET(status == noErr ? guest_handle_for_unit(unit, NULL) : 0);
+    }
+    if (IS("_CloseComponent")) {
+        AudioUnit unit = unit_for_guest(a[0], NULL);
+        OSStatus status = unit ? AudioComponentInstanceDispose(unit) : noErr;
+        if (trace_audio()) {
+            fprintf(stderr, "compat32: audio CloseComponent unit=0x%08x\n", a[0]);
+            trace_audio_status("CloseComponent", status);
+        }
+        RET(status);
+    }
+    if (IS("_CallComponentVersion")) RET(0x00010000);
     if (IS("_AudioUnitInitialize") || IS("_AudioUnitUninitialize") ||
         IS("_AudioOutputUnitStart") || IS("_AudioOutputUnitStop")) {
         AudioUnit unit = unit_for_guest(a[0], NULL);
@@ -237,6 +262,19 @@ static int peggle_audio_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         OUT(2, handle);
         if (trace_audio()) trace_audio_status("AudioConverterNew", status);
         RET(status);
+    }
+    if (IS("_AudioConverterSetProperty")) {
+        AudioConverterRef converter = pg_converter(a[0]);
+        RET(converter ? AudioConverterSetProperty(converter, a[1], a[2],
+                                                  a[3] >= 0x1000 ? P(3) : NULL)
+                      : kAudio_ParamError);
+    }
+    if (IS("_AudioConverterGetProperty")) {
+        AudioConverterRef converter = pg_converter(a[0]);
+        RET(converter ? AudioConverterGetProperty(converter, a[1],
+                                                  a[2] >= 0x1000 ? P(2) : NULL,
+                                                  a[3] >= 0x1000 ? P(3) : NULL)
+                      : kAudio_ParamError);
     }
     if (IS("_AudioConverterDispose")) {
         AudioConverterRef converter = pg_converter(a[0]);

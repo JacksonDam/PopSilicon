@@ -7,6 +7,7 @@
 #include <architecture/i386/table.h>
 #include <CoreFoundation/CoreFoundation.h>
 #include <ctype.h>
+#include <runetype.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
@@ -25,6 +26,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/sysctl.h>
 #include <sys/time.h>
@@ -1128,6 +1130,13 @@ static int build_transition_bridge(void)
     emit_landing32(code + kLanding32Offset, kBridgeCodeBase + kLanding32AltOffset);
     emit_landing32(code + kLanding32AltOffset, 0);
 
+    /* Bejeweled 3 places its symbol stubs in __TEXT,__symbol_stub, which is
+       read-only after mapping; Peggle's live in the rwx __IMPORT segment.
+       Make each stub's page writable+executable before patching (a no-op when
+       it is already writable).  A one-page cache keeps this to a few mprotect
+       calls since the stubs are contiguous. */
+    size_t page_size = (size_t)getpagesize();
+    uintptr_t protected_page = 0;
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         if (current_image->imports[index].kind != MACHO_IMPORT32_STUB) continue;
         uint8_t *thunk = code + kImportThunksOffset + index * kImportThunkSize;
@@ -1144,6 +1153,16 @@ static int build_transition_bridge(void)
         if (displacement < INT32_MIN || displacement > INT32_MAX) {
             errno = ERANGE;
             return runtime_error("i386 import thunk displacement");
+        }
+        /* The stub is 5 bytes; protect the page it starts on plus the next so
+           a stub straddling a page boundary is fully writable. */
+        uintptr_t page = (uintptr_t)stub & ~(uintptr_t)(page_size - 1);
+        if (page != protected_page) {
+            if (mprotect((void *)page, page_size * 2,
+                         PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+                return runtime_error("mprotect import stub page");
+            }
+            protected_page = page;
         }
         stub[0] = 0xe9;
         emit_u32(stub + 1, (uint32_t)(int32_t)displacement);
@@ -1190,7 +1209,45 @@ static int build_transition_bridge(void)
         uint32_t standard_file =
             guest_standard_file_import(current_image->imports[index].name);
         if (standard_file) data_cell[data_cells] = standard_file;
-        if (!strcmp(current_image->imports[index].name,"___sF")) {
+        if (!strcmp(current_image->imports[index].name, "__DefaultRuneLocale")) {
+            /* The Sexy XMLParser classifies characters by reading
+               _DefaultRuneLocale.__runetype[c] inline (i386 layout: the
+               __runetype[256] array sits at struct offset 0x34, one 4-byte
+               entry per rune).  The host x86_64 _RuneLocale uses 8-byte
+               function pointers, so its __runetype array sits at a different
+               offset; binding the guest symbol to it would make the inline
+               read return garbage and the parser would reject ordinary
+               whitespace as an "Illegal Character".  Synthesise an i386
+               _RuneLocale here whose __runetype/__maplower/__mapupper tables
+               are rebuilt from the host ctype predicates (the _CTYPE_* bit
+               values are ABI-stable across architectures). */
+            uint8_t *rune = (uint8_t *)(data_cell + data_cells);
+            memcpy(rune, "RuneMagA", 8);
+            uint32_t *runetype = (uint32_t *)(rune + 0x34);
+            uint32_t *maplower = (uint32_t *)(rune + 0x34 + 256 * 4);
+            uint32_t *mapupper = (uint32_t *)(rune + 0x34 + 256 * 8);
+            for (int c = 0; c < 256; ++c) {
+                unsigned long t = 0;
+                if (isupper(c))  t |= _CTYPE_U;
+                if (islower(c))  t |= _CTYPE_L;
+                if (isdigit(c))  t |= _CTYPE_D;
+                if (isspace(c))  t |= _CTYPE_S;
+                if (ispunct(c))  t |= _CTYPE_P;
+                if (iscntrl(c))  t |= _CTYPE_C;
+                if (isxdigit(c)) t |= _CTYPE_X;
+                if (isblank(c))  t |= _CTYPE_B;
+                if (isalpha(c))  t |= _CTYPE_A;
+                if (isgraph(c))  t |= _CTYPE_G;
+                if (isprint(c))  t |= _CTYPE_R;
+                runetype[c] = (uint32_t)t;
+                maplower[c] = (uint32_t)(isupper(c) ? tolower(c) : c);
+                mapupper[c] = (uint32_t)(islower(c) ? toupper(c) : c);
+            }
+            /* header + __runetype/__maplower/__mapupper + the three empty
+               _RuneRange extents and trailing __variable fields (all left
+               zero by the region-wide memset, i.e. no extended ranges). */
+            data_cells += (0x34 + 256 * 4 * 3 + 64) / 4;
+        } else if (!strcmp(current_image->imports[index].name,"___sF")) {
             guest_sF_address = cell_address;
             data_cells += 68;
         } else data_cells += 4;
@@ -2642,6 +2699,16 @@ static uint64_t return_guest_double(double value)
     return 0;
 }
 
+uint64_t compat_runtime32_return_double(double value)
+{
+    return return_guest_double(value);
+}
+
+uint64_t compat_runtime32_return_float(float value)
+{
+    return return_guest_float(value);
+}
+
 static void *run_guest_thread(void *opaque)
 {
     struct guest_thread_context context = *(struct guest_thread_context *)opaque;
@@ -3125,6 +3192,21 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                       uint32_t return_address)
 {
     uint64_t peggle_result;
+    /* Darwin exports ABI-variant aliases such as "_open$UNIX2003" and
+       "_readdir$INODE64" that are behaviourally identical to the base symbol.
+       Bejeweled 3 imports 15 "$UNIX2003" variants Peggle never used.  C
+       symbol names never contain '$' otherwise, so normalise to the base name
+       once here, and every downstream dispatcher matches without per-variant
+       cases. */
+    if (strchr(name, '$')) {
+        static _Thread_local char base[256];
+        size_t length = (size_t)(strchr(name, '$') - name);
+        if (length < sizeof(base)) {
+            memcpy(base, name, length);
+            base[length] = '\0';
+            name = base;
+        }
+    }
     if (g_named_import_override &&
         g_named_import_override(name, arguments, &peggle_result)) {
         return peggle_result;
@@ -3517,6 +3599,24 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         }
         return (uint32_t)status;
     }
+    if (import_is(name, "_getrusage")) {
+        /* i386 struct rusage: ru_utime/ru_stime (two 8-byte timevals) then 14
+           longs = 72 bytes.  Fill the CPU times; the rest is profiling detail
+           the game only logs. */
+        struct rusage host;
+        int status = getrusage((int)arguments[0], &host);
+        uint32_t *guest = (void *)(uintptr_t)arguments[1];
+        if (guest) {
+            memset(guest, 0, 72);
+            if (status == 0) {
+                guest[0] = (uint32_t)host.ru_utime.tv_sec;
+                guest[1] = (uint32_t)host.ru_utime.tv_usec;
+                guest[2] = (uint32_t)host.ru_stime.tv_sec;
+                guest[3] = (uint32_t)host.ru_stime.tv_usec;
+            }
+        }
+        return (uint32_t)(status == 0 ? 0 : -1);
+    }
     if (import_is(name, "_gettimeofday")) {
         struct timeval host;
         int status = gettimeofday(&host, NULL);
@@ -3569,6 +3669,36 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         guest_qsort((void *)(uintptr_t)arguments[0], arguments[1], arguments[2],
                     arguments[3]);
         return 0;
+    }
+    if (import_is(name, "_vswprintf") || import_is(name, "_swprintf")) {
+        /* Wide printf.  Left to bind to the host, the i386 va_list ABI does not
+           match and formatted wide output is corrupted (Bejeweled 3's Classic
+           level number rendered as "1sf"/"2sf").  Narrow the wide format and
+           reuse guest_vformat, then widen the result into the guest buffer.
+           swprintf takes inline varargs; vswprintf takes a va_list pointer. */
+        wchar_t *destination = (void *)(uintptr_t)arguments[0];
+        size_t destination_size = arguments[1];
+        const uint32_t *wide_format = (const void *)(uintptr_t)arguments[2];
+        const uint32_t *values = import_is(name, "_vswprintf")
+            ? (const uint32_t *)(uintptr_t)arguments[3]
+            : arguments + 3;
+        if (!destination || !wide_format || !values) return (uint32_t)-1;
+        char format[2048];
+        size_t fi = 0;
+        for (; fi + 1 < sizeof(format) && wide_format[fi]; ++fi)
+            format[fi] = (char)wide_format[fi];
+        format[fi] = '\0';
+        char *scratch = malloc(65536);
+        if (!scratch) return (uint32_t)-1;
+        int formatted = guest_vformat(scratch, 65536, format, values);
+        if (destination_size) {
+            size_t j = 0;
+            for (; j + 1 < destination_size && scratch[j]; ++j)
+                destination[j] = (wchar_t)(unsigned char)scratch[j];
+            destination[j] = 0;
+        }
+        free(scratch);
+        return (uint32_t)formatted;
     }
     if (import_is(name, "_sprintf") || import_is(name, "_snprintf") ||
         import_is(name, "_vsprintf") || import_is(name, "_vsnprintf") ||
@@ -3628,6 +3758,31 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return input && format ? (uint32_t)guest_vscan(input, format,
                                                         arguments + 2) : 0;
     }
+    if (import_is(name, "_swscanf")) {
+        /* Bejeweled 3 parses numeric values (leaderboard/config) from wstrings.
+           The input and format are ASCII wchar_t (4-byte) strings; narrow them
+           and reuse the guest sscanf scanner.  Numeric conversions match
+           regardless of char width; the 'l' length modifier is dropped so a
+           %ls/%lc collapses to narrow (adequate for the ASCII data seen). */
+        const uint32_t *wide_input = (const void *)(uintptr_t)arguments[0];
+        const uint32_t *wide_format = (const void *)(uintptr_t)arguments[1];
+        if (!wide_input || !wide_format) return 0;
+        char input[2048];
+        char format[512];
+        size_t n = 0;
+        for (; n + 1 < sizeof(input) && wide_input[n]; ++n)
+            input[n] = (char)wide_input[n];
+        input[n] = '\0';
+        size_t out = 0;
+        for (size_t in = 0; out + 1 < sizeof(format) && wide_format[in]; ++in) {
+            uint32_t c = wide_format[in];
+            if (c == 'l' && (wide_format[in + 1] == 's' || wide_format[in + 1] == 'c'))
+                continue; /* drop the wide-output modifier */
+            format[out++] = (char)c;
+        }
+        format[out] = '\0';
+        return (uint32_t)guest_vscan(input, format, arguments + 2);
+    }
     if (import_is(name, "_fopen")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
         const char *mode = (const char *)(uintptr_t)arguments[1];
@@ -3664,6 +3819,29 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             (const void *)(uintptr_t)arguments[0], arguments[1], arguments[2], file);
         unlock_host_file();
         return result;
+    }
+    if (import_is(name, "_fputs")) {
+        FILE *file = lock_host_file_for_guest(arguments[1]);
+        const char *s = (const char *)(uintptr_t)arguments[0];
+        if (!file) return (uint32_t)-1;
+        int result = fputs(s ? s : "", file);
+        unlock_host_file();
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_fputc")) {
+        FILE *file = lock_host_file_for_guest(arguments[1]);
+        if (!file) return (uint32_t)-1;
+        int result = fputc((int)arguments[0], file);
+        unlock_host_file();
+        return (uint32_t)result;
+    }
+    if (import_is(name, "_fputws")) {
+        FILE *file = lock_host_file_for_guest(arguments[1]);
+        const wchar_t *ws = (const wchar_t *)(uintptr_t)arguments[0];
+        if (!file) return (uint32_t)-1;
+        int result = fputws(ws ? ws : L"", file);
+        unlock_host_file();
+        return (uint32_t)result;
     }
     if (import_is(name, "_fseek")) {
         FILE *file = lock_host_file_for_guest(arguments[0]);
@@ -3783,6 +3961,12 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_rmdir")) {
         return (uint32_t)rmdir((const char *)(uintptr_t)arguments[0]);
     }
+    if (import_is(name, "_unlink")) {
+        return (uint32_t)unlink((const char *)(uintptr_t)arguments[0]);
+    }
+    if (import_is(name, "_tmpfile")) {
+        return guest_handle_for_file(tmpfile());
+    }
     if (import_is(name, "_atoi")) {
         return (uint32_t)atoi((const char *)(uintptr_t)arguments[0]);
     }
@@ -3819,7 +4003,16 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             ((uint64_t)arguments[3] << 32));
         return divisor ? (uint64_t)(dividend % divisor) : 0;
     }
-    if (import_is(name, "___error")) return guest_errno_address;
+    if (import_is(name, "___error")) {
+        /* Bejeweled 3 imports the __error() accessor but not the _errno data
+           symbol, so guest_errno_address is never assigned by the pointer-bind
+           loop; lazily reserve a guest-writable errno cell so *__error() is a
+           valid location (the game clears and tests it around file/sound I/O). */
+        if (!guest_errno_address)
+            guest_errno_address = guest_allocate_at(sizeof(uint32_t), true,
+                                                    kGuestHeapHostSite);
+        return guest_errno_address;
+    }
     if (import_is(name, "_mach_absolute_time")) {
         uint64_t value = mach_absolute_time();
         static uint32_t traced_clocks;
@@ -3920,6 +4113,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return return_guest_double(pow(guest_double(arguments),
                                        guest_double(arguments + 2)));
     }
+    if (import_is(name, "_fmod")) {
+        return return_guest_double(fmod(guest_double(arguments),
+                                        guest_double(arguments + 2)));
+    }
     if (import_is(name, "_difftime")) {
         return return_guest_double((double)(int32_t)arguments[0] -
                                    (double)(int32_t)arguments[1]);
@@ -4016,6 +4213,29 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
         return condition && mutex ? (uint32_t)pthread_cond_wait(condition, mutex) :
                                     (uint32_t)EINVAL;
+    }
+    if (import_is(name, "_pthread_exit")) {
+        /* Terminate the current host thread that is running this guest thread
+           (guest worker threads are host pthreads); mirrors returning from the
+           thread's start routine. */
+        pthread_exit((void *)(uintptr_t)arguments[0]);
+        return 0; /* not reached */
+    }
+    if (import_is(name, "_pthread_cond_timedwait")) {
+        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
+        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
+        if (!condition || !mutex) return (uint32_t)EINVAL;
+        /* i386 struct timespec is two 32-bit fields; widen to the host's
+           16-byte layout.  The guest computes an absolute CLOCK_REALTIME
+           deadline from the host-backed gettimeofday, so it is already in
+           host terms. */
+        const int32_t *guest_time = (const void *)(uintptr_t)arguments[2];
+        struct timespec deadline = {0, 0};
+        if (guest_time) {
+            deadline.tv_sec = (time_t)guest_time[0];
+            deadline.tv_nsec = (long)guest_time[1];
+        }
+        return (uint32_t)pthread_cond_timedwait(condition, mutex, &deadline);
     }
     if (import_is(name, "_pthread_key_create")) {
         uint32_t *key = (void *)(uintptr_t)arguments[0];
@@ -4147,6 +4367,38 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_IODeregisterForSystemPower") ||
         import_is(name, "_IOAllowPowerChange") ||
         import_is(name, "_IOCancelPowerChange")) return 0;
+    /* Steamworks (Bejeweled 3 links libsteam_api.dylib for stats/achievements/
+       cloud, all optional).  Report Steam unavailable so the game runs without
+       it; the interface accessors return null and are never used because Init
+       reports failure.  The game does not gate launch on Steam. */
+    if (import_is(name, "_SteamAPI_Init") ||
+        import_is(name, "_SteamAPI_InitSafe")) return 1;      /* true: pretend Steam is up */
+    if (import_is(name, "_SteamAPI_Shutdown") ||
+        import_is(name, "_SteamAPI_RunCallbacks") ||
+        import_is(name, "_SteamAPI_RegisterCallback") ||
+        import_is(name, "_SteamAPI_UnregisterCallback") ||
+        import_is(name, "_SteamAPI_RegisterCallResult") ||
+        import_is(name, "_SteamAPI_UnregisterCallResult")) return 0;
+    if (import_is(name, "_pg_steam_noop")) return 0;          /* stub vtable method */
+    if (import_is(name, "_SteamClient") || import_is(name, "_SteamUser") ||
+        import_is(name, "_SteamUserStats") || import_is(name, "_SteamUtils") ||
+        import_is(name, "_SteamFriends") || import_is(name, "_SteamApps") ||
+        import_is(name, "_SteamRemoteStorage")) {
+        /* Non-null stub interface: the game calls methods on the returned
+           pointer without null-checking.  Hand back an object whose vtable
+           slots are all a no-op thunk that returns 0 (bool/int/pointer/64-bit
+           all read as 0), so Steam stats/achievements calls are harmless. */
+        static uint32_t stub_interface;
+        if (!stub_interface) {
+            uint32_t thunk = compat_runtime32_guest_callback("_pg_steam_noop");
+            uint32_t vtable = compat_runtime32_allocate(512 * sizeof(uint32_t), 1);
+            uint32_t *slots = (uint32_t *)(uintptr_t)vtable;
+            for (int i = 0; i < 512; ++i) slots[i] = thunk;
+            stub_interface = compat_runtime32_allocate(16, 1);
+            *(uint32_t *)(uintptr_t)stub_interface = vtable;
+        }
+        return stub_interface;
+    }
     if (import_is(name, "_CFRunLoopAddSource") ||
         import_is(name, "_CFRunLoopRemoveSource")) return 0;
     if (import_is(name, "_CFRunLoopContainsSource")) return 0;
@@ -4166,6 +4418,13 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "___cxa_guard_abort")) {
         uint8_t *guard = (void *)(uintptr_t)arguments[0];
         guard[1] = 0;
+        return 0;
+    }
+    /* C++ static-destructor registration (Bejeweled 3's static initializers
+       call it).  We terminate the game rather than unwind at exit, so accept
+       the registration and drop it; report success. */
+    if (import_is(name, "___cxa_atexit") || import_is(name, "_atexit") ||
+        import_is(name, "___cxa_finalize")) {
         return 0;
     }
 
