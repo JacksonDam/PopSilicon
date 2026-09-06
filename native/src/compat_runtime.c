@@ -4103,6 +4103,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_sin")) return return_guest_double(sin(guest_double(arguments)));
     if (import_is(name, "_cos")) return return_guest_double(cos(guest_double(arguments)));
     if (import_is(name, "_atan")) return return_guest_double(atan(guest_double(arguments)));
+    if (import_is(name, "_fmod")) {
+        return return_guest_double(fmod(guest_double(arguments),
+                                        guest_double(arguments + 2)));
+    }
     if (import_is(name, "_ceil")) return return_guest_double(ceil(guest_double(arguments)));
     if (import_is(name, "_floor")) return return_guest_double(floor(guest_double(arguments)));
     if (import_is(name, "_rint")) return return_guest_double(rint(guest_double(arguments)));
@@ -4211,8 +4215,17 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_pthread_cond_wait")) {
         pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
         pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
-        return condition && mutex ? (uint32_t)pthread_cond_wait(condition, mutex) :
-                                    (uint32_t)EINVAL;
+        if (!condition || !mutex) return (uint32_t)EINVAL;
+        /* If the guest's frame/main thread is the one blocking (e.g.
+           CoreAudioSoundInstance::Release waiting for the audio render
+           callback to run DoPostRenderMaintenance), let the audio hold yield
+           so that callback can proceed; otherwise the hold — which keys off
+           the frame clock the blocked thread would advance — never ends. */
+        bool frame_thread = audio_bridge32_is_frame_thread();
+        if (frame_thread) audio_bridge32_frame_thread_wait_begin();
+        uint32_t r = (uint32_t)pthread_cond_wait(condition, mutex);
+        if (frame_thread) audio_bridge32_frame_thread_wait_end();
+        return r;
     }
     if (import_is(name, "_pthread_exit")) {
         /* Terminate the current host thread that is running this guest thread

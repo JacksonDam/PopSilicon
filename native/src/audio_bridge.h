@@ -1,6 +1,7 @@
 #ifndef LP32_AUDIO_BRIDGE_H
 #define LP32_AUDIO_BRIDGE_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
@@ -40,5 +41,13 @@ void audio_bridge32_worker_statistics(struct audio_bridge32_worker_stats *stats)
 /* Presentation clock for the audio hold; call once per presented frame from
    the render thread. */
 void audio_bridge32_note_frame_presented(void);
+
+/* True on the guest's frame/main thread.  While that thread is blocked in a
+   bridged wait it must bracket the wait with the begin/end calls so the audio
+   hold yields and render-driven maintenance can complete (avoids the
+   Release-vs-DoPostRenderMaintenance deadlock). */
+bool audio_bridge32_is_frame_thread(void);
+void audio_bridge32_frame_thread_wait_begin(void);
+void audio_bridge32_frame_thread_wait_end(void);
 
 #endif
