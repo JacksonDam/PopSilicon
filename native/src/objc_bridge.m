@@ -2720,12 +2720,12 @@ static NSDictionary *legacy_dictionary_for_display_mode(CGDisplayModeRef mode)
         nil];
 }
 
-static NSArray *legacy_modes_for_display(CGDirectDisplayID display)
+static NSMutableArray *legacy_modes_for_display(CGDirectDisplayID display)
 {
     static NSMutableDictionary *cache;
     if (!cache) cache = [[NSMutableDictionary alloc] init];
     NSNumber *display_key = [NSNumber numberWithUnsignedInt:display];
-    NSArray *cached = [cache objectForKey:display_key];
+    NSMutableArray *cached = [cache objectForKey:display_key];
     if (cached) return cached;
 
     CFArrayRef modern_modes = CGDisplayCopyAllDisplayModes(display, NULL);
@@ -2771,9 +2771,39 @@ static NSArray *legacy_modes_for_display(CGDirectDisplayID display)
         }
         CFRelease(current);
     }
-    NSArray *result = [NSArray arrayWithArray:legacy_modes];
-    [cache setObject:result forKey:display_key];
-    return result;
+    [cache setObject:legacy_modes forKey:display_key];
+    return legacy_modes;
+}
+
+/*
+ * A requested size the panel does not list.  The emulated switch renders any
+ * mode into a scaled surface (see guest_display_mode), so the request can be
+ * granted regardless of what the display driver offers: some panels expose
+ * only a handful of modes in their own aspect ratio, none of them the 800x600
+ * this engine asks for, and falling back to the native mode makes the game
+ * lay out a "fullscreen" window the desktop cannot actually hold.  The mode
+ * joins the display's list so CGDisplayCurrentMode reports it after the
+ * switch, as the real API would.
+ */
+static NSDictionary *synthesized_legacy_mode(CGDirectDisplayID display,
+                                             size_t width, size_t height)
+{
+    if (!width || !height) return nil;
+    CGDisplayModeRef current = CGDisplayCopyDisplayMode(display);
+    if (!current) return nil;
+    NSMutableDictionary *legacy =
+        [[legacy_dictionary_for_display_mode(current) mutableCopy] autorelease];
+    CFRelease(current);
+    if (!legacy) return nil;
+    [legacy setObject:[NSNumber numberWithUnsignedLongLong:width] forKey:@"Width"];
+    [legacy setObject:[NSNumber numberWithUnsignedLongLong:height] forKey:@"Height"];
+    [legacy setObject:[NSNumber numberWithUnsignedLongLong:width * 4]
+               forKey:@"kCGDisplayBytesPerRow"];
+    [legacy_modes_for_display(display) addObject:legacy];
+    fprintf(stderr,
+            "compat32: display %u lists no %zux%zu mode; synthesized one for the "
+            "emulated switch\n", display, width, height);
+    return legacy;
 }
 
 static NSDictionary *legacy_current_mode_for_display(CGDirectDisplayID display)
@@ -4867,7 +4897,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
      * bridge presents the game in a window that already covers the preferred
      * display, and modern macOS has no exclusive fullscreen or CGL fullscreen
      * drawables, so capture/fade succeed without doing anything, the "best
-     * mode" is whatever legacy mode matches the request on that display, and
+     * mode" is whatever legacy mode matches the request on that display (or
+     * one synthesized for it, since the emulation can render any size), and
      * a mode switch becomes the emulated mode (see guest_display_mode) that
      * the GL surface is rendered at and that later queries report back.
      */
@@ -4990,6 +5021,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 best = candidate;
                 break;
             }
+        }
+        if (!best && !first_launch) {
+            best = synthesized_legacy_mode(arguments[0], width, height);
         }
         if (exact_match) *exact_match = best ? 1 : 0;
         if (!best) best = legacy_current_mode_for_display(arguments[0]);
