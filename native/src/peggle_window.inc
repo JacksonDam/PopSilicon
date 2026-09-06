@@ -12,6 +12,33 @@
 - (void)keyUp:(NSEvent *)event { (void)event; }
 @end
 
+/* The game draws in a 4:3 surface even when AppKit makes its window fill an
+   ultrawide display.  Keeping that surface as a child view lets native full
+   screen scale it to the largest undistorted size and leaves the remainder
+   black, just like a classic display mode. */
+@interface PeggleLetterboxView : NSView
+@end
+@implementation PeggleLetterboxView
+- (BOOL)isOpaque { return YES; }
+- (void)drawRect:(NSRect)dirty
+{
+    [[NSColor blackColor] setFill];
+    NSRectFill(dirty);
+}
+- (void)layout
+{
+    [super layout];
+    if (![[self subviews] count]) return;
+    NSRect bounds = [self bounds];
+    CGFloat scale = fmin(bounds.size.width / 4.0, bounds.size.height / 3.0);
+    NSSize size = NSMakeSize(floor(4.0 * scale), floor(3.0 * scale));
+    NSRect frame = NSMakeRect(floor((bounds.size.width - size.width) / 2.0),
+                              floor((bounds.size.height - size.height) / 2.0),
+                              size.width, size.height);
+    [[[self subviews] objectAtIndex:0] setFrame:frame];
+}
+@end
+
 enum {
     kPgWindowCapacity = 8, kPgWindowBase = 0x7f0a0000, kPgWindowStride = 16,
     kPgEventBase = 0x7f090000, kPgEventCapacity = 64, kPgEventStride = 16,
@@ -92,7 +119,12 @@ static uint32_t pg_cf_cstring(uint32_t handle, CFStringEncoding encoding)
 struct pg_win {
     uint32_t handle;
     NSWindow *window;
+    NSView *render_view;
     NSImageView *image_view;
+    /* The size the Carbon game requested.  The render view may be larger
+       while the window is resized or full screen, so input must be projected
+       back into this coordinate space. */
+    NSSize logical_content_size;
     uint32_t refcon;
     bool overlay;
     CGContextRef context;
@@ -227,6 +259,14 @@ static void pg_queue_text_input(NSEvent *event)
 - (BOOL)windowShouldClose:(id)sender { (void)sender; pg_post_window_event(kEventWindowClose); return NO; }
 - (void)windowDidBecomeKey:(NSNotification *)note { (void)note; pg_post_window_event(kEventWindowActivated); }
 - (void)windowDidResignKey:(NSNotification *)note { (void)note; pg_post_window_event(kEventWindowDeactivated); }
+- (void)windowDidResize:(NSNotification *)note
+{
+    (void)note;
+    /* The legacy renderer learns about the drawable's size lazily.  Updating
+       the context here makes a user resize or native full-screen transition
+       take effect immediately, instead of waiting for the next AGL update. */
+    if (pg_gl) [pg_gl update];
+}
 @end
 
 static CGFloat pg_screen_top(void)
@@ -255,7 +295,36 @@ static struct pg_win *pg_win_for(uint32_t handle)
         pg_wins[index].window) return &pg_wins[index];
     return pg_main_win();
 }
-static NSRect pg_content_rect(struct pg_win *w) { return [w->window contentRectForFrameRect:[w->window frame]]; }
+static NSRect pg_content_rect(struct pg_win *w)
+{
+    if (w->render_view && [w->render_view superview]) {
+        NSRect frame = [w->render_view frame];
+        return [w->window convertRectToScreen:frame];
+    }
+    return [w->window contentRectForFrameRect:[w->window frame]];
+}
+static NSPoint pg_logical_mouse_point(struct pg_win *w, NSPoint screen)
+{
+    NSRect content = pg_content_rect(w);
+    NSSize logical = w->logical_content_size;
+    if (logical.width <= 0 || logical.height <= 0 ||
+        content.size.width <= 0 || content.size.height <= 0) {
+        return NSMakePoint(screen.x - content.origin.x, NSMaxY(content) - screen.y);
+    }
+    return NSMakePoint((screen.x - content.origin.x) * logical.width / content.size.width,
+                       (NSMaxY(content) - screen.y) * logical.height / content.size.height);
+}
+/* Carbon hands the game both window-local and global points.  While the
+   drawable is scaled, expose a virtual global point whose origin remains at
+   the real render surface but whose offsets are in the game's 800x600 space.
+   That makes direct event reads and GetGlobalMouse/GlobalToLocal agree. */
+static NSPoint pg_virtual_screen_mouse_point(struct pg_win *w, NSPoint screen)
+{
+    if (!w) return screen;
+    NSRect content = pg_content_rect(w);
+    NSPoint local = pg_logical_mouse_point(w, screen);
+    return NSMakePoint(content.origin.x + local.x, NSMaxY(content) - local.y);
+}
 static void pg_start_app(void)
 {
     if (pg_app_started) return;
@@ -266,6 +335,12 @@ static void pg_start_app(void)
     NSMenuItem *app_item = [[[NSMenuItem alloc] init] autorelease];
     [bar addItem:app_item];
     NSMenu *menu = [[[NSMenu alloc] initWithTitle:@"Peggle"] autorelease];
+    NSMenuItem *fullscreen = [[[NSMenuItem alloc]
+        initWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:)
+        keyEquivalent:@"f"] autorelease];
+    [fullscreen setKeyEquivalentModifierMask:NSEventModifierFlagControl |
+                                               NSEventModifierFlagCommand];
+    [menu addItem:fullscreen];
     [menu addItemWithTitle:@"Quit Peggle" action:@selector(terminate:) keyEquivalent:@"q"];
     [app_item setSubmenu:menu];
     [NSApp setMainMenu:bar];
@@ -314,19 +389,33 @@ static uint32_t pg_create_window(NSRect content, bool overlay)
         slot->image_view = view;
     } else {
         NSWindow *window = [[NSWindow alloc] initWithContentRect:content
-                                                       styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable
+                                                       styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                                 NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                          backing:NSBackingStoreBuffered defer:NO];
         [window setTitle:@"PeggleSilicon"];
         [window setReleasedWhenClosed:NO];
         [window setAcceptsMouseMovedEvents:YES];
-        PeggleView *view = [[[PeggleView alloc] initWithFrame:NSMakeRect(0, 0, content.size.width, content.size.height)] autorelease];
-        [window setContentView:view];
+        /* Peggle renders at 4:3.  Let AppKit enlarge the drawable, but keep
+           the game's native geometry intact and offer the standard full-screen
+           transition (Control-Command-F or the Peggle menu). */
+        [window setContentAspectRatio:NSMakeSize(4, 3)];
+        [window setMinSize:NSMakeSize(800, 600)];
+        [window setCollectionBehavior:NSWindowCollectionBehaviorFullScreenPrimary];
+        PeggleLetterboxView *container = [[[PeggleLetterboxView alloc]
+            initWithFrame:NSMakeRect(0, 0, content.size.width, content.size.height)] autorelease];
+        PeggleView *view = [[[PeggleView alloc]
+            initWithFrame:NSMakeRect(0, 0, content.size.width, content.size.height)] autorelease];
+        [container addSubview:view];
+        [container layout];
+        [window setContentView:container];
         [window makeFirstResponder:view];
         static PeggleWindowDelegate *delegate;
         if (!delegate) delegate = [[PeggleWindowDelegate alloc] init];
         [window setDelegate:delegate];
         [window center];
         slot->window = window;
+        slot->render_view = view;
+        slot->logical_content_size = content.size;
     }
     slot->overlay = overlay;
     slot->handle = handle;
@@ -350,6 +439,9 @@ static void pg_dispose_window(struct pg_win *w)
 }
 static void pg_set_bounds(struct pg_win *w, NSRect rect, bool is_content)
 {
+    if (!w->overlay && is_content && rect.size.width > 0 && rect.size.height > 0) {
+        w->logical_content_size = rect.size;
+    }
     NSRect frame = is_content ? [w->window frameRectForContentRect:rect] : rect;
     if (!w->overlay && guest_display_mode_active()) {
         /* Emulated fullscreen: the game pins its window to the display origin;
@@ -385,7 +477,7 @@ static void pg_attach_gl(void)
         w = pg_main_win();
     }
     pg_ensure_gl();
-    [pg_gl setView:[w->window contentView]];
+    [pg_gl setView:w->render_view ? w->render_view : [w->window contentView]];
     [pg_gl makeCurrentContext];
     [pg_gl update];
     GLint one = 1;
@@ -492,13 +584,24 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_SetWindowTitleWithCFString")) { struct pg_win *w = pg_win_for(a[0]); if (w) [w->window setTitle:@"PeggleSilicon"]; RET(0); }
     if (IS("_SizeWindow")) {
         struct pg_win *w = pg_win_for(a[0]);
-        if (w) { [w->window setContentSize:NSMakeSize((int16_t)a[1], (int16_t)a[2])]; if (!w->overlay) [pg_gl update]; }
+        if (w) {
+            NSSize size = NSMakeSize((int16_t)a[1], (int16_t)a[2]);
+            if (!w->overlay && size.width > 0 && size.height > 0) w->logical_content_size = size;
+            [w->window setContentSize:size];
+            if (!w->overlay) [pg_gl update];
+        }
         RET(0);
     }
     if (IS("_GetWindowBounds")) {
         struct pg_win *w = pg_win_for(a[0]);
         int16_t q[4] = {0, 0, 600, 800};
-        if (w) pg_qd_from_rect(a[1] == kWindowStructureRgn ? [w->window frame] : pg_content_rect(w), q);
+        if (w) {
+            pg_qd_from_rect(a[1] == kWindowStructureRgn ? [w->window frame] : pg_content_rect(w), q);
+            if (!w->overlay && w->logical_content_size.width > 0 && w->logical_content_size.height > 0) {
+                q[2] = q[0] + (int16_t)w->logical_content_size.height;
+                q[3] = q[1] + (int16_t)w->logical_content_size.width;
+            }
+        }
         if (a[2]) memcpy(P(2), q, sizeof(q));
         RET(0);
     }
@@ -509,8 +612,8 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     }
     if (IS("_GetPortBounds")) {
         struct pg_win *w = pg_win_for(a[0]);
-        NSRect c = w ? pg_content_rect(w) : NSMakeRect(0, 0, 800, 600);
-        int16_t q[4] = {0, 0, (int16_t)c.size.height, (int16_t)c.size.width};
+        NSSize size = w && w->logical_content_size.width > 0 ? w->logical_content_size : NSMakeSize(800, 600);
+        int16_t q[4] = {0, 0, (int16_t)size.height, (int16_t)size.width};
         if (a[1]) memcpy(P(1), q, sizeof(q));
         RET(a[1]);
     }
@@ -529,17 +632,21 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         RET(inDesk);
     }
     if (IS("_GetGlobalMouse")) {
-        NSPoint p = pg_qd_point([NSEvent mouseLocation]);
+        NSPoint screen = pg_virtual_screen_mouse_point(pg_main_win(), [NSEvent mouseLocation]);
+        NSPoint p = pg_qd_point(screen);
         int16_t q[2] = {(int16_t)p.y, (int16_t)p.x};
         if (a[0]) memcpy(P(0), q, sizeof(q));
         RET(0);
     }
     if (IS("_GlobalToLocal")) {
         struct pg_win *w = pg_main_win();
-        int16_t bounds[4] = {0, 0, 0, 0};
-        if (w) pg_qd_from_rect(pg_content_rect(w), bounds);
         int16_t *q = P(0);
-        if (q) { q[0] -= bounds[0]; q[1] -= bounds[1]; }
+        if (q && w) {
+            int16_t bounds[4];
+            pg_qd_from_rect(pg_content_rect(w), bounds);
+            q[0] -= bounds[0];
+            q[1] -= bounds[1];
+        }
         RET(0);
     }
     if (IS("_SetRect")) { int16_t q[4] = {(int16_t)a[2], (int16_t)a[1], (int16_t)a[4], (int16_t)a[3]}; if (a[0]) memcpy(P(0), q, sizeof(q)); RET(0); }
@@ -648,14 +755,16 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
                 memcpy(temp, &handle, 4);
                 length = 4;
             } else if (a[1] == kEventParamMouseLocation) {
-                NSPoint p = pg_qd_point(pg_event_screen_point(native));
+                NSPoint screen = pg_virtual_screen_mouse_point(pg_main_win(),
+                                                                 pg_event_screen_point(native));
+                NSPoint p = pg_qd_point(screen);
                 if (a[2] == typeQDPoint) { int16_t q[2] = {(int16_t)p.y, (int16_t)p.x}; memcpy(temp, q, 4); length = 4; }
                 else { float q[2] = {(float)p.x, (float)p.y}; memcpy(temp, q, 8); length = 8; }
             } else if (a[1] == kEventParamWindowMouseLocation) {
                 struct pg_win *w = pg_main_win();
                 NSPoint p = pg_event_screen_point(native);
-                NSRect c = w ? pg_content_rect(w) : NSZeroRect;
-                float q[2] = {(float)(p.x - c.origin.x), (float)(NSMaxY(c) - p.y)};
+                NSPoint local = w ? pg_logical_mouse_point(w, p) : NSZeroPoint;
+                float q[2] = {(float)local.x, (float)local.y};
                 memcpy(temp, q, 8);
                 length = 8;
             } else if (a[1] == kEventParamMouseButton) {
