@@ -5,3 +5,4 @@ native/build/
 diagnostics/*
 # BASS is fetched by tools/fetch_bass.py, not committed
 native/vendor/bass/
+/launch-video/
