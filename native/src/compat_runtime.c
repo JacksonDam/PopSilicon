@@ -3910,6 +3910,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_sin")) return return_guest_double(sin(guest_double(arguments)));
     if (import_is(name, "_cos")) return return_guest_double(cos(guest_double(arguments)));
     if (import_is(name, "_atan")) return return_guest_double(atan(guest_double(arguments)));
+    if (import_is(name, "_fmod")) {
+        return return_guest_double(fmod(guest_double(arguments),
+                                        guest_double(arguments + 2)));
+    }
     if (import_is(name, "_ceil")) return return_guest_double(ceil(guest_double(arguments)));
     if (import_is(name, "_floor")) return return_guest_double(floor(guest_double(arguments)));
     if (import_is(name, "_rint")) return return_guest_double(rint(guest_double(arguments)));
