@@ -119,7 +119,20 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         uint32_t obj=a[0];
         if (strcmp(op,"C1Ev")==0 || strcmp(op,"C2Ev")==0) PG_RETURN(pg_string_set(obj,NULL,0,w,true));
         if (strcmp(op,"D1Ev")==0 || strcmp(op,"D2Ev")==0) {guest_string_dispose_object(obj);PG_RETURN(0);}
-        if (strncmp(op,"C1EPK",5)==0) {const void *s=(void *)(uintptr_t)a[1];PG_RETURN(pg_string_set(obj,s,wide?wcslen(s):strlen(s),w,true));}
+        if (strncmp(op,"C1EPK",5)==0 || strncmp(op,"C2EPK",5)==0) {
+            /* basic_string(const CharT* s, [size_type n,] const Alloc&): the
+               counted form ("...EPKwmRKS1_" / "...EPKcmRKSaIcE") must copy
+               exactly n units -- the source need not be NUL-terminated (a
+               vector<wchar_t> buffer, a substring).  Measuring it with
+               wcslen/strlen instead dragged heap/stack garbage into the
+               string's tail; Bejeweled 3 then fed those "characters" to its
+               glyph cache every frame, which grew without bound and made the
+               game slow down steadily. */
+            const void *s=(void *)(uintptr_t)a[1];
+            bool counted=(op[5]=='w'||op[5]=='c') && op[6]=='m';
+            size_t len=counted?a[2]:(wide?wcslen(s):strlen(s));
+            PG_RETURN(pg_string_set(obj,s,len,w,true));
+        }
         if (strncmp(op,"C1ERK",5)==0) PG_RETURN(pg_string_set(obj,guest_string_data(a[1]),guest_string_length(a[1]),w,true));
         if (strcmp(op,"C1EmcRKSaIcE")==0) {char *s=malloc(a[1]);memset(s,a[2],a[1]);pg_string_set(obj,s,a[1],1,true);free(s);PG_RETURN(obj);}
         /* Wide fill ctor: basic_string(size_type n, wchar_t c, allocator) --
@@ -155,7 +168,11 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
             size_t cap=a[1]>n?a[1]:n;uint32_t rep=guest_allocate_at(12+(cap+1)*w,true,kGuestHeapStringSite);uint32_t *r=(void *)(uintptr_t)rep;r[0]=(uint32_t)n;r[1]=(uint32_t)cap;memcpy(r+3,s,n*w);uint32_t old=*(uint32_t *)(uintptr_t)obj;*(uint32_t *)(uintptr_t)obj=rep+12;if(old>=12)guest_string_dispose_rep(old-12);PG_RETURN(0);
         }
         if (strcmp(op,"5clearEv")==0) PG_RETURN(pg_string_set(obj,NULL,0,w,false));
-        if (strncmp(op,"aSEPK",5)==0 || strncmp(op,"6assignEPK",10)==0) {const void *v=(void *)(uintptr_t)a[1];PG_RETURN(pg_string_set(obj,v,wide?wcslen(v):strlen(v),w,false));}
+        if (strncmp(op,"aSEPK",5)==0 || strncmp(op,"6assignEPK",10)==0) {
+            const void *v=(void *)(uintptr_t)a[1];
+            bool counted=strstr(op,"PKcm")!=NULL||strstr(op,"PKwm")!=NULL;
+            PG_RETURN(pg_string_set(obj,v,counted?a[2]:(wide?wcslen(v):strlen(v)),w,false));
+        }
         if (strncmp(op,"aSERK",5)==0 || strncmp(op,"6assignERK",10)==0) PG_RETURN(pg_string_set(obj,guest_string_data(a[1]),guest_string_length(a[1]),w,false));
         if (strcmp(op,"aSEc")==0) {char c=a[1];PG_RETURN(pg_string_set(obj,&c,1,1,false));}
         if (strncmp(op,"6assignEm",9)==0) {size_t len=a[1];char *v=malloc((len+1)*w);for(size_t i=0;i<len;i++)memcpy(v+i*w,&a[2],w);pg_string_set(obj,v,len,w,false);free(v);PG_RETURN(obj);}
