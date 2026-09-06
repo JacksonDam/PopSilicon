@@ -17,6 +17,8 @@
 #include <limits.h>
 #include <mach/mach.h>
 #include <mach/mach_time.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_region.h>
 #include <mach-o/dyld.h>
 #include <math.h>
 #include <pthread.h>
@@ -1150,6 +1152,85 @@ static void bind_native_stubs(uint8_t *code)
     }
 }
 
+
+/*
+ * Patching an import stub means writing into the guest image, which may sit on
+ * a read-only page.  Opening such a page has to be undone: a page left rwx
+ * splits the VM region enclosing it, and Steam's DRM decryptor locates its
+ * appended __LINKEDIT blob with mach_vm_region.  A stray split there makes the
+ * decryptor compute a garbage pointer and crash the unwrap.  Only the pages a
+ * stub actually occupies are opened, so patching the last stub of Peggle's rwx
+ * __IMPORT segment no longer reaches into the __LINKEDIT page that follows.
+ */
+struct guest_write_window {
+    size_t page_size;
+    unsigned count;
+    uintptr_t page[2];
+    int protection[2];
+};
+
+static int guest_page_protection(uintptr_t page)
+{
+    mach_vm_address_t address = page;
+    mach_vm_size_t size = 0;
+    vm_region_basic_info_data_64_t info;
+    mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+    mach_port_t object = MACH_PORT_NULL;
+    kern_return_t result = mach_vm_region(mach_task_self(), &address, &size,
+                                          VM_REGION_BASIC_INFO_64,
+                                          (vm_region_info_t)&info, &count,
+                                          &object);
+    if (object != MACH_PORT_NULL) mach_port_deallocate(mach_task_self(), object);
+    if (result != KERN_SUCCESS || address > (mach_vm_address_t)page) return -1;
+    int protection = 0;
+    if (info.protection & VM_PROT_READ) protection |= PROT_READ;
+    if (info.protection & VM_PROT_WRITE) protection |= PROT_WRITE;
+    if (info.protection & VM_PROT_EXECUTE) protection |= PROT_EXEC;
+    return protection;
+}
+
+static void guest_write_window_close(struct guest_write_window *window)
+{
+    while (window->count) {
+        --window->count;
+        mprotect((void *)window->page[window->count], window->page_size,
+                 window->protection[window->count]);
+    }
+}
+
+/* Makes exactly the pages [address, address + length) writable, restoring the
+   pages opened for a previous call. */
+static int guest_write_window_open(struct guest_write_window *window,
+                                   uintptr_t address, size_t length)
+{
+    uintptr_t mask = (uintptr_t)(window->page_size - 1);
+    uintptr_t first = address & ~mask;
+    uintptr_t last = (address + length - 1) & ~mask;
+    unsigned needed = (unsigned)((last - first) / window->page_size) + 1;
+    if (needed > sizeof(window->page) / sizeof(window->page[0])) {
+        errno = ERANGE;
+        return -1;
+    }
+    if (window->count == needed && window->page[0] == first &&
+        (needed < 2 || window->page[1] == last)) {
+        return 0;
+    }
+    guest_write_window_close(window);
+    for (uintptr_t page = first; page <= last; page += window->page_size) {
+        int protection = guest_page_protection(page);
+        if (protection < 0) protection = PROT_READ | PROT_EXEC;
+        if (mprotect((void *)page, window->page_size,
+                     PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
+            guest_write_window_close(window);
+            return -1;
+        }
+        window->page[window->count] = page;
+        window->protection[window->count] = protection;
+        ++window->count;
+    }
+    return 0;
+}
+
 static int build_transition_bridge(void)
 {
     uint8_t *code = (void *)(uintptr_t)kBridgeCodeBase;
@@ -1197,8 +1278,7 @@ static int build_transition_bridge(void)
        Make each stub's page writable+executable before patching (a no-op when
        it is already writable).  A one-page cache keeps this to a few mprotect
        calls since the stubs are contiguous. */
-    size_t page_size = (size_t)getpagesize();
-    uintptr_t protected_page = 0;
+    struct guest_write_window window = {.page_size = (size_t)getpagesize()};
     for (uint32_t index = 0; index < current_image->import_count; ++index) {
         if (current_image->imports[index].kind != MACHO_IMPORT32_STUB) continue;
         uint8_t *thunk = code + kImportThunksOffset + index * kImportThunkSize;
@@ -1216,19 +1296,15 @@ static int build_transition_bridge(void)
             errno = ERANGE;
             return runtime_error("i386 import thunk displacement");
         }
-        /* The stub is 5 bytes; protect the page it starts on plus the next so
-           a stub straddling a page boundary is fully writable. */
-        uintptr_t page = (uintptr_t)stub & ~(uintptr_t)(page_size - 1);
-        if (page != protected_page) {
-            if (mprotect((void *)page, page_size * 2,
-                         PROT_READ | PROT_WRITE | PROT_EXEC) != 0) {
-                return runtime_error("mprotect import stub page");
-            }
-            protected_page = page;
+        /* Open just the page(s) this 5-byte stub occupies, and put their
+           original protection back once every stub is patched. */
+        if (guest_write_window_open(&window, (uintptr_t)stub, 5) != 0) {
+            return runtime_error("mprotect import stub page");
         }
         stub[0] = 0xe9;
         emit_u32(stub + 1, (uint32_t)(int32_t)displacement);
     }
+    guest_write_window_close(&window);
 
     for (uint32_t index = 0; index < kDynamicThunkCapacity; ++index) {
         uint8_t *thunk = code + kDynamicThunksOffset + index * kImportThunkSize;
