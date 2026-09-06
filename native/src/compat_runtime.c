@@ -3110,11 +3110,25 @@ static lp32_fast_import_fn runtime_fast_import(const char *name)
     return NULL;
 }
 
+static int (*g_named_import_override)(const char *, const uint32_t *,
+                                      uint64_t *);
+
+void compat_runtime32_set_named_import_override(
+    int (*handler)(const char *name, const uint32_t *arguments,
+                   uint64_t *result))
+{
+    g_named_import_override = handler;
+}
+
 static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                       const uint32_t *arguments,
                                       uint32_t return_address)
 {
     uint64_t peggle_result;
+    if (g_named_import_override &&
+        g_named_import_override(name, arguments, &peggle_result)) {
+        return peggle_result;
+    }
     if (peggle_cpp_dispatch(name, arguments, &peggle_result) ||
         peggle_libc_dispatch(name, arguments, &peggle_result) ||
         peggle_bass_dispatch(name, arguments, &peggle_result)) return peggle_result;

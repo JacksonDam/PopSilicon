@@ -2,6 +2,7 @@
 #include "game_profile.h"
 #include "macho_loader.h"
 #include "objc_bridge.h"
+#include "steam_unwrap.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -638,15 +639,23 @@ int main(int argc, char **argv)
 
     if (getenv("LP32_PAUSE_FOR_VMMAP")) sleep(30);
 
+    /* Open the session log before the image is examined: a Steam or Finder
+       launch has no other way to report an image the loader rejects. */
+    open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+
+    /* Steam DRM unwrap: recover a clean image from a DRM-wrapped executable by
+       running Valve's own i386 decryptor under the runtime.  This does not run
+       the game, so it bypasses the title-profile check and startup patches. */
+    const char *unwrap_output = getenv("LP32_UNWRAP_STEAM");
+
     struct macho_image32 image;
     if (macho_image32_load(image_path, &image) != 0) return EXIT_FAILURE;
-    if (lp32_profile_select(&image) != 0) {
+    if (!unwrap_output && lp32_profile_select(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
-    open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
 
-    if (configure_guest_breakpoint(&image) != 0) {
+    if (!unwrap_output && configure_guest_breakpoint(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
@@ -667,6 +676,11 @@ int main(int argc, char **argv)
     if (compat_runtime32_initialize(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
+    }
+    if (unwrap_output) {
+        int result = steam_unwrap_run(image_path, unwrap_output);
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     if (getenv("LP32_HEAP_SELFTEST")) {
         int result = compat_runtime32_run_heap_self_test();

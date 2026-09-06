@@ -17,7 +17,7 @@ all: $(BUILD_DIR)/game_loader
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/game_loader: Makefile $(wildcard src/*.h src/*.inc) src/game_loader.c src/game_profile.c src/macho_loader.c src/compat_runtime.c src/audio_bridge.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/address_space_reserve.S | $(BUILD_DIR)
+$(BUILD_DIR)/game_loader: Makefile $(wildcard src/*.h src/*.inc) src/game_loader.c src/game_profile.c src/macho_loader.c src/steam_unwrap.c src/compat_runtime.c src/audio_bridge.c src/objc_bridge.m src/arb_program_guard.c src/arb_sampler_usage.c src/mode32_switch.S src/import_gateway.S src/address_space_reserve.S | $(BUILD_DIR)
 	$(CLANG) $(CFLAGS) $(LDFLAGS) $(filter %.c %.m %.S,$^) -Lvendor/bass -lbass -Wl,-rpath,@executable_path -framework Cocoa -framework Carbon -framework OpenGL -framework AudioToolbox -framework AudioUnit -framework CoreAudio -framework IOKit -o $@
 	@text=$$(otool -l $@ | awk '/segname __TEXT$$/ { getline; print $$2; exit }'); \
 	linkedit=$$(otool -l $@ | awk '/segname __LINKEDIT$$/ { getline; print $$2; exit }'); \

@@ -87,14 +87,10 @@ struct ContentView: View {
         .frame(minWidth: 520, idealWidth: 560, minHeight: 520, idealHeight: 600)
         .alert(isPresented: $model.showSteamReplacementConfirmation) {
             Alert(
-                title: Text("Replace Steam installation?"),
-                message: Text(
-                    model.steamInstallationURL.map {
-                        "The original will be renamed to \($0.lastPathComponent).bak before PeggleSilicon is installed."
-                    } ?? "The original Steam app will be backed up before PeggleSilicon is installed."
-                ),
+                title: Text(model.steamAlertTitle),
+                message: Text(model.steamAlertMessage),
                 primaryButton: .destructive(
-                    Text("Replace and Install"),
+                    Text(model.steamAlertButtonTitle),
                     action: model.confirmSteamReplacement
                 ),
                 secondaryButton: .cancel(Text("Cancel"))

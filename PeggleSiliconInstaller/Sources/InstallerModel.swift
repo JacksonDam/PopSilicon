@@ -28,16 +28,7 @@ final class InstallerModel: ObservableObject {
         if let steamInstallation {
             steamInstallationState = SteamLocator.state(of: steamInstallation)
         }
-        switch steamInstallationState {
-        case .unpatched:
-            statusMessage = "Steam installation detected. It can be installed directly."
-        case .peggleSilicon:
-            statusMessage = "PeggleSilicon is already installed in Steam."
-        case .unsupported:
-            statusMessage = steamInstallation == nil
-                ? "Drop the game app to begin."
-                : "Steam installation found, but it is not an unmodified 32-bit copy."
-        }
+        refreshStatusMessage()
     }
 
     var destinationURL: URL? {
@@ -48,10 +39,69 @@ final class InstallerModel: ObservableObject {
         sourceURL != nil && destinationDirectory != nil && !isBuilding
     }
 
+    /// Steam's install can be installed into or repaired.
+    private var steamIsInstallable: Bool {
+        steamInstallationState == .unpatched || steamInstallationState == .needsRepair
+    }
+
+    /// Location of the original 32-bit Peggle game to build the Steam install
+    /// from.  Steam's own copy is DRM-wrapped, but the build unwraps it, so no
+    /// separate download is required.  A dropped game app overrides, and a
+    /// prior `.bak` backup is the source when repairing an existing install.
+    var steamBuildSource: URL? {
+        if let sourceURL { return sourceURL }
+        guard let steamInstallationURL else { return nil }
+        let backup = steamInstallationURL.appendingPathExtension("bak")
+        switch steamInstallationState {
+        case .unpatched:
+            return steamInstallationURL
+        case .needsRepair, .peggleSilicon:
+            return FileManager.default.fileExists(atPath: backup.path) ? backup : nil
+        case .unsupported:
+            return nil
+        }
+    }
+
     var canReplaceSteam: Bool {
         steamInstallationURL != nil
-            && steamInstallationState == .unpatched
+            && steamIsInstallable
+            && steamBuildSource != nil
             && !isBuilding
+    }
+
+    var steamActionTitle: String {
+        steamInstallationState == .needsRepair
+            ? "Repair Steam installation…"
+            : "Replace Steam installation…"
+    }
+
+    var steamAlertTitle: String {
+        steamInstallationState == .needsRepair
+            ? "Repair Steam installation?"
+            : "Replace Steam installation?"
+    }
+
+    var steamAlertMessage: String {
+        let needsSteam = "Steam must be running and signed in to the account that owns "
+            + "Peggle Deluxe, which is used once to unwrap the game's DRM."
+        if steamInstallationState == .needsRepair {
+            return "PeggleSilicon in Steam will be rebuilt in place; the existing "
+                + "Peggle Deluxe.app.bak backup is kept.\n\n" + needsSteam
+        }
+        let backupName = steamInstallationURL.map { "\($0.lastPathComponent).bak" } ?? "Peggle Deluxe.app.bak"
+        return "The original will be renamed to \(backupName) before PeggleSilicon is installed.\n\n"
+            + needsSteam
+    }
+
+    var steamAlertButtonTitle: String {
+        steamInstallationState == .needsRepair ? "Repair" : "Replace and Install"
+    }
+
+    var dropZoneHint: String {
+        guard steamInstallationURL != nil, steamIsInstallable else {
+            return "The original Peggle Deluxe 1.0.5 application is required."
+        }
+        return "Optional for Steam; needed only to export a standalone copy to a folder."
     }
 
     func acceptDrop(providers: [NSItemProvider]) -> Bool {
@@ -128,7 +178,7 @@ final class InstallerModel: ObservableObject {
 
     func requestSteamReplacement() {
         guard steamInstallationURL != nil, !isBuilding else { return }
-        guard steamInstallationState == .unpatched else {
+        guard steamIsInstallable, steamBuildSource != nil else {
             errorMessage = "The Steam app is already patched or is not an unmodified 32-bit Peggle installation."
             return
         }
@@ -138,8 +188,8 @@ final class InstallerModel: ObservableObject {
 
     func confirmSteamReplacement() {
         showSteamReplacementConfirmation = false
-        guard let steamInstallationURL else { return }
-        guard steamInstallationState == .unpatched else {
+        guard let steamInstallationURL, let source = steamBuildSource else { return }
+        guard steamIsInstallable else {
             errorMessage = "The Steam app is already patched or is not an unmodified 32-bit Peggle installation."
             return
         }
@@ -148,18 +198,20 @@ final class InstallerModel: ObservableObject {
             return
         }
 
+        let repairing = steamInstallationState == .needsRepair
+        let backup = steamInstallationURL.appendingPathExtension("bak")
         isBuilding = true
         errorMessage = nil
         buildOutput = nil
         installationSucceeded = false
         successProgress = 0
         steamReplacementSucceeded = false
-        steamBackupURL = steamInstallationURL.appendingPathExtension("bak")
-        statusMessage = "Installing into Steam…"
+        steamBackupURL = backup
+        statusMessage = repairing ? "Repairing the Steam installation…" : "Installing into Steam…"
 
         Task { [weak self] in
             let result = await SteamReplacementRunner.run(
-                source: steamInstallationURL,
+                source: source,
                 target: steamInstallationURL,
                 projectRoot: projectRoot
             )
@@ -172,7 +224,8 @@ final class InstallerModel: ObservableObject {
                 steamReplacementSucceeded = true
                 installationSucceeded = true
                 steamInstallationState = .peggleSilicon
-                pegHitSoundPlayer.play(from: steamInstallationURL, projectRoot: projectRoot)
+                steamBackupURL = FileManager.default.fileExists(atPath: backup.path) ? backup : nil
+                pegHitSoundPlayer.play(from: source, projectRoot: projectRoot)
                 successProgress = 0
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 80_000_000)
@@ -180,8 +233,29 @@ final class InstallerModel: ObservableObject {
                 }
             } else {
                 statusMessage = "Installation failed."
-                errorMessage = "The Steam installation was not replaced."
+                errorMessage = repairing
+                    ? "The Steam installation was not repaired."
+                    : "The Steam installation was not replaced."
             }
+        }
+    }
+
+    private func refreshStatusMessage() {
+        guard steamInstallationURL != nil else {
+            statusMessage = "Drop the game app to begin."
+            return
+        }
+        switch steamInstallationState {
+        case .unpatched:
+            statusMessage = "Steam installation detected. It can be installed directly."
+        case .needsRepair:
+            statusMessage = steamBuildSource != nil
+                ? "PeggleSilicon in Steam needs repair. It can be repaired directly."
+                : "PeggleSilicon in Steam needs repair, but no backup was found to rebuild from."
+        case .peggleSilicon:
+            statusMessage = "PeggleSilicon is already installed in Steam."
+        case .unsupported:
+            statusMessage = "Steam installation found, but it is not an unmodified 32-bit copy."
         }
     }
 
@@ -191,16 +265,16 @@ final class InstallerModel: ObservableObject {
             return
         }
 
-        if url.standardizedFileURL == steamInstallationURL?.standardizedFileURL,
-           SteamLocator.state(of: url) != .unpatched {
-            errorMessage = "The Steam app is already patched or is not an unmodified 32-bit Peggle installation."
-            return
-        }
-
         let executable = url.appendingPathComponent("Contents/MacOS/Peggle")
         guard url.pathExtension.lowercased() == "app",
               FileManager.default.fileExists(atPath: executable.path) else {
             errorMessage = "Drop the original Peggle Deluxe.app bundle."
+            return
+        }
+        // Both the retail game and Steam's DRM copy are valid: the DRM copy is
+        // unwrapped at build time.
+        guard SteamLocator.isGameSource(url) else {
+            errorMessage = "This app does not contain the original 32-bit Peggle executable."
             return
         }
 

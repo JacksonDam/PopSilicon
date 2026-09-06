@@ -26,13 +26,11 @@ struct DropZoneView: View {
                 } else {
                     Text("Drag Peggle Deluxe.app here")
                         .font(.headline)
-                    Text(
-                        model.steamInstallationState == .unpatched
-                            ? "Required for a standalone export; Steam can be installed directly above."
-                            : "The original Peggle Deluxe 1.0.5 application is required."
-                        )
+                    Text(model.dropZoneHint)
                         .font(.caption)
                         .foregroundColor(.gray)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
         }

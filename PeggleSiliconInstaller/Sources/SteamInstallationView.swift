@@ -14,34 +14,20 @@ struct SteamInstallationView: View {
                         .foregroundColor(.gray)
                 }
             } else if let steamInstallationURL = model.steamInstallationURL {
-                Label(
-                    model.steamInstallationState == .unpatched
-                        ? "Steam installation detected"
-                        : model.steamInstallationState == .peggleSilicon
-                            ? "PeggleSilicon already installed in Steam"
-                            : "Unsupported Steam installation",
-                    systemImage: model.steamInstallationState == .unpatched
-                        ? "gamecontroller"
-                        : model.steamInstallationState == .peggleSilicon
-                            ? "checkmark.circle"
-                            : "exclamationmark.triangle"
-                )
+                Label(headline, systemImage: symbol)
                     .font(.headline)
                 Text(steamInstallationURL.path)
                     .font(.caption)
                     .foregroundColor(.gray)
                     .lineLimit(2)
                     .truncationMode(.middle)
-                if model.steamInstallationState == .unpatched {
-                    Text("The unmodified Steam app will be used directly.")
+                if let detail {
+                    Text(detail)
                         .font(.caption)
                         .foregroundColor(.gray)
-                } else if model.steamInstallationState == .unsupported {
-                    Text("This app is not an unmodified 32-bit Peggle installation.")
-                        .font(.caption)
-                        .foregroundColor(.gray)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                Button("Replace Steam installation…", action: model.requestSteamReplacement)
+                Button(model.steamActionTitle, action: model.requestSteamReplacement)
                     .disabled(!model.canReplaceSteam)
             }
         }
@@ -51,5 +37,37 @@ struct SteamInstallationView: View {
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color.gray.opacity(0.08))
         )
+    }
+
+    private var headline: String {
+        switch model.steamInstallationState {
+        case .unpatched: return "Steam installation detected"
+        case .peggleSilicon: return "PeggleSilicon already installed in Steam"
+        case .needsRepair: return "PeggleSilicon in Steam needs repair"
+        case .unsupported: return "Unsupported Steam installation"
+        }
+    }
+
+    private var symbol: String {
+        switch model.steamInstallationState {
+        case .unpatched: return "gamecontroller"
+        case .peggleSilicon: return "checkmark.circle"
+        case .needsRepair, .unsupported: return "exclamationmark.triangle"
+        }
+    }
+
+    private var detail: String? {
+        switch model.steamInstallationState {
+        case .unpatched:
+            return "Steam's copy is DRM-protected; its game code is unwrapped automatically. No separate download is needed."
+        case .needsRepair:
+            return model.canReplaceSteam
+                ? "The game image is still DRM-encrypted; it can be repaired from the backup."
+                : "The game image is DRM-encrypted and no Peggle Deluxe.app.bak backup was found to rebuild from."
+        case .peggleSilicon:
+            return nil
+        case .unsupported:
+            return "This app is not an unmodified 32-bit Peggle installation."
+        }
     }
 }

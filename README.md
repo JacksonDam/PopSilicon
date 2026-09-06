@@ -46,14 +46,23 @@ Drag the original `Peggle Deluxe.app` into the window, choose an export folder,
 and click **Install PeggleSilicon**. The helper invokes `tools/build.py` and
 creates `PeggleSilicon.app` in the selected folder.
 
-Steam support is currently broken.
+If the standard Steam installation is present, the installer offers
+**Replace Steam installation…** and installs directly from it. No separate
+download is needed: Valve ships the Steam executable wrapped in Steam DRM, which
+keeps the game code encrypted, so the build first unwraps it. Because macOS can
+no longer run the 32-bit game, the unwrap is performed by the compatibility
+runtime itself, which executes Valve's own decryptor to recover the original
+code. That decryptor verifies ownership through a live handshake with the Steam
+client, so **Steam must be running and signed in to the account that owns Peggle
+Deluxe** during installation; the build starts Steam if it is not already
+running. After confirmation, the original Steam app is renamed to
+`Peggle Deluxe.app.bak` and the Apple silicon build takes its place with Steam's
+expected `Contents/MacOS/Peggle` executable name. An older PeggleSilicon install
+whose game image is still the encrypted executable is detected and can be
+repaired the same way from the backup.
 
-~~If the standard Steam installation is present and still unmodified, the installer
-can use that `.app` directly and offers **Replace Steam installation…**. It checks
-for the original 32-bit Intel executable before proceeding. After confirmation,
-the original Steam app is renamed to `Peggle Deluxe.app.bak` and the Apple silicon
-build takes its place with Steam's expected `Contents/MacOS/Peggle` executable name.~~
-
-The original game executable and resources are copied unchanged into
+The same unwrap runs for a standalone export if a DRM-wrapped app is supplied,
+so both the Steam copy and a DRM-free `Peggle Deluxe.app` work as the source.
+The recovered game executable and resources are copied into
 `Contents/SharedSupport`. BASS is bundled from `native/vendor/bass` and the
 resulting app is ad hoc signed for local use.

@@ -2,8 +2,14 @@ import Foundation
 
 enum SteamLocator {
     enum InstallationState: Equatable {
+        /// Valve's copy of the game is still in place.
         case unpatched
+        /// PeggleSilicon is installed and its game image is loadable.
         case peggleSilicon
+        /// PeggleSilicon is installed, but its game image is Steam's still
+        /// DRM-encrypted executable, which the loader cannot start (an older
+        /// install predating in-installer DRM unwrapping); it can be repaired.
+        case needsRepair
         case unsupported
     }
 
@@ -32,13 +38,22 @@ enum SteamLocator {
             return .unsupported
         }
 
-        // PeggleSilicon stores the original 32-bit image separately before
-        // replacing the Steam entry point with its native loader.
+        // PeggleSilicon stores the game image separately before replacing the
+        // Steam entry point with its native loader.  If that image is still the
+        // DRM-encrypted executable, the install predates DRM unwrapping and
+        // needs repair; otherwise it is a good install.
         if FileManager.default.fileExists(atPath: sharedImage.path) {
-            return .peggleSilicon
+            return MachOInspector.isSteamDRMWrapped(at: sharedImage) ? .needsRepair : .peggleSilicon
         }
 
         return MachOInspector.isI386Executable(at: executable) ? .unpatched : .unsupported
+    }
+
+    /// Whether a bundle's executable is the original 32-bit Peggle game (retail
+    /// or Steam's DRM copy — both are valid build sources; the DRM copy is
+    /// unwrapped at build time).
+    static func isGameSource(_ bundle: URL) -> Bool {
+        MachOInspector.isI386Executable(at: bundle.appendingPathComponent("Contents/MacOS/Peggle"))
     }
 }
 
@@ -47,6 +62,9 @@ private enum MachOInspector {
     private static let machHeader32: UInt32 = 0xfeedface
     private static let machHeader64: UInt32 = 0xfeedfacf
     private static let fatHeader: UInt32 = 0xcafebabe
+    /// Valve's DRM wrapper appends its unlock stub, which carries the wrapper's
+    /// own source paths; the native loader checks the same marker.
+    private static let steamDRMMarker = Data("/src/drm/mach-o/".utf8)
 
     static func isI386Executable(at url: URL) -> Bool {
         guard let data = try? Data(contentsOf: url), data.count >= 12 else { return false }
@@ -71,6 +89,11 @@ private enum MachOInspector {
         default:
             return false
         }
+    }
+
+    static func isSteamDRMWrapped(at url: URL) -> Bool {
+        guard let data = try? Data(contentsOf: url) else { return false }
+        return data.range(of: steamDRMMarker) != nil
     }
 
     private static func readUInt32(_ data: Data, at offset: Int, bigEndian: Bool) -> UInt32 {

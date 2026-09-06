@@ -34,6 +34,14 @@ uint64_t compat_runtime32_dispatch_import(const char *name,
    (the same mechanism dlsym results use).  0 if the thunk table is full. */
 uint32_t compat_runtime32_guest_callback(const char *name);
 
+/* Install a handler consulted first by the import dispatcher, before any
+   built-in bridge.  Returns 1 (and sets *result) to handle an import by name,
+   0 to fall through.  Used by the Steam DRM unwrap to shim the handful of
+   libSystem/dyld/mach functions Valve's decryptor calls.  NULL disables it. */
+void compat_runtime32_set_named_import_override(
+    int (*handler)(const char *name, const uint32_t *arguments,
+                   uint64_t *result));
+
 /* Per-thread bridge cost counters, accumulated only while
    LP32_FRAME_STATS is set.  The render thread reads and clears them once
    per swap. */

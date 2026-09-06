@@ -1,23 +1,33 @@
 import Foundation
 
 enum SteamReplacementRunner {
+    /// Builds PeggleSilicon from `source` (the bundle whose executable becomes
+    /// the game image) and installs it at `target`, Steam's app location.
+    /// A target that is still Valve's copy is renamed to `.bak` first; a
+    /// target that already holds PeggleSilicon is replaced in place, keeping
+    /// whatever backup exists.
     static func run(source: URL, target: URL, projectRoot: URL) async -> BuildResult {
         let fileManager = FileManager.default
         let parent = target.deletingLastPathComponent()
         let backup = target.appendingPathExtension("bak")
         let temporaryOutput = parent.appendingPathComponent(".PeggleSilicon.install.app")
-        let originalInfo = readInfoPlist(at: target)
+        let previousInstall = parent.appendingPathComponent(".PeggleSilicon.previous.app")
+        let backupExists = fileManager.fileExists(atPath: backup.path)
+        let targetIsPeggleSilicon = fileManager.fileExists(
+            atPath: target.appendingPathComponent("Contents/SharedSupport/Peggle.image").path
+        )
+        let originalInfo = readInfoPlist(at: backupExists ? backup : target)
 
-        guard !fileManager.fileExists(atPath: backup.path) else {
+        guard targetIsPeggleSilicon || !backupExists else {
             return BuildResult(
                 exitStatus: -1,
                 output: "A backup already exists at \(backup.path). Remove or move it before replacing the Steam installation."
             )
         }
-        guard !fileManager.fileExists(atPath: temporaryOutput.path) else {
+        for leftover in [temporaryOutput, previousInstall] where fileManager.fileExists(atPath: leftover.path) {
             return BuildResult(
                 exitStatus: -1,
-                output: "A previous temporary installation exists at \(temporaryOutput.path). Remove it before trying again."
+                output: "A previous temporary installation exists at \(leftover.path). Remove it before trying again."
             )
         }
 
@@ -30,12 +40,18 @@ enum SteamReplacementRunner {
 
         do {
             try makeSteamCompatible(at: temporaryOutput, preserving: originalInfo)
-            try fileManager.moveItem(at: target, to: backup)
+            // Move the current bundle aside, then put the new one in place;
+            // the aside copy is restored if that fails.
+            let aside = targetIsPeggleSilicon ? previousInstall : backup
+            try fileManager.moveItem(at: target, to: aside)
             do {
                 try fileManager.moveItem(at: temporaryOutput, to: target)
             } catch {
-                try? fileManager.moveItem(at: backup, to: target)
+                try? fileManager.moveItem(at: aside, to: target)
                 throw error
+            }
+            if targetIsPeggleSilicon {
+                try? fileManager.removeItem(at: previousInstall)
             }
         } catch {
             try? fileManager.removeItem(at: temporaryOutput)
@@ -45,10 +61,15 @@ enum SteamReplacementRunner {
             )
         }
 
-        return BuildResult(
-            exitStatus: 0,
-            output: build.output + "\nSteam installation replaced. Original saved to \(backup.path)."
-        )
+        let summary: String
+        if !targetIsPeggleSilicon {
+            summary = "Steam installation replaced. Original saved to \(backup.path)."
+        } else if backupExists {
+            summary = "Steam installation repaired. The original remains at \(backup.path)."
+        } else {
+            summary = "Steam installation repaired."
+        }
+        return BuildResult(exitStatus: 0, output: build.output + "\n" + summary)
     }
 
     private static func readInfoPlist(at bundle: URL) -> [String: Any]? {

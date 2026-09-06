@@ -1,6 +1,7 @@
 #include "game_profile.h"
 #include "macho_loader.h"
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -69,6 +70,22 @@ uint32_t lp32_profile_main_address(const struct macho_image32 *image)
     return 0;
 }
 
+/*
+ * Valve's Mach-O DRM wrapper (Steam's copy of the game) keeps the original
+ * load commands and entry stub but encrypts __TEXT,__text and appends its
+ * decryption stub to an enlarged, executable __LINKEDIT.  The encrypted image
+ * cannot be run directly; it must first be unwrapped (see steam_unwrap.c /
+ * LP32_UNWRAP_STEAM), which tools/build.py does automatically.  The stub
+ * carries its own source paths, which is the cheapest reliable signature.
+ */
+static bool steam_drm_wrapped(const struct macho_image32 *image)
+{
+    static const char marker[] = "/src/drm/mach-o/";
+    const void *start = (const void *)(uintptr_t)image->min_address;
+    size_t length = image->max_address - image->min_address;
+    return memmem(start, length, marker, sizeof(marker) - 1) != NULL;
+}
+
 int lp32_profile_select(const struct macho_image32 *image)
 {
     const char *override = getenv("LP32_GAME");
@@ -79,6 +96,16 @@ int lp32_profile_select(const struct macho_image32 *image)
     if ((image->entry_eip != peggle_profile.entry_eip ||
          image->max_address != peggle_profile.image_end) &&
         !(override && override[0])) {
+        if (steam_drm_wrapped(image)) {
+            fprintf(stderr,
+                    "game_loader: the game image is Steam's DRM-protected "
+                    "executable and must be unwrapped before it can run.  Set "
+                    "LP32_UNWRAP_STEAM to recover a clean image, or reinstall "
+                    "with tools/build.py, which unwraps the Steam copy "
+                    "automatically (entry=0x%08x end=0x%08x).\n",
+                    image->entry_eip, image->max_address);
+            return -1;
+        }
         fprintf(stderr,
                 "game_loader: unrecognised image (entry=0x%08x end=0x%08x)\n",
                 image->entry_eip, image->max_address);
