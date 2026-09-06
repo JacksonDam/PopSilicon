@@ -50,14 +50,10 @@ def unwrap_steam_drm(loader: pathlib.Path, drm_executable: pathlib.Path,
     ensure_steam_running()
     with tempfile.TemporaryDirectory(prefix='pegglesilicon-unwrap-') as tmp:
         staged = pathlib.Path(tmp)/'Peggle.image'
+        # The loader finds libbass next to itself (make copies the dylib into
+        # native/build), so no DYLD_* variables are needed; arch(1) would strip
+        # them anyway.
         env = dict(os.environ, LP32_UNWRAP_STEAM=str(staged))
-        # The loader links libbass with an @executable_path rpath; when run from
-        # native/build it has no sibling copy, so point the loader at the vendor
-        # dylib via the fallback search path.
-        env['DYLD_FALLBACK_LIBRARY_PATH'] = os.pathsep.join(filter(None, [
-            str(root/'native/vendor/bass'),
-            env.get('DYLD_FALLBACK_LIBRARY_PATH', ''),
-        ]))
         result = subprocess.run(
             ['arch', '-x86_64', str(loader), str(drm_executable)],
             env=env, capture_output=True, text=True)

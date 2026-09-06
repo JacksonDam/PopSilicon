@@ -12,7 +12,18 @@ LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segadd
 
 .PHONY: all clean run
 
-all: $(BUILD_DIR)/game_loader
+# game_loader links libbass as @rpath/libbass.dylib with @executable_path as
+# its only run path.  Keep a copy of the dylib next to the loader so it can be
+# run from here (make run, the Steam DRM unwrap in tools/build.py) without any
+# DYLD_* environment variables, which SIP strips from platform tools such as
+# arch(1) and which dyld no longer applies to @rpath names anyway.  The vendor
+# dylib is unsigned, so the copy is ad hoc signed and taken without extended
+# attributes; a quarantined unsigned library is refused by system policy.
+all: $(BUILD_DIR)/game_loader $(BUILD_DIR)/libbass.dylib
+
+$(BUILD_DIR)/libbass.dylib: vendor/bass/libbass.dylib | $(BUILD_DIR)
+	ditto --noextattr --noqtn $< $@
+	codesign --force --sign - $@
 
 $(BUILD_DIR):
 	mkdir -p $@
@@ -27,8 +38,8 @@ $(BUILD_DIR)/game_loader: Makefile $(wildcard src/*.h src/*.inc) src/game_loader
 	fi
 	codesign --force --sign - $@
 
-run: $(BUILD_DIR)/game_loader
+run: $(BUILD_DIR)/game_loader $(BUILD_DIR)/libbass.dylib
 	arch -x86_64 ./$(BUILD_DIR)/game_loader
 
 clean:
-	rm -f $(BUILD_DIR)/game_loader
+	rm -f $(BUILD_DIR)/game_loader $(BUILD_DIR)/libbass.dylib
