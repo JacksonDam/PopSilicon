@@ -154,15 +154,70 @@ static uint64_t hold_threshold_ns(void)
     return threshold;
 }
 
+/* Identity of the thread that presents frames (the guest's main/game thread)
+   and a yield flag raised while that thread is blocked in a bridged wait.  The
+   audio hold keys off the frame clock, so if the frame thread blocks waiting
+   for a render callback to run — CoreAudioSoundInstance::Release waits for
+   DoPostRenderMaintenance to mark a sound RELEASED — suppressing the guest
+   callback would stop that maintenance, the frame would never advance, and the
+   hold would never end (a deadlock; the "Main Menu from Quick Play hangs" bug).
+   While the frame thread is so blocked, yield the hold so the callback enters
+   the guest and the pending maintenance completes. */
+static unsigned long long hold_frame_thread;
+static int hold_frame_thread_waiting;
+
+static unsigned long long audio_current_thread_id(void)
+{
+    unsigned long long tid = 0;
+    pthread_threadid_np(NULL, &tid);
+    return tid;
+}
+
+/* Upper bound on a single hold episode.  A legitimate slow frame (first-use
+   shader compilation) is a few hundred ms; beyond this the hold always yields
+   so the guest callback resumes and any waiter is released even if the frame
+   thread detection above is bypassed.  LP32_AUDIO_HOLD_MAX_MS overrides it. */
+static uint64_t hold_cap_ns(void)
+{
+    static uint64_t cap = UINT64_MAX;
+    if (cap == UINT64_MAX) {
+        const char *value = getenv("LP32_AUDIO_HOLD_MAX_MS");
+        cap = (value ? strtoull(value, NULL, 0) : 1000) * 1000000ull;
+    }
+    return cap;
+}
+
 static bool audio_hold_active(void)
 {
     uint64_t threshold = hold_threshold_ns();
     uint64_t last = __atomic_load_n(&hold_last_frame_ns, __ATOMIC_ACQUIRE);
-    return threshold && last && monotonic_ns() - last > threshold;
+    if (!threshold || !last) return false;
+    if (__atomic_load_n(&hold_frame_thread_waiting, __ATOMIC_ACQUIRE) > 0) return false;
+    uint64_t outstanding = monotonic_ns() - last;
+    uint64_t cap = hold_cap_ns();
+    if (cap && outstanding >= cap) return false;
+    return outstanding > threshold;
+}
+
+bool audio_bridge32_is_frame_thread(void)
+{
+    unsigned long long frame = __atomic_load_n(&hold_frame_thread, __ATOMIC_ACQUIRE);
+    return frame != 0 && audio_current_thread_id() == frame;
+}
+
+void audio_bridge32_frame_thread_wait_begin(void)
+{
+    __atomic_fetch_add(&hold_frame_thread_waiting, 1, __ATOMIC_ACQ_REL);
+}
+
+void audio_bridge32_frame_thread_wait_end(void)
+{
+    __atomic_fetch_sub(&hold_frame_thread_waiting, 1, __ATOMIC_ACQ_REL);
 }
 
 void audio_bridge32_note_frame_presented(void)
 {
+    __atomic_store_n(&hold_frame_thread, audio_current_thread_id(), __ATOMIC_RELEASE);
     uint64_t now = monotonic_ns();
     uint64_t last = __atomic_exchange_n(&hold_last_frame_ns, now, __ATOMIC_ACQ_REL);
     uint64_t threshold = hold_threshold_ns();

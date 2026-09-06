@@ -4018,8 +4018,17 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_pthread_cond_wait")) {
         pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
         pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
-        return condition && mutex ? (uint32_t)pthread_cond_wait(condition, mutex) :
-                                    (uint32_t)EINVAL;
+        if (!condition || !mutex) return (uint32_t)EINVAL;
+        /* If the guest's frame/main thread is the one blocking (e.g.
+           CoreAudioSoundInstance::Release waiting for the audio render
+           callback to run DoPostRenderMaintenance), let the audio hold yield
+           so that callback can proceed; otherwise the hold — which keys off
+           the frame clock the blocked thread would advance — never ends. */
+        bool frame_thread = audio_bridge32_is_frame_thread();
+        if (frame_thread) audio_bridge32_frame_thread_wait_begin();
+        uint32_t r = (uint32_t)pthread_cond_wait(condition, mutex);
+        if (frame_thread) audio_bridge32_frame_thread_wait_end();
+        return r;
     }
     if (import_is(name, "_pthread_key_create")) {
         uint32_t *key = (void *)(uintptr_t)arguments[0];
