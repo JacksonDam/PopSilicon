@@ -3,6 +3,7 @@
 #include "macho_loader.h"
 #include "objc_bridge.h"
 #include "steam_unwrap.h"
+#include "guest_profiler.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -792,6 +793,7 @@ int main(int argc, char **argv)
             macho_image32_unload(&image);
             return EXIT_FAILURE;
         }
+        lp32_guest_profiler_start();
         printf("entering game main: 0x%08" PRIx32 "\n", main_address);
         fflush(stdout);
         uint32_t result = compat_runtime32_call(
