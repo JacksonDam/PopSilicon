@@ -91,6 +91,25 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_getpid"))RET(getpid());
     if(IS("_wcslen"))RET(wcslen((void *)(uintptr_t)a[0]));
     if(IS("_wcstombs"))RET(wcstombs((void *)(uintptr_t)a[0],(void *)(uintptr_t)a[1],a[2]));
+    /* char *fcvt(double value, int ndigit, int *decpt, int *sign) and ecvt:
+       Bejeweled 3's Poker mode formats its payouts with them.  The digit
+       string lives in a static buffer; ours is a guest allocation so the
+       returned pointer is guest-addressable. */
+    if(IS("_fcvt")||IS("_ecvt")){
+        static uint32_t cvt_buffer;
+        if(!cvt_buffer)cvt_buffer=compat_runtime32_allocate(512,1);
+        int decpt=0,sign=0;
+        const char *digits=IS("_fcvt")?fcvt(guest_double(a),(int)a[2],&decpt,&sign):ecvt(guest_double(a),(int)a[2],&decpt,&sign);
+        if(a[3])*(int32_t *)(uintptr_t)a[3]=decpt;
+        if(a[4])*(int32_t *)(uintptr_t)a[4]=sign;
+        strlcpy((char *)(uintptr_t)cvt_buffer,digits?digits:"",512);
+        RET(cvt_buffer);
+    }
+    /* unsigned long __maskrune(int c, unsigned long mask): the inline ctype
+       macros call it for bytes outside ASCII (Bejeweled 3 hit it classifying
+       0xC4 while rebuilding the main menu after Zen mode).  The host's C
+       locale gives the same answer the game's own C locale would. */
+    if(IS("___maskrune"))RET((uint32_t)__maskrune((int32_t)a[0],a[1]));
     /* Bejeweled 3's Lightning mode parses its timer text with wcstof. */
     if(IS("_wcstof")){wchar_t *end;float v=wcstof((const wchar_t *)(uintptr_t)a[0],&end);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET(return_guest_float(v));}
     if(IS("_mbstowcs")){
