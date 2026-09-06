@@ -19,6 +19,6 @@ struct SuccessMarkView: View {
                 .animation(.easeOut(duration: 0.75), value: progress)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("PeggleSilicon installed successfully")
+        .accessibilityLabel("Installed successfully")
     }
 }

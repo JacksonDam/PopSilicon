@@ -133,7 +133,7 @@ private final class BassSoundPlayer {
 
     private static func copyWithoutAttributes(of source: URL) -> (directory: URL, file: URL)? {
         let directory = FileManager.default.temporaryDirectory
-            .appendingPathComponent("PeggleSiliconInstaller-\(getpid())", isDirectory: true)
+            .appendingPathComponent("PopSiliconInstaller-\(getpid())", isDirectory: true)
         let file = directory.appendingPathComponent(source.lastPathComponent)
         guard (try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else {
             return nil

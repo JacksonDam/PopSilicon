@@ -6,7 +6,7 @@ struct SteamInstallationView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if model.steamReplacementSucceeded {
-                Label("PeggleSilicon installed in Steam", systemImage: "checkmark.circle.fill")
+                Label("\(model.productName) installed in Steam", systemImage: "checkmark.circle.fill")
                     .foregroundColor(.green)
                 if let backupURL = model.steamBackupURL {
                     Text("Original saved as \(backupURL.lastPathComponent).")
@@ -42,8 +42,8 @@ struct SteamInstallationView: View {
     private var headline: String {
         switch model.steamInstallationState {
         case .unpatched: return "Steam installation detected"
-        case .peggleSilicon: return "PeggleSilicon already installed in Steam"
-        case .needsRepair: return "PeggleSilicon in Steam needs repair"
+        case .peggleSilicon: return "\(model.productName) already installed in Steam"
+        case .needsRepair: return "\(model.productName) in Steam needs repair"
         case .unsupported: return "Unsupported Steam installation"
         }
     }
@@ -63,11 +63,11 @@ struct SteamInstallationView: View {
         case .needsRepair:
             return model.canReplaceSteam
                 ? "The game image is still DRM-encrypted; it can be repaired from the backup."
-                : "The game image is DRM-encrypted and no Peggle Deluxe.app.bak backup was found to rebuild from."
+                : "The game image is DRM-encrypted and no \(model.selectedGame.steamAppName).bak backup was found to rebuild from."
         case .peggleSilicon:
             return nil
         case .unsupported:
-            return "This app is not an unmodified 32-bit Peggle installation."
+            return "This app is not an unmodified 32-bit \(model.selectedGame.displayName) installation."
         }
     }
 }

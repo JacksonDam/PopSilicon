@@ -8,7 +8,7 @@ struct DropZoneView: View {
         VStack(spacing: 10) {
             if model.installationSucceeded {
                 SuccessMarkView(progress: model.successProgress)
-                Text("Installed PeggleSilicon successfully!")
+                Text("Installed \(model.productName) successfully!")
                     .font(.headline)
             } else {
                 Image(systemName: "arrow.down.app")

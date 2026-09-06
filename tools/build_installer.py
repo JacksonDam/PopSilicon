@@ -7,16 +7,16 @@ import tempfile
 
 
 root = pathlib.Path(__file__).resolve().parent.parent
-source_root = root / 'PeggleSiliconInstaller'
+source_root = root / 'PopSiliconInstaller'
 
 subprocess.run([str(root / 'tools/install_dependencies.sh'), '--installer'], check=True)
 
-parser = argparse.ArgumentParser(description='Build the PeggleSilicon export helper app.')
+parser = argparse.ArgumentParser(description='Build the PopSilicon installer app.')
 parser.add_argument(
     '--output',
     type=pathlib.Path,
-    default=root / 'build/PeggleSilicon Installer.app',
-    help='destination app bundle (default: build/PeggleSilicon Installer.app)',
+    default=root / 'build/PopSilicon Installer.app',
+    help='destination app bundle (default: build/PopSilicon Installer.app)',
 )
 args = parser.parse_args()
 
@@ -27,8 +27,8 @@ if not swift_sources:
 bundle = args.output.expanduser()
 bundle.parent.mkdir(parents=True, exist_ok=True)
 
-with tempfile.TemporaryDirectory(prefix='pegglesilicon-installer-') as temporary:
-    executable = pathlib.Path(temporary) / 'PeggleSiliconInstaller'
+with tempfile.TemporaryDirectory(prefix='popsilicon-installer-') as temporary:
+    executable = pathlib.Path(temporary) / 'PopSiliconInstaller'
     subprocess.run(
         [
             'xcrun', 'swiftc',
@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='pegglesilicon-installer-') as temporary
         shutil.rmtree(bundle)
     contents = bundle / 'Contents'
     (contents / 'MacOS').mkdir(parents=True)
-    shutil.copy2(executable, contents / 'MacOS/PeggleSiliconInstaller')
+    shutil.copy2(executable, contents / 'MacOS/PopSiliconInstaller')
     shutil.copy2(source_root / 'Info.plist', contents / 'Info.plist')
 
 subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(bundle)], check=True)

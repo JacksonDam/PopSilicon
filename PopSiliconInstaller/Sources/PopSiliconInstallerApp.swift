@@ -1,11 +1,11 @@
 import SwiftUI
 
 @main
-struct PeggleSiliconInstallerApp: App {
+struct PopSiliconInstallerApp: App {
     @StateObject private var model = InstallerModel()
 
     var body: some Scene {
-        WindowGroup("Install PeggleSilicon") {
+        WindowGroup("PopSilicon Installer") {
             ContentView(model: model)
         }
         .windowStyle(.titleBar)

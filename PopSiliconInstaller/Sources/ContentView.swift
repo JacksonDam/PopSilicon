@@ -5,11 +5,45 @@ struct ContentView: View {
     @ObservedObject var model: InstallerModel
 
     var body: some View {
+        Group {
+            if let product = model.product {
+                installer(for: product)
+            } else {
+                ProductPickerView(model: model)
+            }
+        }
+        .frame(minWidth: 520, idealWidth: 560, minHeight: 520, idealHeight: 600)
+        .alert(isPresented: $model.showSteamReplacementConfirmation) {
+            Alert(
+                title: Text(model.steamAlertTitle),
+                message: Text(model.steamAlertMessage),
+                primaryButton: .destructive(
+                    Text(model.steamAlertButtonTitle),
+                    action: model.confirmSteamReplacement
+                ),
+                secondaryButton: .cancel(Text("Cancel"))
+            )
+        }
+    }
+
+    /// The per-product installer: today's PeggleSilicon layout, with the Game
+    /// menu limited to the product's titles.
+    private func installer(for product: Product) -> some View {
         VStack(alignment: .leading, spacing: 20) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("PeggleSilicon Installer")
-                    .font(.largeTitle.bold())
-                Text("Run Peggle Deluxe, Peggle Nights or Bejeweled 3 on Apple silicon")
+                HStack(alignment: .firstTextBaseline) {
+                    Text("\(product.displayName) Installer")
+                        .font(.largeTitle.bold())
+                    Spacer()
+                    Button {
+                        model.chooseAnotherProduct()
+                    } label: {
+                        Label("PopSilicon", systemImage: "chevron.left")
+                    }
+                    .disabled(model.isBuilding)
+                    .help("Choose a different product")
+                }
+                Text("Run \(product.gameList) on Apple silicon")
                     .foregroundColor(.gray)
             }
 
@@ -52,7 +86,7 @@ struct ContentView: View {
                 if model.isBuilding {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Building PeggleSilicon…")
+                    Text("Building \(product.displayName)…")
                         .foregroundColor(.gray)
                 } else {
                     Text(model.statusMessage)
@@ -61,7 +95,7 @@ struct ContentView: View {
 
                 Spacer()
 
-                Button("Install PeggleSilicon", action: model.export)
+                Button("Install \(product.displayName)", action: model.export)
                 .buttonStyle(DefaultButtonStyle())
                 .controlSize(.large)
                 .disabled(!model.canExport)
@@ -98,23 +132,11 @@ struct ContentView: View {
             }
         }
         .padding(28)
-        .frame(minWidth: 520, idealWidth: 560, minHeight: 520, idealHeight: 600)
-        .alert(isPresented: $model.showSteamReplacementConfirmation) {
-            Alert(
-                title: Text(model.steamAlertTitle),
-                message: Text(model.steamAlertMessage),
-                primaryButton: .destructive(
-                    Text(model.steamAlertButtonTitle),
-                    action: model.confirmSteamReplacement
-                ),
-                secondaryButton: .cancel(Text("Cancel"))
-            )
-        }
     }
 
     private func expandWindowForBuildOutput() {
         guard let window = NSApp.keyWindow ?? NSApp.windows.first(where: {
-            $0.title == "Install PeggleSilicon"
+            $0.title == "PopSilicon Installer"
         }) else { return }
 
         let minimumHeight: CGFloat = 820

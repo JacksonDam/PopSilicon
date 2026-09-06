@@ -19,6 +19,8 @@ final class InstallerModel: ObservableObject {
             refreshSteamInstallation()
         }
     }
+    /// The product being installed; nil shows the product chooser.
+    @Published private(set) var product: Product?
     @Published private(set) var sourceURL: URL?
     @Published private(set) var destinationDirectory: URL?
     @Published private(set) var isBuilding = false
@@ -40,7 +42,34 @@ final class InstallerModel: ObservableObject {
         refreshSteamInstallation()
     }
 
-    var availableGames: [Game] { Game.all }
+    /// Only the chosen product's games are offered.
+    var availableGames: [Game] { product?.games ?? [] }
+
+    /// Name of the compatibility app being installed ("PeggleSilicon" or
+    /// "BejeweledSilicon"), for messages.
+    var productName: String { product?.displayName ?? "PopSilicon" }
+
+    func selectProduct(_ product: Product) {
+        self.product = product
+        if product.games.contains(selectedGame) {
+            errorMessage = nil
+            installationSucceeded = false
+            steamReplacementSucceeded = false
+            refreshSteamInstallation()
+        } else {
+            selectedGame = product.games[0]   // didSet resets and refreshes
+        }
+    }
+
+    func chooseAnotherProduct() {
+        guard !isBuilding else { return }
+        product = nil
+        sourceURL = nil
+        errorMessage = nil
+        buildOutput = nil
+        installationSucceeded = false
+        steamReplacementSucceeded = false
+    }
 
     var destinationURL: URL? {
         destinationDirectory?.appendingPathComponent(selectedGame.outputAppName, isDirectory: true)
@@ -99,11 +128,11 @@ final class InstallerModel: ObservableObject {
                 + "\(selectedGame.displayName), which is used once to unwrap the game's DRM."
             : ""
         if steamInstallationState == .needsRepair {
-            return "PeggleSilicon in Steam will be rebuilt in place; the existing "
+            return "\(productName) in Steam will be rebuilt in place; the existing "
                 + "\(selectedGame.steamAppName).bak backup is kept." + needsSteam
         }
         return "The original will be renamed to \(selectedGame.steamAppName).bak before "
-            + "PeggleSilicon is installed." + needsSteam
+            + "\(productName) is installed." + needsSteam
     }
 
     var steamAlertButtonTitle: String {
@@ -152,7 +181,7 @@ final class InstallerModel: ObservableObject {
     func export() {
         guard let sourceURL, let destinationURL else { return }
         guard let projectRoot = ProjectLocator.find() else {
-            errorMessage = "PeggleSilicon project files could not be found next to this app."
+            errorMessage = "PopSilicon project files could not be found next to this app."
             return
         }
 
@@ -208,7 +237,7 @@ final class InstallerModel: ObservableObject {
             return
         }
         guard let projectRoot = ProjectLocator.find() else {
-            errorMessage = "PeggleSilicon project files could not be found next to this app."
+            errorMessage = "PopSilicon project files could not be found next to this app."
             return
         }
 
@@ -272,10 +301,10 @@ final class InstallerModel: ObservableObject {
             statusMessage = "\(selectedGame.displayName) Steam installation detected. It can be installed directly."
         case .needsRepair:
             statusMessage = steamBuildSource != nil
-                ? "PeggleSilicon in Steam needs repair. It can be repaired directly."
-                : "PeggleSilicon in Steam needs repair, but no backup was found to rebuild from."
+                ? "\(productName) in Steam needs repair. It can be repaired directly."
+                : "\(productName) in Steam needs repair, but no backup was found to rebuild from."
         case .peggleSilicon:
-            statusMessage = "PeggleSilicon is already installed in \(selectedGame.displayName) on Steam."
+            statusMessage = "\(productName) is already installed in \(selectedGame.displayName) on Steam."
         case .unsupported:
             statusMessage = "\(selectedGame.displayName) Steam installation found, but it is not an unmodified 32-bit copy."
         }
@@ -297,6 +326,11 @@ final class InstallerModel: ObservableObject {
         guard let droppedGame = SteamLocator.game(of: url) else {
             errorMessage = "This app is not \(supportedList)."
             return
+        }
+        // A dropped game also picks its product.
+        let droppedProduct = Product.containing(droppedGame)
+        if product != droppedProduct {
+            product = droppedProduct
         }
         if droppedGame != selectedGame {
             selectedGame = droppedGame

@@ -10,7 +10,7 @@ if [ "${1:-}" = "--installer" ]; then
 fi
 
 if ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
-    echo "PeggleSilicon needs Apple's Command Line Tools for Xcode."
+    echo "PopSilicon needs Apple's Command Line Tools for Xcode."
     echo "Opening Apple's installer; finish it, then run the installation again."
     /usr/bin/xcode-select --install >/dev/null 2>&1 || true
     exit 74
@@ -28,7 +28,7 @@ if [ "$require_swift" -eq 1 ] && ! /usr/bin/xcrun --find swiftc >/dev/null 2>&1;
 fi
 
 if [ -n "$missing" ]; then
-    echo "PeggleSilicon is missing these commands:$missing"
+    echo "PopSilicon is missing these commands:$missing"
     echo "Install Apple's Command Line Tools with: xcode-select --install"
     echo "If Python 3 is still missing afterward, install Python 3 from python.org or Homebrew."
     exit 1

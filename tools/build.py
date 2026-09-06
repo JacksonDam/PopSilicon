@@ -111,7 +111,7 @@ def game_for_source(info: dict) -> dict:
     return game
 
 
-parser = argparse.ArgumentParser(description='Build the PeggleSilicon compatibility app.')
+parser = argparse.ArgumentParser(description='Build a PopSilicon compatibility app (PeggleSilicon or BejeweledSilicon) from the original game.')
 parser.add_argument('source', type=pathlib.Path,
                     help='path to a Peggle Deluxe.app or Peggle Nights.app (retail or the Steam copy)')
 parser.add_argument(
