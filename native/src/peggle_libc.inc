@@ -91,6 +91,8 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_getpid"))RET(getpid());
     if(IS("_wcslen"))RET(wcslen((void *)(uintptr_t)a[0]));
     if(IS("_wcstombs"))RET(wcstombs((void *)(uintptr_t)a[0],(void *)(uintptr_t)a[1],a[2]));
+    /* Bejeweled 3's Lightning mode parses its timer text with wcstof. */
+    if(IS("_wcstof")){wchar_t *end;float v=wcstof((const wchar_t *)(uintptr_t)a[0],&end);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET(return_guest_float(v));}
     if(IS("_mbstowcs")){
         wchar_t *dst=(wchar_t *)(uintptr_t)a[0];
         const unsigned char *src=(const void *)(uintptr_t)a[1];
