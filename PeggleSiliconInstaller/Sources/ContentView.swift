@@ -9,7 +9,7 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("PeggleSilicon Installer")
                     .font(.largeTitle.bold())
-                Text("Run Peggle Deluxe or Peggle Nights on Apple silicon")
+                Text("Run Peggle Deluxe, Peggle Nights or Bejeweled 3 on Apple silicon")
                     .foregroundColor(.gray)
             }
 

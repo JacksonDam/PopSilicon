@@ -51,6 +51,14 @@ enum SteamLocator {
         return MachOInspector.isI386Executable(at: executable)
     }
 
+    /// Whether building from this bundle needs the Steam client: only Valve's
+    /// DRM-wrapped executables do (Peggle's Steam copies; Bejeweled 3 ships
+    /// unwrapped).
+    static func sourceNeedsSteam(_ bundle: URL, for game: Game) -> Bool {
+        MachOInspector.isSteamDRMWrapped(
+            at: bundle.appendingPathComponent("Contents/MacOS/\(game.executableName)"))
+    }
+
     /// The game a dropped bundle belongs to, if any.
     static func game(of bundle: URL) -> Game? {
         Game.matching(bundleIdentifier: bundleIdentifier(of: bundle))

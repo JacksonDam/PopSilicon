@@ -1,11 +1,12 @@
 # PeggleSilicon
 
-PeggleSilicon runs the original 32-bit Intel Peggle Deluxe 1.0.5 and Peggle
-Nights 1.0.4 Mac games on Apple silicon by loading their i386 Mach-O image
-through Rosetta and translating the legacy Carbon, CoreFoundation, OpenGL,
-audio, libc, pthread, and C++ ABI calls to current macOS APIs. A single loader
-serves both titles; it detects which game an image is and applies the right
-profile.
+PeggleSilicon runs the original 32-bit Intel Peggle Deluxe 1.0.5, Peggle
+Nights 1.0.4 and Bejeweled 3 1.1.12 Mac games on Apple silicon by loading their
+i386 Mach-O image through Rosetta and translating the legacy Carbon,
+CoreFoundation, OpenGL, audio, libc, pthread, and C++ ABI calls to current
+macOS APIs. A single loader serves all three titles; it detects which game an
+image is and applies the right profile. Bejeweled 3 support is the newest: the
+Classic mode is played through regularly, the other modes less so.
 
 The export step builds the native loader on the Mac where it runs. It therefore
 needs Python 3 and Apple's Command Line Tools for Xcode, which provide `xcrun`,
@@ -48,23 +49,26 @@ Choose the game from the **Game** menu at the top (Peggle Deluxe by default),
 then drag that game's original `.app` into the window, choose an export folder,
 and click **Install PeggleSilicon**. The helper invokes `tools/build.py` and
 creates the app in the selected folder (`PeggleSilicon.app` for Deluxe,
-`PeggleNights.app` for Nights). Dropping a recognised game app selects it
-automatically, so the whole window follows whichever title you drop.
+`PeggleNights.app` for Nights, `Bejeweled3.app` for Bejeweled 3). Dropping a
+recognised game app selects it automatically, so the whole window follows
+whichever title you drop.
 
 If the selected game's Steam installation is present, the installer offers
 **Replace Steam installation…** and installs directly from it. No separate
-download is needed: Valve ships the Steam executable wrapped in Steam DRM, which
-keeps the game code encrypted, so the build first unwraps it. Because macOS can
-no longer run the 32-bit game, the unwrap is performed by the compatibility
-runtime itself, which executes Valve's own decryptor to recover the original
-code. That decryptor verifies ownership through a live handshake with the Steam
-client, so **Steam must be running and signed in to the account that owns the
-game** during installation; the build starts Steam if it is not already
-running. After confirmation, the original Steam app is renamed to
-`<name>.app.bak` and the Apple silicon build takes its place under the
-executable name Steam launches (`Peggle` for Deluxe, `Peggle Nights` for
-Nights). An older PeggleSilicon install whose game image is still the encrypted
-executable is detected and can be repaired the same way from the backup.
+download is needed. Valve ships the two Peggle Steam executables wrapped in
+Steam DRM, which keeps the game code encrypted, so the build first unwraps
+them. Because macOS can no longer run the 32-bit game, the unwrap is performed
+by the compatibility runtime itself, which executes Valve's own decryptor to
+recover the original code. That decryptor verifies ownership through a live
+handshake with the Steam client, so for the Peggle games **Steam must be
+running and signed in to the account that owns the game** during installation;
+the build starts Steam if it is not already running. Bejeweled 3's Steam copy
+is not DRM-wrapped, so it installs without Steam running. After confirmation,
+the original Steam app is renamed to `<name>.app.bak` and the Apple silicon
+build takes its place under the executable name Steam launches (`Peggle` for
+Deluxe, `Peggle Nights` for Nights, `Bejeweled3` for Bejeweled 3). An older
+PeggleSilicon install whose game image is still the encrypted executable is
+detected and can be repaired the same way from the backup.
 
 The same unwrap runs for a standalone export if a DRM-wrapped app is supplied,
 so both the Steam copy and a DRM-free copy of the game work as the source. The

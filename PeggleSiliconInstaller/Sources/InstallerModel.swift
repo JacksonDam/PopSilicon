@@ -93,14 +93,17 @@ final class InstallerModel: ObservableObject {
     }
 
     var steamAlertMessage: String {
-        let needsSteam = "Steam must be running and signed in to the account that owns "
-            + "\(selectedGame.displayName), which is used once to unwrap the game's DRM."
+        let drmWrapped = steamBuildSource.map { SteamLocator.sourceNeedsSteam($0, for: selectedGame) } ?? false
+        let needsSteam = drmWrapped
+            ? "\n\nSteam must be running and signed in to the account that owns "
+                + "\(selectedGame.displayName), which is used once to unwrap the game's DRM."
+            : ""
         if steamInstallationState == .needsRepair {
             return "PeggleSilicon in Steam will be rebuilt in place; the existing "
-                + "\(selectedGame.steamAppName).bak backup is kept.\n\n" + needsSteam
+                + "\(selectedGame.steamAppName).bak backup is kept." + needsSteam
         }
         return "The original will be renamed to \(selectedGame.steamAppName).bak before "
-            + "PeggleSilicon is installed.\n\n" + needsSteam
+            + "PeggleSilicon is installed." + needsSteam
     }
 
     var steamAlertButtonTitle: String {
@@ -283,14 +286,16 @@ final class InstallerModel: ObservableObject {
             errorMessage = "The dropped item could not be read."
             return
         }
+        let supported = Game.all.map(\.displayName)
+        let supportedList = supported.dropLast().joined(separator: ", ") + " or " + supported.last!
         guard url.pathExtension.lowercased() == "app" else {
-            errorMessage = "Drop a Peggle Deluxe.app or Peggle Nights.app bundle."
+            errorMessage = "Drop the original \(supportedList) app bundle."
             return
         }
         // Identify which game was dropped; follow the drop by switching the
         // selector so the whole UI targets it.
         guard let droppedGame = SteamLocator.game(of: url) else {
-            errorMessage = "This app is not Peggle Deluxe or Peggle Nights."
+            errorMessage = "This app is not \(supportedList)."
             return
         }
         if droppedGame != selectedGame {
