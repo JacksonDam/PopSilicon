@@ -22,8 +22,12 @@ LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segadd
 all: $(BUILD_DIR)/game_loader $(BUILD_DIR)/libbass.dylib
 
 # BASS is not in the repository: tools/fetch_bass.py downloads un4seen's
-# official package into vendor/bass (ignored by git) when it is missing.
-vendor/bass/libbass.dylib vendor/bass/bass.h:
+# official package into vendor/bass (ignored by git) when it is missing.  One
+# fetch produces both files; chaining the header on the dylib keeps a parallel
+# build from running two downloads at once into the same directory.
+vendor/bass/libbass.dylib:
+	python3 ../tools/fetch_bass.py
+vendor/bass/bass.h: vendor/bass/libbass.dylib
 	python3 ../tools/fetch_bass.py
 
 $(BUILD_DIR)/libbass.dylib: vendor/bass/libbass.dylib | $(BUILD_DIR)

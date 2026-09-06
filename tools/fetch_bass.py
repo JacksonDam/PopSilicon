@@ -10,6 +10,8 @@ Run it directly to prefetch; native/Makefile runs it when the files are
 missing.  Offline, place libbass.dylib, c/bass.h and bass.txt from
 bass24-osx.zip in native/vendor/bass yourself.
 """
+from __future__ import annotations
+
 import hashlib
 import io
 import pathlib
