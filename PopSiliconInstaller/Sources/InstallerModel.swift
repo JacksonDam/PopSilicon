@@ -36,7 +36,6 @@ final class InstallerModel: ObservableObject {
     @Published private(set) var steamReplacementSucceeded = false
     @Published private(set) var steamBackupURL: URL?
     @Published var showSteamReplacementConfirmation = false
-    private let pegHitSoundPlayer = PegHitSoundPlayer()
 
     init() {
         refreshSteamInstallation()
@@ -205,7 +204,6 @@ final class InstallerModel: ObservableObject {
             if result.succeeded {
                 statusMessage = "Installation complete."
                 installationSucceeded = true
-                pegHitSoundPlayer.play(from: sourceURL, projectRoot: projectRoot)
                 successProgress = 0
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 80_000_000)
@@ -269,7 +267,6 @@ final class InstallerModel: ObservableObject {
                 installationSucceeded = true
                 steamInstallationState = .peggleSilicon
                 steamBackupURL = FileManager.default.fileExists(atPath: backup.path) ? backup : nil
-                pegHitSoundPlayer.play(from: source, projectRoot: projectRoot)
                 successProgress = 0
                 Task { @MainActor [weak self] in
                     try? await Task.sleep(nanoseconds: 80_000_000)

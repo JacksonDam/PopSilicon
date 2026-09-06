@@ -79,5 +79,9 @@ from the backup.
 The same unwrap runs for a standalone export if a DRM-wrapped app is supplied,
 so both the Steam copy and a DRM-free copy of the game work as the source. The
 recovered game executable and resources are copied into `Contents/SharedSupport`.
-BASS is bundled from `native/vendor/bass` and the resulting app is ad hoc signed
-for local use.
+The games' audio library, BASS from un4seen.com, is not part of this
+repository. The first build runs `tools/fetch_bass.py`, which downloads the
+official `bass24-osx.zip` into `native/vendor/bass` (ignored by git) and copies
+`libbass.dylib` into the app next to the loader; run the script yourself to
+prefetch, or unpack the package there by hand when offline. The resulting app
+is ad hoc signed for local use.
