@@ -46,11 +46,13 @@ Drag the original `Peggle Deluxe.app` into the window, choose an export folder,
 and click **Install PeggleSilicon**. The helper invokes `tools/build.py` and
 creates `PeggleSilicon.app` in the selected folder.
 
-If the standard Steam installation is present and still unmodified, the installer
+Steam support is currently broken.
+
+~~If the standard Steam installation is present and still unmodified, the installer
 can use that `.app` directly and offers **Replace Steam installation…**. It checks
 for the original 32-bit Intel executable before proceeding. After confirmation,
 the original Steam app is renamed to `Peggle Deluxe.app.bak` and the Apple silicon
-build takes its place with Steam's expected `Contents/MacOS/Peggle` executable name.
+build takes its place with Steam's expected `Contents/MacOS/Peggle` executable name.~~
 
 The original game executable and resources are copied unchanged into
 `Contents/SharedSupport`. BASS is bundled from `native/vendor/bass` and the
