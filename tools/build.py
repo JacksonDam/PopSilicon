@@ -64,6 +64,15 @@ def unwrap_steam_drm(loader: pathlib.Path, drm_executable: pathlib.Path,
         shutil.move(str(staged), str(out_image))
 
 
+def copy_clean(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Copy one file without its extended attributes.  A vendor dylib or game
+    copy that came through a browser carries com.apple.quarantine, which
+    shutil.copy2 would preserve and which makes Gatekeeper prompt before the
+    library may load; drop it the way the Resources copy below does."""
+    subprocess.run(['ditto', '--noextattr', '--noqtn', str(source), str(destination)],
+                   check=True)
+
+
 parser = argparse.ArgumentParser(description='Build the PeggleSilicon compatibility app.')
 parser.add_argument('source', type=pathlib.Path,
                     help='path to a Peggle Deluxe.app (retail or the Steam copy)')
@@ -99,11 +108,11 @@ if not image.exists() or (not drm and not filecmp.cmp(executable,image,shallow=F
   print(f'{executable.name} is a Steam DRM copy; unwrapping its game code…')
   unwrap_steam_drm(loader,executable,image)
  else:
-  shutil.copy2(executable,image)
+  copy_clean(executable,image)
  subprocess.run(['ditto','--noextattr','--noqtn',str(source/'Contents/Resources'),str(c/'Resources')],check=True)
 
-shutil.copy2(loader,c/'MacOS/PeggleSilicon')
-shutil.copy2(root/'native/vendor/bass/libbass.dylib',c/'MacOS/libbass.dylib')
+copy_clean(loader,c/'MacOS/PeggleSilicon')
+copy_clean(root/'native/vendor/bass/libbass.dylib',c/'MacOS/libbass.dylib')
 p=plistlib.loads((source/'Contents/Info.plist').read_bytes());p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier='local.peggle.silicon',CFBundleName='PeggleSilicon',LSMinimumSystemVersion='11.0',NSHighResolutionCapable=False)
 (c/'Info.plist').write_bytes(plistlib.dumps(p))
 subprocess.run(['codesign','--force','--deep','--sign','-',str(bundle)],check=True)

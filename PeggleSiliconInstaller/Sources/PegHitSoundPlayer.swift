@@ -47,6 +47,7 @@ private final class BassSoundPlayer {
 
     private static let fileMemoryCopy: UInt32 = 3
     private let library: UnsafeMutableRawPointer
+    private let copyDirectory: URL?
     private let bassFree: BassFree
     private let streamCreateFile: BassStreamCreateFile
     private let streamFree: BassStreamFree
@@ -56,8 +57,19 @@ private final class BassSoundPlayer {
     private var soundData: Data?
 
     init?(libraryURL: URL) {
-        guard let library = dlopen(libraryURL.path, RTLD_NOW | RTLD_LOCAL) else { return nil }
+        // A checkout downloaded as an archive carries a quarantine attribute
+        // on the vendor dylib, and Gatekeeper prompts before it lets a
+        // quarantined library into a Finder-launched app.  Load a private copy
+        // taken without extended attributes instead; the arm64 slice is
+        // already ad hoc signed, so nothing else is needed.
+        let copy = Self.copyWithoutAttributes(of: libraryURL)
+        let loadURL = copy?.file ?? libraryURL
+        guard let library = dlopen(loadURL.path, RTLD_NOW | RTLD_LOCAL) else {
+            Self.removeCopy(copy)
+            return nil
+        }
         self.library = library
+        self.copyDirectory = copy?.directory
 
         func load<T>(_ name: String, as type: T.Type) -> T? {
             guard let symbol = dlsym(library, name) else { return nil }
@@ -71,6 +83,7 @@ private final class BassSoundPlayer {
               let channelPlay = load("BASS_ChannelPlay", as: BassChannelPlay.self),
               bassInit(-1, 44100, 0, nil, nil) != 0 else {
             dlclose(library)
+            Self.removeCopy(copy)
             return nil
         }
 
@@ -115,6 +128,29 @@ private final class BassSoundPlayer {
         if stream != 0 { _ = streamFree(stream) }
         if initialized { _ = bassFree() }
         dlclose(library)
+        if let copyDirectory { try? FileManager.default.removeItem(at: copyDirectory) }
+    }
+
+    private static func copyWithoutAttributes(of source: URL) -> (directory: URL, file: URL)? {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("PeggleSiliconInstaller-\(getpid())", isDirectory: true)
+        let file = directory.appendingPathComponent(source.lastPathComponent)
+        guard (try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)) != nil else {
+            return nil
+        }
+        // copyfile propagates the quarantine attribute even when asked for the
+        // data alone, so strip it from the copy explicitly.
+        guard copyfile(source.path, file.path, nil, copyfile_flags_t(COPYFILE_DATA)) == 0,
+              removexattr(file.path, "com.apple.quarantine", 0) == 0 || errno == ENOATTR else {
+            try? FileManager.default.removeItem(at: directory)
+            return nil
+        }
+        return (directory, file)
+    }
+
+    private static func removeCopy(_ copy: (directory: URL, file: URL)?) {
+        guard let copy else { return }
+        try? FileManager.default.removeItem(at: copy.directory)
     }
 }
 
