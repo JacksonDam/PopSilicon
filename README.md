@@ -6,8 +6,8 @@ Carbon, CoreFoundation, OpenGL, audio, libc, pthread, and C++ ABI calls to
 current macOS APIs. It ships as two products built from the same runtime:
 
 - **PeggleSilicon** for Peggle Deluxe 1.0.5 and Peggle Nights 1.0.4.
-- **BejeweledSilicon** for Bejeweled 3 1.1.12. This is the newest: the Classic
-  mode is played through regularly, the other modes less so.
+- **BejeweledSilicon** for Bejeweled 3 1.1.12. This is the newest version, and
+Classic mode has been playtested, but there may still be bugs especially in other modes.
 
 A single loader serves all three titles; it detects which game an image is and
 applies the right profile.
