@@ -4886,14 +4886,19 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = kCGErrorSuccess;
         return 1;
     }
-    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRelease")) {
-        /* Releasing the captured display restores the desktop mode. */
+    if (LP32_NAME_IS(import_name, import_length, "_CGDisplayRelease") ||
+        LP32_NAME_IS(import_name, import_length, "_CGReleaseAllDisplays")) {
+        /* Releasing the captured display(s) restores the desktop mode.  The
+           game calls the AllDisplays variant when leaving fullscreen (e.g. on
+           ESC); leaving it unhandled trapped and then crashed (issue #3). */
         set_guest_display_mode(NSZeroSize);
         [presenting_view applyGuestDisplayMode];
         *result = kCGErrorSuccess;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayCapture") ||
+        LP32_NAME_IS(import_name, import_length, "_CGCaptureAllDisplays") ||
+        LP32_NAME_IS(import_name, import_length, "_CGCaptureAllDisplaysWithOptions") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayHideCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayShowCursor") ||
         LP32_NAME_IS(import_name, import_length, "_CGDisplayFade") ||
