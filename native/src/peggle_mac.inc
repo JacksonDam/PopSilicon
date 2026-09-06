@@ -49,10 +49,11 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 #define O(i) object_for_argument(a[i])
 #define OUT(i, v) do { if (a[i]) *(uint32_t *)P(i) = (uint32_t)(v); } while (0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
-    if (lp32_profile()->title != LP32_TITLE_PEGGLE) return 0;
+    if (!lp32_title_is_peggle_engine(lp32_profile()->title)) return 0;
     if (peggle_window_dispatch(n, a, r) || peggle_graphics_dispatch(n, a, r)) return 1;
     if (IS("_CFBundleGetValueForInfoDictionaryKey")) RET(proxy_for_object([O(0) objectForInfoDictionaryKey:O(1)]));
-    if (IS("_CFBundleGetVersionNumber")) RET(0x01058000);
+    if (IS("_CFBundleGetVersionNumber"))
+        RET(lp32_profile()->title == LP32_TITLE_PEGGLE_NIGHTS ? 0x01048000 : 0x01058000);
     if (IS("_CFBundleCopyLocalizedString")) RET(pg_cf_register((CFTypeRef)[[O(0) localizedStringForKey:O(1) value:O(2) table:O(3)] retain]));
     if (IS("_CFStringCreateWithCString")) RET(pg_cf_register(a[1] >= 0x1000 ? CFStringCreateWithCString(NULL, P(1), a[2]) : NULL));
     if (IS("_CFStringCreateWithCharacters")) RET(pg_cf_register(a[1] >= 0x1000 ? CFStringCreateWithCharacters(NULL, P(1), a[2]) : NULL));

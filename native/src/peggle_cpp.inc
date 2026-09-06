@@ -18,11 +18,28 @@ static struct { uint32_t obj; uint32_t text; } pg_streams[64];
 static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *out)
 {
 #define PG_RETURN(x) do { *out = (uint64_t)(x); return 1; } while (0)
-    if (lp32_profile()->title != LP32_TITLE_PEGGLE) return 0;
+    if (!lp32_title_is_peggle_engine(lp32_profile()->title)) return 0;
+    static int trace_cpp = -1;
+    if (trace_cpp < 0) trace_cpp = getenv("LP32_TRACE_CPP") ? 1 : 0;
+    if (trace_cpp) { fprintf(stderr, "compat32: cpp %s a0=%08x a1=%08x a2=%08x\n", name, a[0], a[1], a[2]); }
+    /* std::copy(reverse_iterator first, reverse_iterator last, wchar_t* dest):
+       EncodingParser::PutString copies a wstring in reverse into a vector<wchar_t>.
+       The iterators (single "current" pointers) are passed by address; operator*
+       reads *(current-1), operator++ decrements current. */
+    if (strncmp(name,"__ZSt4copyISt16reverse_iterator",31)==0) {
+        uint32_t first=*(uint32_t *)(uintptr_t)a[0];
+        uint32_t last=*(uint32_t *)(uintptr_t)a[1];
+        uint32_t dst=a[2];
+        while (first!=last) { first-=4; *(uint32_t *)(uintptr_t)dst=*(uint32_t *)(uintptr_t)first; dst+=4; }
+        PG_RETURN(dst);
+    }
     if (peggle_tree_dispatch(name, a, out)) return 1;
     if (peggle_cxx_dispatch(name, a, out)) return 1;
     if (strncmp(name,"__ZNSaI",7)==0) PG_RETURN(0); /* empty allocator */
     if (strcmp(name,"__ZNSt6localeC1EPKc")==0) { *(uint32_t *)(uintptr_t)a[0]=0; PG_RETURN(a[0]); }
+    if (strcmp(name,"__ZNSt6localeC1ERKS_")==0) { *(uint32_t *)(uintptr_t)a[0]=*(uint32_t *)(uintptr_t)a[1]; PG_RETURN(a[0]); }
+    if (strcmp(name,"__ZNSt6localeC1Ev")==0) { *(uint32_t *)(uintptr_t)a[0]=0; PG_RETURN(a[0]); }
+    if (strcmp(name,"__ZNSt6localeaSERKS_")==0) { *(uint32_t *)(uintptr_t)a[0]=*(uint32_t *)(uintptr_t)a[1]; PG_RETURN(a[0]); }
     if (strcmp(name,"__ZNSt6localeD1Ev")==0) PG_RETURN(0);
     if (strcmp(name,"__ZSt9use_facetISt8numpunctIcEERKT_RKSt6locale")==0) {
         static uint32_t facet; if(!facet){facet=compat_runtime32_allocate(64,1);uint32_t v=compat_runtime32_allocate(64,1);*(uint32_t *)(uintptr_t)facet=v;for(int i=0;i<16;i++)((uint32_t *)(uintptr_t)v)[i]=compat_runtime32_guest_callback("_pg_decimal_point");} PG_RETURN(facet);
@@ -58,6 +75,17 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         if (strcmp(op,"6substrEmm")==0) { /* nontrivial class result: hidden output precedes this */
             compat_runtime32_struct_return();const char *src=guest_string_data(a[1]);size_t len_src=guest_string_length(a[1]);size_t pos=a[2]<len_src?a[2]:len_src,len=a[3]<len_src-pos?a[3]:len_src-pos;PG_RETURN(pg_string_set(a[0],src+pos*w,len,w,true));
         }
+        /* reverse_iterator rbegin()/rend(): the iterator is a single pointer
+           ("current"), returned via sret (a[0]=out, a[1]=this).  current for
+           rbegin() is end() (data+n), for rend() is begin() (data); operator*
+           yields *(current-1). */
+        if (strcmp(op,"6rbeginEv")==0 || strcmp(op,"4rendEv")==0) {
+            compat_runtime32_struct_return();
+            uint32_t data=*(uint32_t *)(uintptr_t)a[1];
+            uint32_t nn=(uint32_t)guest_string_length(a[1]);
+            *(uint32_t *)(uintptr_t)a[0]=(op[0]=='6')?data+nn*w:data;
+            PG_RETURN(a[0]);
+        }
         const char *s=guest_string_data(obj);size_t n=guest_string_length(obj);
         if (strcmp(op,"4sizeEv")==0 || strcmp(op,"6lengthEv")==0) PG_RETURN(n);
         if (strcmp(op,"5emptyEv")==0) PG_RETURN(n==0);
@@ -72,7 +100,7 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         if (strncmp(op,"aSERK",5)==0 || strncmp(op,"6assignERK",10)==0) PG_RETURN(pg_string_set(obj,guest_string_data(a[1]),guest_string_length(a[1]),w,false));
         if (strcmp(op,"aSEc")==0) {char c=a[1];PG_RETURN(pg_string_set(obj,&c,1,1,false));}
         if (strncmp(op,"6assignEm",9)==0) {size_t len=a[1];char *v=malloc((len+1)*w);for(size_t i=0;i<len;i++)memcpy(v+i*w,&a[2],w);pg_string_set(obj,v,len,w,false);free(v);PG_RETURN(obj);}
-        if (strncmp(op,"6append",7)==0 || strncmp(op,"pLE",3)==0 || strcmp(op,"9push_backEc")==0) {
+        if (strncmp(op,"6append",7)==0 || strncmp(op,"pLE",3)==0 || strncmp(op,"9push_backE",11)==0) {
             const void *v=NULL;size_t len=0;bool repeat=false;uint32_t ch=a[1];
             if(strstr(op,"EPK")){v=(void *)(uintptr_t)a[1];len=(strstr(op,"PKcm")||strstr(op,"PKwm"))?a[2]:(wide?wcslen(v):strlen(v));}
             else if(strstr(op,"ERK")){v=guest_string_data(a[1]);len=guest_string_length(a[1]);}

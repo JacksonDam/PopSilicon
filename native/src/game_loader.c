@@ -597,14 +597,14 @@ static void runtime_diagnostic_line(const char *line)
 static const char *default_image_path(const char *argv0, char *buffer,
                                       size_t size)
 {
-    static const char *const candidates[] = {"PeggleSilicon"};
     const char *slash = strrchr(argv0, '/');
     size_t directory_length = slash ? (size_t)(slash - argv0) : 0;
-    for (size_t index = 0; index < sizeof(candidates) / sizeof(candidates[0]); ++index) {
-        const struct lp32_game_profile *profile = lp32_profile_named(candidates[index]);
+    size_t profile_count = 0;
+    const struct lp32_game_profile *const *profiles = lp32_known_profiles(&profile_count);
+    for (size_t index = 0; index < profile_count; ++index) {
         int length = snprintf(buffer, size, "%.*s%s../SharedSupport/%s",
                               (int)directory_length, argv0, slash ? "/" : "",
-                              profile->image_file);
+                              profiles[index]->image_file);
         if (length < 0 || (size_t)length >= size) {
             fprintf(stderr, "game_loader: executable path is too long\n");
             return NULL;

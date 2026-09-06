@@ -10,7 +10,7 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
 {
 #define IS(s) (strcmp(n,s)==0)
 #define RET(x) do{*r=(uint64_t)(x);return 1;}while(0)
-    if(lp32_profile()->title!=LP32_TITLE_PEGGLE)return 0;
+    if(!lp32_title_is_peggle_engine(lp32_profile()->title))return 0;
     if(IS("_shm_open"))RET((uint32_t)shm_open((void *)(uintptr_t)a[0],a[1],0600));
     if(IS("_shm_unlink"))RET((uint32_t)shm_unlink((void *)(uintptr_t)a[0]));
     if(IS("_ftruncate"))RET((uint32_t)ftruncate(a[0],(uint64_t)a[1]|((uint64_t)a[2]<<32)));
@@ -54,6 +54,8 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_isalnum"))RET(isalnum(a[0]));
     if(IS("_isxdigit"))RET(isxdigit(a[0]));
     if(IS("_atoi"))RET(atoi((void *)(uintptr_t)a[0]));
+    if(IS("_atof"))RET(return_guest_double(atof((void *)(uintptr_t)a[0])));
+    if(IS("_atol"))RET((uint32_t)atol((void *)(uintptr_t)a[0]));
     if(IS("_srandom")){srandom(a[0]);RET(0);}
     if(IS("_random"))RET(random());
     if(IS("_rand"))RET(rand());
@@ -66,8 +68,17 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_ldexp"))RET(return_guest_double(ldexp(guest_double(a),(int)a[2])));
     if(IS("_frexp"))RET(return_guest_double(frexp(guest_double(a),(void *)(uintptr_t)a[2])));
     if(IS("_acosf"))RET(return_guest_float(acosf(guest_float(a[0]))));
+    if(IS("_asinf"))RET(return_guest_float(asinf(guest_float(a[0]))));
+    if(IS("_atanf"))RET(return_guest_float(atanf(guest_float(a[0]))));
+    if(IS("_tanf"))RET(return_guest_float(tanf(guest_float(a[0]))));
+    if(IS("_cbrtf"))RET(return_guest_float(cbrtf(guest_float(a[0]))));
+    if(IS("_powf"))RET(return_guest_float(powf(guest_float(a[0]),guest_float(a[1]))));
+    if(IS("_sqrtf"))RET(return_guest_float(sqrtf(guest_float(a[0]))));
     if(IS("_atan2f"))RET(return_guest_float(atan2f(guest_float(a[0]),guest_float(a[1]))));
     if(IS("_rintf"))RET(return_guest_float(rintf(guest_float(a[0]))));
+    if(IS("_roundf"))RET(return_guest_float(roundf(guest_float(a[0]))));
+    if(IS("_lroundf"))RET((uint32_t)lroundf(guest_float(a[0])));
+    if(IS("_truncf"))RET(return_guest_float(truncf(guest_float(a[0]))));
     if(IS("_modff"))RET(return_guest_float(modff(guest_float(a[0]),(void *)(uintptr_t)a[1])));
     if(IS("___udivdi3")){uint64_t x=(uint64_t)a[0]|((uint64_t)a[1]<<32),y=(uint64_t)a[2]|((uint64_t)a[3]<<32);RET(x/y);}
     if(IS("___divdi3")){int64_t x=(uint64_t)a[0]|((uint64_t)a[1]<<32),y=(uint64_t)a[2]|((uint64_t)a[3]<<32);RET(x/y);}

@@ -6,32 +6,23 @@ enum SteamLocator {
         case unpatched
         /// PeggleSilicon is installed and its game image is loadable.
         case peggleSilicon
-        /// PeggleSilicon is installed, but its game image is Steam's still
+        /// PeggleSilicon is installed, but its game image is still Steam's
         /// DRM-encrypted executable, which the loader cannot start (an older
         /// install predating in-installer DRM unwrapping); it can be repaired.
         case needsRepair
         case unsupported
     }
 
-    static func find() -> URL? {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        let installation = home
-            .appendingPathComponent("Library/Application Support/Steam", isDirectory: true)
-            .appendingPathComponent("steamapps/common/Peggle Deluxe/Peggle Deluxe.app", isDirectory: true)
-        let executable = installation.appendingPathComponent("Contents/MacOS/Peggle")
-
-        guard FileManager.default.fileExists(atPath: installation.path),
-              FileManager.default.fileExists(atPath: executable.path) else {
-            return nil
-        }
-        return installation
+    /// Steam install for the given game, if present.
+    static func find(_ game: Game) -> URL? {
+        game.steamInstallationURL
     }
 
-    static func state(of installation: URL) -> InstallationState {
+    static func state(of installation: URL, game: Game) -> InstallationState {
         let contents = installation.appendingPathComponent("Contents")
-        let executable = contents.appendingPathComponent("MacOS/Peggle")
+        let executable = contents.appendingPathComponent("MacOS/\(game.executableName)")
         let resources = contents.appendingPathComponent("Resources/main.pak")
-        let sharedImage = contents.appendingPathComponent("SharedSupport/Peggle.image")
+        let sharedImage = contents.appendingPathComponent("SharedSupport/\(game.imageFileName)")
 
         guard FileManager.default.fileExists(atPath: executable.path),
               FileManager.default.fileExists(atPath: resources.path) else {
@@ -49,11 +40,30 @@ enum SteamLocator {
         return MachOInspector.isI386Executable(at: executable) ? .unpatched : .unsupported
     }
 
-    /// Whether a bundle's executable is the original 32-bit Peggle game (retail
-    /// or Steam's DRM copy — both are valid build sources; the DRM copy is
-    /// unwrapped at build time).
-    static func isGameSource(_ bundle: URL) -> Bool {
-        MachOInspector.isI386Executable(at: bundle.appendingPathComponent("Contents/MacOS/Peggle"))
+    /// Whether a bundle is the original 32-bit game for `game` (retail or
+    /// Steam's DRM copy — both are valid build sources; the DRM copy is
+    /// unwrapped at build time).  Verified by bundle identifier and a 32-bit
+    /// Intel executable.
+    static func isSource(_ bundle: URL, for game: Game) -> Bool {
+        guard bundleIdentifier(of: bundle) == game.id else { return false }
+        let executable = bundle.appendingPathComponent(
+            "Contents/MacOS/\(game.executableName)")
+        return MachOInspector.isI386Executable(at: executable)
+    }
+
+    /// The game a dropped bundle belongs to, if any.
+    static func game(of bundle: URL) -> Game? {
+        Game.matching(bundleIdentifier: bundleIdentifier(of: bundle))
+    }
+
+    private static func bundleIdentifier(of bundle: URL) -> String? {
+        let plistURL = bundle.appendingPathComponent("Contents/Info.plist")
+        guard let data = try? Data(contentsOf: plistURL),
+              let plist = try? PropertyListSerialization.propertyList(
+                  from: data, options: [], format: nil) as? [String: Any] else {
+            return nil
+        }
+        return plist["CFBundleIdentifier"] as? String
     }
 }
 

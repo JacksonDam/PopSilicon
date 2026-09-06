@@ -4911,6 +4911,32 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = kCGErrorSuccess;
         return 1;
     }
+    /* Gamma ramp: the game saves the display transfer table, then drives fades
+       by setting it and restores it on exit.  Windowed presentation has no
+       display gamma to touch, so report an identity ramp and swallow the sets;
+       fades still run in the game's own compositing. */
+    if (LP32_NAME_IS(import_name, import_length, "_CGGetDisplayTransferByTable")) {
+        uint32_t capacity = arguments[1];
+        float *red = (void *)(uintptr_t)arguments[2];
+        float *green = (void *)(uintptr_t)arguments[3];
+        float *blue = (void *)(uintptr_t)arguments[4];
+        uint32_t *sample_count = (void *)(uintptr_t)arguments[5];
+        for (uint32_t i = 0; i < capacity; ++i) {
+            float v = capacity > 1 ? (float)i / (float)(capacity - 1) : 0.0f;
+            if (red) red[i] = v;
+            if (green) green[i] = v;
+            if (blue) blue[i] = v;
+        }
+        if (sample_count) *sample_count = capacity;
+        *result = kCGErrorSuccess;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CGSetDisplayTransferByTable") ||
+        LP32_NAME_IS(import_name, import_length, "_CGSetDisplayTransferByFormula") ||
+        LP32_NAME_IS(import_name, import_length, "_CGDisplayRestoreColorSyncSettings")) {
+        *result = kCGErrorSuccess;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIsCaptured")) {
         *result = 0;
         return 1;

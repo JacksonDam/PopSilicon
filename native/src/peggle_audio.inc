@@ -100,7 +100,7 @@ static int peggle_audio_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 #define P(i) ((void *)(uintptr_t)a[i])
 #define OUT(i, v) do { if (a[i]) *(uint32_t *)P(i) = (uint32_t)(v); } while (0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
-    if (lp32_profile()->title != LP32_TITLE_PEGGLE) return 0;
+    if (!lp32_title_is_peggle_engine(lp32_profile()->title)) return 0;
     if (IS("_FindNextComponent")) {
         AudioComponent found = AudioComponentFindNext(pg_component(a[0]), P(1));
         if (!found) RET(0);

@@ -18,12 +18,31 @@ static const struct lp32_game_profile peggle_profile = {
     .main_address = 0x0006a33e,
 };
 
+/* Peggle Nights 1.0.4 (PopCap, 2008; original i386 Mac executable).  Same
+   "Sexy" engine as Deluxe; main is derived from the crt start stub. */
+static const struct lp32_game_profile peggle_nights_profile = {
+    .title = LP32_TITLE_PEGGLE_NIGHTS,
+    .name = "PeggleNights",
+    .display_name = "Peggle Nights",
+    .log_directory = "PeggleNights",
+    .image_file = "PeggleNights.image",
+    .entry_eip = 0x0000431c,
+    .image_end = 0x004ad000,
+    .main_address = 0,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
     .display_name = "unknown title",
     .log_directory = "PeggleSilicon",
     .image_file = "Peggle.image",
+};
+
+/* All shipping titles, in detection order. */
+static const struct lp32_game_profile *const known_profiles[] = {
+    &peggle_profile,
+    &peggle_nights_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -33,11 +52,21 @@ const struct lp32_game_profile *lp32_profile(void)
     return current_profile;
 }
 
+const struct lp32_game_profile *const *lp32_known_profiles(size_t *count)
+{
+    if (count) *count = sizeof(known_profiles) / sizeof(known_profiles[0]);
+    return known_profiles;
+}
+
 const struct lp32_game_profile *lp32_profile_named(const char *name)
 {
     if (!name) return NULL;
     if (strcasecmp(name, "PeggleSilicon") == 0 ||
-        strcasecmp(name, "Peggle") == 0) return &peggle_profile;
+        strcasecmp(name, "Peggle") == 0 ||
+        strcasecmp(name, "PeggleDeluxe") == 0 ||
+        strcasecmp(name, "Peggle Deluxe") == 0) return &peggle_profile;
+    if (strcasecmp(name, "PeggleNights") == 0 ||
+        strcasecmp(name, "Peggle Nights") == 0) return &peggle_nights_profile;
     return NULL;
 }
 
@@ -86,32 +115,56 @@ static bool steam_drm_wrapped(const struct macho_image32 *image)
     return memmem(start, length, marker, sizeof(marker) - 1) != NULL;
 }
 
+static const struct lp32_game_profile *detect_profile(
+    const struct macho_image32 *image)
+{
+    for (size_t i = 0; i < sizeof(known_profiles) / sizeof(known_profiles[0]); ++i) {
+        if (image->entry_eip == known_profiles[i]->entry_eip &&
+            image->max_address == known_profiles[i]->image_end) {
+            return known_profiles[i];
+        }
+    }
+    return NULL;
+}
+
 int lp32_profile_select(const struct macho_image32 *image)
 {
     const char *override = getenv("LP32_GAME");
-    if (override && override[0] && !lp32_profile_named(override)) {
-        fprintf(stderr, "game_loader: unknown LP32_GAME profile: %s\n", override);
-        return -1;
-    }
-    if ((image->entry_eip != peggle_profile.entry_eip ||
-         image->max_address != peggle_profile.image_end) &&
-        !(override && override[0])) {
-        if (steam_drm_wrapped(image)) {
+    if (override && override[0]) {
+        const struct lp32_game_profile *forced = lp32_profile_named(override);
+        if (!forced) {
+            fprintf(stderr, "game_loader: unknown LP32_GAME profile: %s\n", override);
+            return -1;
+        }
+        if (image->entry_eip != forced->entry_eip ||
+            image->max_address != forced->image_end) {
             fprintf(stderr,
-                    "game_loader: the game image is Steam's DRM-protected "
-                    "executable and must be unwrapped before it can run.  Set "
-                    "LP32_UNWRAP_STEAM to recover a clean image, or reinstall "
-                    "with tools/build.py, which unwraps the Steam copy "
-                    "automatically (entry=0x%08x end=0x%08x).\n",
+                    "compat32: warning: image (entry=0x%08x end=0x%08x) does not "
+                    "match forced profile %s (entry=0x%08x end=0x%08x)\n",
+                    image->entry_eip, image->max_address, forced->name,
+                    forced->entry_eip, forced->image_end);
+        }
+        current_profile = forced;
+    } else {
+        const struct lp32_game_profile *detected = detect_profile(image);
+        if (!detected) {
+            if (steam_drm_wrapped(image)) {
+                fprintf(stderr,
+                        "game_loader: the game image is Steam's DRM-protected "
+                        "executable and must be unwrapped before it can run.  Set "
+                        "LP32_UNWRAP_STEAM to recover a clean image, or reinstall "
+                        "with tools/build.py, which unwraps the Steam copy "
+                        "automatically (entry=0x%08x end=0x%08x).\n",
+                        image->entry_eip, image->max_address);
+                return -1;
+            }
+            fprintf(stderr,
+                    "game_loader: unrecognised image (entry=0x%08x end=0x%08x)\n",
                     image->entry_eip, image->max_address);
             return -1;
         }
-        fprintf(stderr,
-                "game_loader: unrecognised image (entry=0x%08x end=0x%08x)\n",
-                image->entry_eip, image->max_address);
-        return -1;
+        current_profile = detected;
     }
-    current_profile = &peggle_profile;
     fprintf(stderr, "compat32: title profile %s (%s)\n",
             current_profile->name, current_profile->display_name);
     return 0;

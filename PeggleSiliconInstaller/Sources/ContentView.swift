@@ -9,8 +9,22 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("PeggleSilicon Installer")
                     .font(.largeTitle.bold())
-                Text("Run Peggle Deluxe on Apple silicon")
+                Text("Run Peggle Deluxe or Peggle Nights on Apple silicon")
                     .foregroundColor(.gray)
+            }
+
+            HStack(spacing: 10) {
+                Text("Game")
+                    .foregroundColor(.gray)
+                Picker("Game", selection: $model.selectedGame) {
+                    ForEach(model.availableGames) { game in
+                        Text(game.displayName).tag(game)
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: 220)
+                .disabled(model.isBuilding)
+                Spacer()
             }
 
             if model.steamInstallationURL != nil {

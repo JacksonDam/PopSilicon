@@ -33,10 +33,10 @@ def ensure_steam_running() -> None:
             return
         time.sleep(1)
     raise SystemExit(
-        'Steam must be running to unwrap the Steam copy of Peggle Deluxe.\n'
+        'Steam must be running to unwrap the Steam copy of the game.\n'
         'Valve wraps the executable in Steam DRM that only decrypts after a live\n'
         'ownership check with the Steam client. Start Steam, sign in to the\n'
-        'account that owns Peggle Deluxe, then run the installation again.')
+        'account that owns the game, then run the installation again.')
 
 
 def unwrap_steam_drm(loader: pathlib.Path, drm_executable: pathlib.Path,
@@ -59,7 +59,7 @@ def unwrap_steam_drm(loader: pathlib.Path, drm_executable: pathlib.Path,
             env=env, capture_output=True, text=True)
         if result.returncode != 0 or not staged.is_file():
             raise SystemExit(
-                'could not unwrap the Steam DRM copy of Peggle Deluxe.\n'
+                'could not unwrap the Steam DRM copy of the game.\n'
                 f'{result.stdout}{result.stderr}'.strip())
         shutil.move(str(staged), str(out_image))
 
@@ -73,39 +73,74 @@ def copy_clean(source: pathlib.Path, destination: pathlib.Path) -> None:
                    check=True)
 
 
+# Per-title build settings, keyed by the source bundle identifier.  The image
+# file name must match the corresponding profile's image_file in
+# native/src/game_profile.c so the loader finds and auto-detects it.
+GAMES = {
+    'com.popcap.peggle': {
+        'display_name': 'Peggle Deluxe',
+        'image_file': 'Peggle.image',
+        'output_name': 'PeggleSilicon.app',
+        'bundle_identifier': 'local.peggle.silicon',
+        'bundle_name': 'PeggleSilicon',
+    },
+    'com.popcap.pegglenights': {
+        'display_name': 'Peggle Nights',
+        'image_file': 'PeggleNights.image',
+        'output_name': 'PeggleNights.app',
+        'bundle_identifier': 'local.peggle.nights',
+        'bundle_name': 'PeggleNights',
+    },
+}
+
+
+def game_for_source(info: dict) -> dict:
+    identifier = info.get('CFBundleIdentifier', '')
+    game = GAMES.get(identifier)
+    if not game:
+        raise SystemExit(
+            f'unsupported game bundle: {identifier or "(no identifier)"}.\n'
+            'Supported: Peggle Deluxe and Peggle Nights.')
+    return game
+
+
 parser = argparse.ArgumentParser(description='Build the PeggleSilicon compatibility app.')
 parser.add_argument('source', type=pathlib.Path,
-                    help='path to a Peggle Deluxe.app (retail or the Steam copy)')
+                    help='path to a Peggle Deluxe.app or Peggle Nights.app (retail or the Steam copy)')
 parser.add_argument(
     '--output',
     type=pathlib.Path,
-    default=root/'build/PeggleSilicon.app',
-    help='destination app bundle (default: build/PeggleSilicon.app)',
+    default=None,
+    help='destination app bundle (default: build/<game>.app)',
 )
 args = parser.parse_args()
 
 source=args.source.expanduser()
 if not source.is_dir():
     raise SystemExit(f'game bundle not found: {source}')
-executable=source/'Contents/MacOS/Peggle'
+source_info=plistlib.loads((source/'Contents/Info.plist').read_bytes())
+game=game_for_source(source_info)
+executable=source/'Contents/MacOS'/source_info.get('CFBundleExecutable','')
 if not executable.is_file():
     raise SystemExit(f'game executable not found: {executable}')
 
 subprocess.run(['make','-C',str(root/'native'),'-j4'],check=True)
 loader=root/'native/build/game_loader'
 
-bundle=args.output.expanduser();c=bundle/'Contents'
+bundle=(args.output.expanduser() if args.output
+        else root/'build'/game['output_name'])
+c=bundle/'Contents'
 bundle.parent.mkdir(parents=True,exist_ok=True)
 for d in ('MacOS','Resources','SharedSupport'): (c/d).mkdir(parents=True,exist_ok=True)
 
-image=c/'SharedSupport/Peggle.image'
+image=c/'SharedSupport'/game['image_file']
 drm=is_steam_drm(executable)
 # Regenerate the image when it is missing, or (for a plain retail source) when
 # the source executable changed.  A DRM source needs an unwrap step, so only
 # regenerate it when the image is absent.
 if not image.exists() or (not drm and not filecmp.cmp(executable,image,shallow=False)):
  if drm:
-  print(f'{executable.name} is a Steam DRM copy; unwrapping its game code…')
+  print(f"{executable.name} is a Steam DRM copy of {game['display_name']}; unwrapping its game code…")
   unwrap_steam_drm(loader,executable,image)
  else:
   copy_clean(executable,image)
@@ -113,7 +148,7 @@ if not image.exists() or (not drm and not filecmp.cmp(executable,image,shallow=F
 
 copy_clean(loader,c/'MacOS/PeggleSilicon')
 copy_clean(root/'native/vendor/bass/libbass.dylib',c/'MacOS/libbass.dylib')
-p=plistlib.loads((source/'Contents/Info.plist').read_bytes());p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier='local.peggle.silicon',CFBundleName='PeggleSilicon',LSMinimumSystemVersion='11.0',NSHighResolutionCapable=False)
+p=dict(source_info);p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier=game['bundle_identifier'],CFBundleName=game['bundle_name'],LSMinimumSystemVersion='11.0',NSHighResolutionCapable=False)
 (c/'Info.plist').write_bytes(plistlib.dumps(p))
 subprocess.run(['codesign','--force','--deep','--sign','-',str(bundle)],check=True)
 print(bundle)

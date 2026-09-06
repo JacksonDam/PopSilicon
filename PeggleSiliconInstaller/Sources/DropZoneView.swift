@@ -24,7 +24,7 @@ struct DropZoneView: View {
                         .foregroundColor(.gray)
                         .lineLimit(2)
                 } else {
-                    Text("Drag Peggle Deluxe.app here")
+                    Text("Drag \(model.selectedGame.steamAppName) here")
                         .font(.headline)
                     Text(model.dropZoneHint)
                         .font(.caption)
@@ -52,8 +52,8 @@ struct DropZoneView: View {
         )
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("Peggle Deluxe application drop area")
-        .accessibilityHint("Drag the original Peggle Deluxe application here")
+        .accessibilityLabel("\(model.selectedGame.displayName) application drop area")
+        .accessibilityHint("Drag the original \(model.selectedGame.displayName) application here")
         .onDrop(
             of: [UTType.fileURL],
             isTargeted: $model.isDropTargeted,

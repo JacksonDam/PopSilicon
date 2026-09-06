@@ -3633,12 +3633,12 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         const char *mode = (const char *)(uintptr_t)arguments[1];
         FILE *file = fopen(path, mode);
         if (!file && getenv("LP32_TRACE_FILES")) {
-            fprintf(stderr, "compat32: fopen failed: %s (%s)\n",
-                    path ? path : "(null)", strerror(errno));
+            fprintf(stderr, "compat32: fopen failed: %s (%s) from 0x%08" PRIx32 "\n",
+                    path ? path : "(null)", strerror(errno), return_address);
         } else if (file && getenv("LP32_TRACE_FILES") &&
                    getenv("LP32_TRACE_FILES")[0] == '2') {
-            fprintf(stderr, "compat32: fopen %s (%s)\n", path ? path : "(null)",
-                    mode ? mode : "");
+            fprintf(stderr, "compat32: fopen %s (%s) from 0x%08" PRIx32 "\n",
+                    path ? path : "(null)", mode ? mode : "", return_address);
         }
         if (!file && errno == ENOENT && path && mode && mode[0] == 'r' &&
             path_is_game_config(path)) {
@@ -4127,6 +4127,26 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_IOServiceAddInterestNotification") ||
         import_is(name, "_IOServiceAddMatchingNotification")) return UINT32_C(0xe00002c7);
+    enum {
+        kPowerRootConnection = 0x504d5201u, /* 'PMR\1' sentinel io_connect_t */
+        kPowerNotificationPort = 0x504d5202u,
+        kPowerNotifier = 0x504d5203u,
+    };
+    /* Sleep/wake notifications (Peggle Nights registers for these during
+       SexyAppBase::Init and ABORTS init if this returns MACH_PORT_NULL).
+       Return a non-zero sentinel connection and fabricate a notification port
+       so the game proceeds; the run-loop source it fetches is a no-op below, so
+       no sleep hooks actually fire. */
+    if (import_is(name, "_IORegisterForSystemPower")) {
+        uint32_t *port_ref = (void *)(uintptr_t)arguments[1];
+        uint32_t *notifier = (void *)(uintptr_t)arguments[3];
+        if (port_ref) *port_ref = kPowerNotificationPort;
+        if (notifier) *notifier = kPowerNotifier;
+        return kPowerRootConnection; /* non-zero io_connect_t */
+    }
+    if (import_is(name, "_IODeregisterForSystemPower") ||
+        import_is(name, "_IOAllowPowerChange") ||
+        import_is(name, "_IOCancelPowerChange")) return 0;
     if (import_is(name, "_CFRunLoopAddSource") ||
         import_is(name, "_CFRunLoopRemoveSource")) return 0;
     if (import_is(name, "_CFRunLoopContainsSource")) return 0;

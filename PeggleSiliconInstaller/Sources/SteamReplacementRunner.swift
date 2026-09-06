@@ -6,7 +6,7 @@ enum SteamReplacementRunner {
     /// A target that is still Valve's copy is renamed to `.bak` first; a
     /// target that already holds PeggleSilicon is replaced in place, keeping
     /// whatever backup exists.
-    static func run(source: URL, target: URL, projectRoot: URL) async -> BuildResult {
+    static func run(source: URL, target: URL, game: Game, projectRoot: URL) async -> BuildResult {
         let fileManager = FileManager.default
         let parent = target.deletingLastPathComponent()
         let backup = target.appendingPathExtension("bak")
@@ -14,7 +14,7 @@ enum SteamReplacementRunner {
         let previousInstall = parent.appendingPathComponent(".PeggleSilicon.previous.app")
         let backupExists = fileManager.fileExists(atPath: backup.path)
         let targetIsPeggleSilicon = fileManager.fileExists(
-            atPath: target.appendingPathComponent("Contents/SharedSupport/Peggle.image").path
+            atPath: target.appendingPathComponent("Contents/SharedSupport/\(game.imageFileName)").path
         )
         let originalInfo = readInfoPlist(at: backupExists ? backup : target)
 
@@ -39,7 +39,7 @@ enum SteamReplacementRunner {
         guard build.succeeded else { return build }
 
         do {
-            try makeSteamCompatible(at: temporaryOutput, preserving: originalInfo)
+            try makeSteamCompatible(at: temporaryOutput, game: game, preserving: originalInfo)
             // Move the current bundle aside, then put the new one in place;
             // the aside copy is restored if that fails.
             let aside = targetIsPeggleSilicon ? previousInstall : backup
@@ -87,29 +87,30 @@ enum SteamReplacementRunner {
 
     private static func makeSteamCompatible(
         at bundle: URL,
+        game: Game,
         preserving originalInfo: [String: Any]?
     ) throws {
         let fileManager = FileManager.default
         let macOSDirectory = bundle.appendingPathComponent("Contents/MacOS")
         let siliconExecutable = macOSDirectory.appendingPathComponent("PeggleSilicon")
-        let steamExecutable = macOSDirectory.appendingPathComponent("Peggle")
+        let steamExecutable = macOSDirectory.appendingPathComponent(game.executableName)
 
         guard fileManager.fileExists(atPath: siliconExecutable.path) else {
             throw InstallerError("The generated PeggleSilicon executable was not found.")
         }
         guard !fileManager.fileExists(atPath: steamExecutable.path) else {
-            throw InstallerError("The temporary Steam installation already contains a Peggle executable.")
+            throw InstallerError("The temporary Steam installation already contains a \(game.executableName) executable.")
         }
 
         // Steam's macOS launch configuration invokes the original executable
-        // name directly, so the compatibility loader must be exposed as Peggle.
+        // name directly, so the compatibility loader must be exposed under it.
         try fileManager.moveItem(at: siliconExecutable, to: steamExecutable)
 
         let plistURL = bundle.appendingPathComponent("Contents/Info.plist")
         guard var plist = readInfoPlist(at: bundle) else {
             throw InstallerError("The generated app has an invalid Info.plist.")
         }
-        plist["CFBundleExecutable"] = "Peggle"
+        plist["CFBundleExecutable"] = game.executableName
         for key in ["CFBundleIdentifier", "CFBundleName", "CFBundleDisplayName"] {
             if let value = originalInfo?[key] {
                 plist[key] = value
