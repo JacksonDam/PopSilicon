@@ -596,7 +596,14 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         struct pg_win *w = pg_win_for(a[0]);
         int16_t q[4] = {0, 0, 600, 800};
         if (w) {
-            pg_qd_from_rect(a[1] == kWindowStructureRgn ? [w->window frame] : pg_content_rect(w), q);
+            /* The engine was written for a borderless full-screen window and
+               assumes the structure and content regions coincide: it takes its
+               drawing and hit-testing origin from the structure region.
+               Reporting the real frame, which includes the title bar, put that
+               origin a title bar above the content and pushed every hit test
+               down by the same amount, so buttons only responded below
+               themselves.  Report the content region for both. */
+            pg_qd_from_rect(pg_content_rect(w), q);
             if (!w->overlay && w->logical_content_size.width > 0 && w->logical_content_size.height > 0) {
                 q[2] = q[0] + (int16_t)w->logical_content_size.height;
                 q[3] = q[1] + (int16_t)w->logical_content_size.width;
@@ -607,7 +614,9 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     }
     if (IS("_SetWindowBounds")) {
         struct pg_win *w = pg_win_for(a[0]);
-        if (w && a[2] >= 0x1000) pg_set_bounds(w, pg_rect_from_qd(P(2)), a[1] != kWindowStructureRgn);
+        /* Both regions are the content region here, so a bounds the engine
+           read back and set again round-trips instead of creeping upwards. */
+        if (w && a[2] >= 0x1000) pg_set_bounds(w, pg_rect_from_qd(P(2)), true);
         RET(0);
     }
     if (IS("_GetPortBounds")) {
@@ -624,9 +633,16 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_SetWRefCon")) { struct pg_win *w = pg_win_for(a[0]); if (w) w->refcon = a[1]; RET(0); }
     if (IS("_GetWRefCon")) { struct pg_win *w = pg_win_for(a[0]); RET(w ? w->refcon : 0); }
     if (IS("_FindWindow")) {
-        NSPoint p = pg_qd_point(NSMakePoint((int16_t)(a[0] >> 16), (int16_t)(a[0] & 0xffff)));
+        /* The argument is a global QuickDraw Point, measured down from the top
+           of the screen.  pg_qd_point already turns it into the screen
+           coordinates pg_content_rect uses; flipping it a second time put the
+           point back into QuickDraw space, so every click outside a vertically
+           centred window read as inDesk and the engine dropped it.  It stayed
+           hidden while the emulated display mode centred the window, which made
+           the two flips cancel out. */
+        NSPoint screen = pg_qd_point(NSMakePoint((int16_t)(a[0] >> 16),
+                                                 (int16_t)(a[0] & 0xffff)));
         struct pg_win *w = pg_main_win();
-        NSPoint screen = NSMakePoint(p.x, pg_screen_top() - p.y);
         if (w && NSPointInRect(screen, pg_content_rect(w))) { OUT(1, w->handle); RET(inContent); }
         OUT(1, 0);
         RET(inDesk);
@@ -749,7 +765,11 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         }
         if (!found) {
             found = true;
-            if (a[1] == kEventParamDirectObject) {
+            if (a[1] == kEventParamDirectObject ||
+                a[1] == kEventParamWindowRef) {
+                /* Carbon tags every mouse event with the window it happened in
+                   and the engine asks for it; answering "missing" left it with
+                   no window to route the click to.  There is one game window. */
                 struct pg_win *w = pg_main_win();
                 uint32_t handle = w ? w->handle : 0;
                 memcpy(temp, &handle, 4);
@@ -764,9 +784,19 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
                 struct pg_win *w = pg_main_win();
                 NSPoint p = pg_event_screen_point(native);
                 NSPoint local = w ? pg_logical_mouse_point(w, p) : NSZeroPoint;
-                float q[2] = {(float)local.x, (float)local.y};
-                memcpy(temp, q, 8);
-                length = 8;
+                /* Honour the requested type, as the global location above
+                   already does.  The engine asks for this one as a QuickDraw
+                   Point (two 16-bit words, vertical first); always answering
+                   with the HIPoint pair handed it the bytes of a float. */
+                if (a[2] == typeQDPoint) {
+                    int16_t q[2] = {(int16_t)local.y, (int16_t)local.x};
+                    memcpy(temp, q, 4);
+                    length = 4;
+                } else {
+                    float q[2] = {(float)local.x, (float)local.y};
+                    memcpy(temp, q, 8);
+                    length = 8;
+                }
             } else if (a[1] == kEventParamMouseButton) {
                 uint16_t button = (uint16_t)(native ? [native buttonNumber] + 1 : 1);
                 memcpy(temp, &button, 2);
