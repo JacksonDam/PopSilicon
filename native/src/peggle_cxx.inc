@@ -121,7 +121,7 @@ static int peggle_cxx_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     }
     if (IS("___cxa_allocate_exception")) RET(compat_runtime32_allocate(a[0] ? a[0] : 4, 1));
     if (IS("___cxa_free_exception")) { compat_runtime32_deallocate(a[0]); RET(0); }
-    if (IS("___cxa_begin_catch")) RET(a[0]);
+    if (IS("___cxa_begin_catch") || IS("___cxa_get_exception_ptr")) RET(a[0]);
     if (IS("___cxa_end_catch")) RET(0);
     if (IS("___cxa_throw")) {
         const char *type = pg_ti_name(a[1]);

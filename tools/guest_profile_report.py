@@ -32,7 +32,12 @@ for line in open(profile):
     addr = int(parts[1], 16)
     if parts[0] == 'g':
         nguest += 1
-        chain = [int(x, 16) for x in line.split()[2:]]
+        chain = []
+        for token in line.split()[2:]:
+            try:
+                chain.append(int(token, 16))
+            except ValueError:
+                break  # the trailing @timestamp, or a watch-mode arg0=/arg1=
         if chain:
             fn = name_of(addr) if 0x1000 <= addr < keys[-1] + 0x200000 else '?'
             callers[fn][' <- '.join(name_of(c) for c in chain[:3])] += 1

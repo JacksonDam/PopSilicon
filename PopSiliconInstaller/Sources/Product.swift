@@ -8,6 +8,7 @@ enum Product: String, CaseIterable, Identifiable {
     case bejeweledSilicon
     case chuzzleSilicon
     case pvzSilicon
+    case zumaSilicon
 
     var id: String { rawValue }
 
@@ -17,6 +18,7 @@ enum Product: String, CaseIterable, Identifiable {
         case .bejeweledSilicon: return "BejeweledSilicon"
         case .chuzzleSilicon: return "ChuzzleSilicon"
         case .pvzSilicon: return "PvZSilicon"
+        case .zumaSilicon: return "ZumaSilicon"
         }
     }
 
@@ -26,6 +28,7 @@ enum Product: String, CaseIterable, Identifiable {
         case .bejeweledSilicon: return [.bejeweled3, .bejeweled2]
         case .chuzzleSilicon: return [.chuzzle]
         case .pvzSilicon: return [.plantsVsZombies]
+        case .zumaSilicon: return [.zuma]
         }
     }
 
@@ -42,6 +45,7 @@ enum Product: String, CaseIterable, Identifiable {
         case .bejeweledSilicon: return "diamond.fill"
         case .chuzzleSilicon: return "circle.grid.3x3.fill"
         case .pvzSilicon: return "leaf.fill"
+        case .zumaSilicon: return "circle.circle.fill"
         }
     }
 

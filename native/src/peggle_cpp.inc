@@ -81,7 +81,8 @@ static int peggle_file_stream_dispatch(const char *name, const uint32_t *a, uint
        (a string stream's basic_ios, say) falls through to its own handler. */
     int slot = pg_file_slot(a[0]);
     if (slot < 0) return 0;
-    if (strstr(name, "basic_filebuf") && strstr(name, "7is_openEv")) {
+    /* is_open() is asked of the stream itself as well as of its filebuf. */
+    if (strstr(name, "7is_openEv")) {
         PG_RETURN(pg_files[slot].file != NULL);
     }
     if (strstr(name, "basic_ios") && strstr(name, "3eofEv")) {

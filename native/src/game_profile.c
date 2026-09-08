@@ -64,6 +64,21 @@ static const struct lp32_game_profile bejeweled2_profile = {
     .main_address = 0,
 };
 
+/* Zuma Deluxe 1.0.0 (PopCap, 2003; original i386 Mac executable).  Bejeweled
+   2's twin: the same early Carbon/AGL engine with FMOD over the Sound Manager
+   and BASSMOD for its music, and the same unencrypted __STEAM ownership stub.
+   main is derived from the crt start stub. */
+static const struct lp32_game_profile zuma_profile = {
+    .title = LP32_TITLE_ZUMA,
+    .name = "Zuma",
+    .display_name = "Zuma Deluxe",
+    .log_directory = "Zuma",
+    .image_file = "Zuma.image",
+    .entry_eip = 0x0000299c,
+    .image_end = 0x002f6358,
+    .main_address = 0,
+};
+
 /* Plants vs. Zombies 1.0.41 (PopCap, 2009; original i386 Mac executable).
    The same "Sexy" engine generation as Bejeweled 3 -- Cocoa, AGL, BASS and
    libsteam_api -- and, like the Peggle titles, its Steam copy is wrapped in
@@ -113,6 +128,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &bejeweled2_profile,
     &chuzzle_profile,
     &plantsvszombies_profile,
+    &zuma_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -142,6 +158,8 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (strcasecmp(name, "Bejeweled2") == 0 ||
         strcasecmp(name, "Bejeweled 2") == 0 ||
         strcasecmp(name, "Bejeweled 2 Deluxe") == 0) return &bejeweled2_profile;
+    if (strcasecmp(name, "Zuma") == 0 ||
+        strcasecmp(name, "Zuma Deluxe") == 0) return &zuma_profile;
     if (strcasecmp(name, "PlantsVsZombies") == 0 ||
         strcasecmp(name, "Plants vs. Zombies") == 0 ||
         strcasecmp(name, "PvZ") == 0) return &plantsvszombies_profile;

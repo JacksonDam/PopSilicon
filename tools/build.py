@@ -105,6 +105,13 @@ GAMES = {
         'bundle_identifier': 'local.bejeweled2.silicon',
         'bundle_name': 'Bejeweled2',
     },
+    'com.popcap.zuma.app': {
+        'display_name': 'Zuma Deluxe',
+        'image_file': 'Zuma.image',
+        'output_name': 'Zuma.app',
+        'bundle_identifier': 'local.zuma.silicon',
+        'bundle_name': 'Zuma',
+    },
     'com.popcap.plantsvszombies': {
         'display_name': 'Plants vs. Zombies',
         'image_file': 'PlantsVsZombies.image',
@@ -129,7 +136,8 @@ def game_for_source(info: dict) -> dict:
         raise SystemExit(
             f'unsupported game bundle: {identifier or "(no identifier)"}.\n'
             'Supported: Peggle Deluxe, Peggle Nights, Bejeweled 3, '
-            'Bejeweled 2 Deluxe, Chuzzle Deluxe and Plants vs. Zombies.')
+            'Bejeweled 2 Deluxe, Chuzzle Deluxe, Plants vs. Zombies and '
+            'Zuma Deluxe.')
     return game
 
 

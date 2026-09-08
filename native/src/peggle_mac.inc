@@ -12,7 +12,7 @@ static uint64_t pg_fp_double(double v)
 #include "gli_context.inc"
 #include "peggle_window.inc"
 #include "peggle_graphics.inc"
-#include "bejeweled2.inc"
+#include "classic_toolbox.inc"
 #include "chuzzle.inc"
 
 /* A small printf for CFStringCreateWithFormat over i386 varargs (%@ takes a
@@ -55,7 +55,7 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (!lp32_title_is_peggle_engine(lp32_profile()->title)) return 0;
     if (gli_dispatch(n, a, r) ||
         peggle_window_dispatch(n, a, r) || peggle_graphics_dispatch(n, a, r) ||
-        bejeweled2_dispatch(n, a, r) || chuzzle_dispatch(n, a, r)) return 1;
+        classic_toolbox_dispatch(n, a, r) || chuzzle_dispatch(n, a, r)) return 1;
     if (IS("_CFBundleGetValueForInfoDictionaryKey")) RET(proxy_for_object([O(0) objectForInfoDictionaryKey:O(1)]));
     if (IS("_CFBundleGetVersionNumber")) {
         switch (lp32_profile()->title) {
@@ -191,7 +191,19 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_CopyCStringToPascal")) { size_t len = strlen(P(0)); if (len > 255) len = 255; *(uint8_t *)P(1) = len; memcpy((uint8_t *)P(1) + 1, P(0), len); RET(0); }
     if (IS("_Delay")) { usleep(a[0] * 1000000u / 60); OUT(1, (uint32_t)(CFAbsoluteTimeGetCurrent() * 60)); RET(0); }
     if (IS("_AddNanosecondsToAbsolute")) { mach_timebase_info_data_t info; mach_timebase_info(&info); uint64_t ns = (uint64_t)a[0] | ((uint64_t)a[1] << 32), time = (uint64_t)a[2] | ((uint64_t)a[3] << 32); RET(time + ns * info.denom / info.numer); }
-    if (IS("_MPDelayUntil")) { uint64_t target; memcpy(&target, P(0), 8); mach_wait_until(target); RET(0); }
+    if (IS("_MPDelayUntil")) {
+        /* mach_wait_until returns KERN_ABORTED on any signal, and the guest
+           ignores the result.  This is Zuma's frame limiter, so an interrupted
+           wait would shorten its frame -- which the sampling profiler, firing
+           SIGPROF hundreds of times a second, would do to every frame and so
+           change the very timing being measured.  Wait out the full deadline,
+           as _usleep already does. */
+        uint64_t target;
+        memcpy(&target, P(0), 8);
+        while (mach_absolute_time() < target && mach_wait_until(target) == KERN_ABORTED) {
+        }
+        RET(0);
+    }
     if (IS("_GetApplicationTextEncoding")) RET(0);
     if (IS("_GetCurrentEventTime")) RET(pg_fp_double(CFAbsoluteTimeGetCurrent()));
     if (IS("_UpTime")) RET(mach_absolute_time());

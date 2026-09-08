@@ -22,6 +22,10 @@ enum { kProfileStackBase = 0x7c000000u, kProfileStackEnd = 0x7f000000u };
 #define kHostTag (UINT64_C(1) << 63)
 
 static uint64_t *profile_samples;
+/* When each sample was taken, on the same clock the import profiler uses
+   (CLOCK_UPTIME_RAW nanoseconds), so a report can be sliced to a window --
+   a brief stall is invisible in a whole session's aggregate. */
+static uint64_t *profile_times;
 static uint32_t *profile_callers;
 /* LP32_PROFILE_WATCH=<lo>-<hi>: for samples inside [lo, hi) also record the
    two stack arguments [ebp+8] and [ebp+12] of the interrupted frame. */
@@ -44,6 +48,7 @@ static void profile_signal(int signal_number, siginfo_t *info, void *opaque)
     if (index < kProfileCapacity) {
         profile_samples[index] = cs == lp32_cs32 ? (rip & UINT32_MAX)
                                                  : (rip | kHostTag);
+        profile_times[index] = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
         /* Guest callers via the i386 frame-pointer chain: [ebp] = saved ebp,
            [ebp+4] = return address.  Only follow frames inside the guest
            stack region (always mapped), so the handler cannot fault. */
@@ -131,17 +136,18 @@ static void profile_flush(uint32_t *flushed)
             Dl_info dl;
             if (dladdr((void *)(uintptr_t)rip, &dl) && dl.dli_sname) {
                 const char *image = strrchr(dl.dli_fname, '/');
-                fprintf(profile_out, "h 0x%" PRIx64 " %s!%s+0x%" PRIx64 "\n",
+                fprintf(profile_out, "h 0x%" PRIx64 " %s!%s+0x%" PRIx64,
                         rip, image ? image + 1 : dl.dli_fname, dl.dli_sname,
                         rip - (uint64_t)(uintptr_t)dl.dli_saddr);
             } else if (dladdr((void *)(uintptr_t)rip, &dl) && dl.dli_fname) {
                 const char *image = strrchr(dl.dli_fname, '/');
-                fprintf(profile_out, "h 0x%" PRIx64 " %s!?+0x%" PRIx64 "\n",
+                fprintf(profile_out, "h 0x%" PRIx64 " %s!?+0x%" PRIx64,
                         rip, image ? image + 1 : dl.dli_fname,
                         rip - (uint64_t)(uintptr_t)dl.dli_fbase);
             } else {
-                fprintf(profile_out, "h 0x%" PRIx64 " ?\n", rip);
+                fprintf(profile_out, "h 0x%" PRIx64 " ?", rip);
             }
+            fprintf(profile_out, " @%" PRIu64 "\n", profile_times[index]);
         } else {
             fprintf(profile_out, "g 0x%" PRIx64, sample);
             const uint32_t *callers = &profile_callers[(size_t)index * kProfileDepth];
@@ -157,7 +163,7 @@ static void profile_flush(uint32_t *flushed)
                         profile_watch_values[(size_t)index * 3 + 2]);
                 dump_guest_wstring(profile_watch_values[(size_t)index * 3 + 2]);
             }
-            fputc('\n', profile_out);
+            fprintf(profile_out, " @%" PRIu64 "\n", profile_times[index]);
         }
     }
     *flushed = count;
@@ -188,9 +194,10 @@ void lp32_guest_profiler_start(void)
     profile_interval_us = (unsigned)strtoul(text, NULL, 0);
     if (profile_interval_us < 100) profile_interval_us = 1000;
     profile_samples = calloc(kProfileCapacity, sizeof(*profile_samples));
+    profile_times = calloc(kProfileCapacity, sizeof(*profile_times));
     profile_callers = calloc((size_t)kProfileCapacity * kProfileDepth,
                              sizeof(*profile_callers));
-    if (!profile_samples || !profile_callers) return;
+    if (!profile_samples || !profile_times || !profile_callers) return;
     const char *path = getenv("LP32_PROFILE_OUT");
     char buffer[1024];
     if (!path || !path[0]) {

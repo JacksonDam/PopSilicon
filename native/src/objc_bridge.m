@@ -2228,7 +2228,10 @@ static void present_frame_with_stats(NSOpenGLContext *context,
     } stats;
     static uint64_t report_interval;
     if (!report_interval) {
-        report_interval = strtoull(getenv("LP32_FRAME_STATS"), NULL, 0);
+        /* The timing is also on when only LP32_SLOW_IMPORT_MS was asked for,
+           so the interval variable may be absent. */
+        const char *interval_text = getenv("LP32_FRAME_STATS");
+        report_interval = interval_text ? strtoull(interval_text, NULL, 0) : 0;
         if (!report_interval) report_interval = 300;
     }
     uint64_t now_ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);

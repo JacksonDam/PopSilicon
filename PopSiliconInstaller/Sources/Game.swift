@@ -97,8 +97,19 @@ struct Game: Identifiable, Hashable {
         resourceMarker: "main.pak"
     )
 
+    static let zuma = Game(
+        id: "com.popcap.zuma.app",
+        displayName: "Zuma Deluxe",
+        steamFolder: "Zuma Deluxe",
+        steamAppName: "Zuma Deluxe.app",
+        executableName: "Zuma",
+        outputAppName: "Zuma.app",
+        imageFileName: "Zuma.image",
+        resourceMarker: "properties/resources.xml"
+    )
+
     static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2, .chuzzle,
-                              .plantsVsZombies]
+                              .plantsVsZombies, .zuma]
 
     /// The game whose original bundle identifier matches this dropped app.
     static func matching(bundleIdentifier: String?) -> Game? {

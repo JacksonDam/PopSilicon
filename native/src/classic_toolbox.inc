@@ -1,11 +1,12 @@
 /*
- * Bejeweled 2 Deluxe is the oldest title the runtime carries (2004), and it
- * reaches for a much older Mac OS X than the Peggle titles do: the classic
- * Memory, Queue, Notification, Process, Multiprocessing and Sound Managers,
- * plus Open Transport.  Its Carbon window, event and AGL surface is already
- * emulated in peggle_window.inc; what follows is everything else.
+ * The classic Mac Toolbox, for the two earliest titles the runtime carries:
+ * Bejeweled 2 Deluxe (2004) and Zuma Deluxe (2003).  Both are the same early
+ * PopCap engine and reach for a much older Mac OS X than the later games do:
+ * the Memory, Queue, Notification, Process, Multiprocessing and Sound
+ * Managers, plus Open Transport.  Their Carbon window, event and AGL surface
+ * is already emulated in peggle_window.inc; what follows is everything else.
  *
- * The Sound Manager is the substantial part.  Bejeweled 2 statically links
+ * The Sound Manager is the substantial part.  Both games statically link
  * FMOD 3, whose Mac output driver mixes into a double buffer that the game's
  * own CarbonSndPlayDoubleBuffer feeds to a Sound Manager channel with
  * bufferCmd/callBackCmd pairs, refilling from the channel callback by writing
@@ -22,25 +23,25 @@
    needs the size back, so the size lives in a header word ahead of the block
    (16 bytes keeps the returned pointer 16-byte aligned, as the Memory Manager
    guaranteed). */
-enum { kB2PtrHeader = 16 };
+enum { kCtPtrHeader = 16 };
 
-static uint32_t b2_new_ptr(uint32_t size, bool clear)
+static uint32_t ct_new_ptr(uint32_t size, bool clear)
 {
-    if (size > UINT32_MAX - kB2PtrHeader) return 0;
-    uint32_t block = compat_runtime32_allocate(size + kB2PtrHeader, clear);
+    if (size > UINT32_MAX - kCtPtrHeader) return 0;
+    uint32_t block = compat_runtime32_allocate(size + kCtPtrHeader, clear);
     if (!block) return 0;
     *(uint32_t *)(uintptr_t)block = size;
-    return block + kB2PtrHeader;
+    return block + kCtPtrHeader;
 }
 
-static uint32_t b2_ptr_size(uint32_t pointer)
+static uint32_t ct_ptr_size(uint32_t pointer)
 {
-    return pointer >= kB2PtrHeader ? *(uint32_t *)(uintptr_t)(pointer - kB2PtrHeader) : 0;
+    return pointer >= kCtPtrHeader ? *(uint32_t *)(uintptr_t)(pointer - kCtPtrHeader) : 0;
 }
 
-static void b2_dispose_ptr(uint32_t pointer)
+static void ct_dispose_ptr(uint32_t pointer)
 {
-    if (pointer >= kB2PtrHeader) compat_runtime32_deallocate(pointer - kB2PtrHeader);
+    if (pointer >= kCtPtrHeader) compat_runtime32_deallocate(pointer - kCtPtrHeader);
 }
 
 /* --- Multiprocessing Services ----------------------------------------- */
@@ -48,20 +49,20 @@ static void b2_dispose_ptr(uint32_t pointer)
 /* MP tasks are pthreads running a guest entry point, MP critical regions are
    recursive mutexes (an MP task may re-enter one it already holds).  Both are
    addressed by small integer ids, which is all the guest ever stores. */
-enum { kB2MPCapacity = 64 };
-static struct { pthread_t thread; bool live; } b2_mp_tasks[kB2MPCapacity];
-static pthread_mutex_t b2_mp_regions[kB2MPCapacity];
-static bool b2_mp_region_live[kB2MPCapacity];
-static pthread_mutex_t b2_mp_lock = PTHREAD_MUTEX_INITIALIZER;
-static _Thread_local uint32_t b2_mp_current_task;
+enum { kCtMPCapacity = 64 };
+static struct { pthread_t thread; bool live; } ct_mp_tasks[kCtMPCapacity];
+static pthread_mutex_t ct_mp_regions[kCtMPCapacity];
+static bool ct_mp_region_live[kCtMPCapacity];
+static pthread_mutex_t ct_mp_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local uint32_t ct_mp_current_task;
 
-struct b2_mp_start { uint32_t entry, parameter, identifier; };
+struct ct_mp_start { uint32_t entry, parameter, identifier; };
 
-static void *b2_mp_run(void *opaque)
+static void *ct_mp_run(void *opaque)
 {
-    struct b2_mp_start start = *(struct b2_mp_start *)opaque;
+    struct ct_mp_start start = *(struct ct_mp_start *)opaque;
     free(opaque);
-    b2_mp_current_task = start.identifier;
+    ct_mp_current_task = start.identifier;
     uint32_t argument = start.parameter;
     return (void *)(uintptr_t)compat_runtime32_call(start.entry, &argument, 1);
 }
@@ -69,46 +70,46 @@ static void *b2_mp_run(void *opaque)
 /* --- FSIterator handles ------------------------------------------------ */
 
 /* FSIterator is an opaque host pointer; the guest keeps a 32-bit token. */
-enum { kB2IteratorBase = 0x7f0c0000, kB2IteratorCapacity = 16 };
-static FSIterator b2_iterators[kB2IteratorCapacity];
+enum { kCtIteratorBase = 0x7f0c0000, kCtIteratorCapacity = 16 };
+static FSIterator ct_iterators[kCtIteratorCapacity];
 
-static uint32_t b2_iterator_register(FSIterator iterator)
+static uint32_t ct_iterator_register(FSIterator iterator)
 {
-    for (uint32_t i = 0; i < kB2IteratorCapacity; ++i) {
-        if (!b2_iterators[i]) { b2_iterators[i] = iterator; return kB2IteratorBase + i; }
+    for (uint32_t i = 0; i < kCtIteratorCapacity; ++i) {
+        if (!ct_iterators[i]) { ct_iterators[i] = iterator; return kCtIteratorBase + i; }
     }
     return 0;
 }
 
-static FSIterator b2_iterator_for(uint32_t handle)
+static FSIterator ct_iterator_for(uint32_t handle)
 {
-    uint32_t index = handle - kB2IteratorBase;
-    return index < kB2IteratorCapacity ? b2_iterators[index] : NULL;
+    uint32_t index = handle - kCtIteratorBase;
+    return index < kCtIteratorCapacity ? ct_iterators[index] : NULL;
 }
 
 /* --- Sound Manager ----------------------------------------------------- */
 
 enum {
-    kB2SndNullCmd = 0, kB2SndQuietCmd = 3, kB2SndFlushCmd = 4,
-    kB2SndWaitCmd = 10, kB2SndPauseCmd = 11, kB2SndResumeCmd = 12,
-    kB2SndCallBackCmd = 13, kB2SndAmpCmd = 43, kB2SndVolumeCmd = 46,
-    kB2SndBufferCmd = 81, kB2SndRateMultiplierCmd = 86,
+    kCtSndNullCmd = 0, kCtSndQuietCmd = 3, kCtSndFlushCmd = 4,
+    kCtSndWaitCmd = 10, kCtSndPauseCmd = 11, kCtSndResumeCmd = 12,
+    kCtSndCallBackCmd = 13, kCtSndAmpCmd = 43, kCtSndVolumeCmd = 46,
+    kCtSndBufferCmd = 81, kCtSndRateMultiplierCmd = 86,
     /* SndChannel field offsets (68k-aligned, as the guest sees them). */
-    kB2ChanCallBack = 8, kB2ChanUserInfo = 12, kB2ChanFlags = 28,
-    kB2ChanQLength = 30, kB2ChanQHead = 32, kB2ChanQTail = 34,
-    kB2ChanQueue = 36, kB2ChanQSlots = 128,
-    kB2ChannelSize = kB2ChanQueue + kB2ChanQSlots * 8,
-    kB2SndChannelCapacity = 8,
-    kB2SndQueueBuffers = 3,
+    kCtChanCallBack = 8, kCtChanUserInfo = 12, kCtChanFlags = 28,
+    kCtChanQLength = 30, kCtChanQHead = 32, kCtChanQTail = 34,
+    kCtChanQueue = 36, kCtChanQSlots = 128,
+    kCtChannelSize = kCtChanQueue + kCtChanQSlots * 8,
+    kCtSndChannelCapacity = 8,
+    kCtSndQueueBuffers = 3,
 };
 
-struct b2_snd_channel {
+struct ct_snd_channel {
     uint32_t handle;            /* guest SndChannelPtr */
     AudioQueueRef queue;
     AudioStreamBasicDescription format;
     pthread_mutex_t lock;
     /* Buffers handed to the queue that have not played out yet: the command
-       queue may not run further ahead than kB2SndQueueBuffers of them. */
+       queue may not run further ahead than kCtSndQueueBuffers of them. */
     unsigned buffers_in_flight;
     bool started;
     bool disposing;
@@ -116,37 +117,37 @@ struct b2_snd_channel {
     uint32_t command;           /* guest SndCommand handed to the callback */
 };
 
-static struct b2_snd_channel b2_snd_channels[kB2SndChannelCapacity];
-static int b2_snd_trace = -1;
+static struct ct_snd_channel ct_snd_channels[kCtSndChannelCapacity];
+static int ct_snd_trace = -1;
 
-static bool b2_snd_tracing(void)
+static bool ct_snd_tracing(void)
 {
-    if (b2_snd_trace < 0) b2_snd_trace = getenv("LP32_TRACE_SND") != NULL;
-    return b2_snd_trace != 0;
+    if (ct_snd_trace < 0) ct_snd_trace = getenv("LP32_TRACE_SND") != NULL;
+    return ct_snd_trace != 0;
 }
 
-static struct b2_snd_channel *b2_channel_for(uint32_t handle)
+static struct ct_snd_channel *ct_channel_for(uint32_t handle)
 {
-    for (unsigned i = 0; i < kB2SndChannelCapacity; ++i) {
-        if (b2_snd_channels[i].handle && b2_snd_channels[i].handle == handle) {
-            return &b2_snd_channels[i];
+    for (unsigned i = 0; i < kCtSndChannelCapacity; ++i) {
+        if (ct_snd_channels[i].handle && ct_snd_channels[i].handle == handle) {
+            return &ct_snd_channels[i];
         }
     }
     return NULL;
 }
 
-static int16_t b2_chan_read16(uint32_t channel, uint32_t offset)
+static int16_t ct_chan_read16(uint32_t channel, uint32_t offset)
 {
     return *(int16_t *)(uintptr_t)(channel + offset);
 }
 
-static void b2_chan_write16(uint32_t channel, uint32_t offset, int16_t value)
+static void ct_chan_write16(uint32_t channel, uint32_t offset, int16_t value)
 {
     *(int16_t *)(uintptr_t)(channel + offset) = value;
 }
 
 /* One sound header as the guest laid it out (stdSH, extSH or cmpSH). */
-struct b2_sound_header {
+struct ct_sound_header {
     uint32_t samples;
     uint32_t channels;
     double rate;
@@ -156,7 +157,7 @@ struct b2_sound_header {
     bool big_endian;
 };
 
-static bool b2_parse_sound_header(uint32_t header, struct b2_sound_header *out)
+static bool ct_parse_sound_header(uint32_t header, struct ct_sound_header *out)
 {
     if (header < 0x1000) return false;
     const uint8_t *bytes = (const void *)(uintptr_t)header;
@@ -188,23 +189,23 @@ static bool b2_parse_sound_header(uint32_t header, struct b2_sound_header *out)
     return out->samples >= 0x1000 && out->frames != 0;
 }
 
-static void b2_snd_pump(struct b2_snd_channel *channel);
+static void ct_snd_pump(struct ct_snd_channel *channel);
 
-static void b2_snd_output_callback(void *opaque, AudioQueueRef queue,
+static void ct_snd_output_callback(void *opaque, AudioQueueRef queue,
                                    AudioQueueBufferRef buffer)
 {
-    struct b2_snd_channel *channel = opaque;
+    struct ct_snd_channel *channel = opaque;
     AudioQueueFreeBuffer(queue, buffer);
     pthread_mutex_lock(&channel->lock);
     if (channel->buffers_in_flight) --channel->buffers_in_flight;
     pthread_mutex_unlock(&channel->lock);
     /* The finished buffer is what lets the channel reach the callBackCmd that
        follows it, which is where the game refills and re-queues. */
-    if (!channel->disposing) b2_snd_pump(channel);
+    if (!channel->disposing) ct_snd_pump(channel);
 }
 
-static bool b2_snd_ensure_queue(struct b2_snd_channel *channel,
-                                const struct b2_sound_header *header)
+static bool ct_snd_ensure_queue(struct ct_snd_channel *channel,
+                                const struct ct_sound_header *header)
 {
     AudioStreamBasicDescription format = {0};
     format.mSampleRate = header->rate;
@@ -228,7 +229,7 @@ static bool b2_snd_ensure_queue(struct b2_snd_channel *channel,
         channel->buffers_in_flight = 0;
         AudioQueueDispose(stale, false);
     }
-    OSStatus status = AudioQueueNewOutput(&format, b2_snd_output_callback,
+    OSStatus status = AudioQueueNewOutput(&format, ct_snd_output_callback,
                                           channel, NULL, NULL, 0, &channel->queue);
     if (status != noErr) {
         fprintf(stderr, "compat32: AudioQueueNewOutput failed (%d)\n", (int)status);
@@ -242,11 +243,11 @@ static bool b2_snd_ensure_queue(struct b2_snd_channel *channel,
 }
 
 /* Plays one bufferCmd; returns true when the channel must now wait for it. */
-static bool b2_snd_play_buffer(struct b2_snd_channel *channel, uint32_t header_address)
+static bool ct_snd_play_buffer(struct ct_snd_channel *channel, uint32_t header_address)
 {
-    struct b2_sound_header header;
-    if (!b2_parse_sound_header(header_address, &header)) return false;
-    if (!b2_snd_ensure_queue(channel, &header)) return false;
+    struct ct_sound_header header;
+    if (!ct_parse_sound_header(header_address, &header)) return false;
+    if (!ct_snd_ensure_queue(channel, &header)) return false;
     uint32_t bytes = header.frames * channel->format.mBytesPerFrame;
     AudioQueueBufferRef buffer = NULL;
     if (AudioQueueAllocateBuffer(channel->queue, bytes, &buffer) != noErr) return false;
@@ -267,47 +268,47 @@ static bool b2_snd_play_buffer(struct b2_snd_channel *channel, uint32_t header_a
  * Runs the channel's command queue until it must wait.  The Sound Manager
  * played a channel serially: a bufferCmd holds the queue until its buffer has
  * been consumed, and only then does the callBackCmd behind it fire.  Keeping
- * kB2SndQueueBuffers buffers in flight bounds how far ahead the game mixes
+ * kCtSndQueueBuffers buffers in flight bounds how far ahead the game mixes
  * while keeping the output fed.
  */
-static void b2_snd_pump(struct b2_snd_channel *channel)
+static void ct_snd_pump(struct ct_snd_channel *channel)
 {
     for (;;) {
         pthread_mutex_lock(&channel->lock);
         uint32_t handle = channel->handle;
         if (!handle || channel->disposing ||
-            channel->buffers_in_flight >= kB2SndQueueBuffers) {
+            channel->buffers_in_flight >= kCtSndQueueBuffers) {
             pthread_mutex_unlock(&channel->lock);
             return;
         }
-        int16_t head = b2_chan_read16(handle, kB2ChanQHead);
-        int16_t tail = b2_chan_read16(handle, kB2ChanQTail);
-        if (head < 0 || head >= kB2ChanQSlots) {
+        int16_t head = ct_chan_read16(handle, kCtChanQHead);
+        int16_t tail = ct_chan_read16(handle, kCtChanQTail);
+        if (head < 0 || head >= kCtChanQSlots) {
             pthread_mutex_unlock(&channel->lock);
             return;
         }
-        const uint8_t *slot = (const void *)(uintptr_t)(handle + kB2ChanQueue + head * 8);
+        const uint8_t *slot = (const void *)(uintptr_t)(handle + kCtChanQueue + head * 8);
         uint16_t command;
         uint32_t parameter2;
         int16_t parameter1;
         memcpy(&command, slot + 0, 2);
         memcpy(&parameter1, slot + 2, 2);
         memcpy(&parameter2, slot + 4, 4);
-        int16_t next = (int16_t)((head + 1) % kB2ChanQSlots);
-        b2_chan_write16(handle, kB2ChanQHead, next == tail ? -1 : next);
+        int16_t next = (int16_t)((head + 1) % kCtChanQSlots);
+        ct_chan_write16(handle, kCtChanQHead, next == tail ? -1 : next);
         command &= 0x7fff; /* dataOffsetFlag: never set by this game */
-        if (b2_snd_tracing()) {
+        if (ct_snd_tracing()) {
             fprintf(stderr, "compat32: snd channel 0x%08x cmd=%u param1=%d param2=0x%08x\n",
                     handle, command, parameter1, parameter2);
         }
-        if (command == kB2SndBufferCmd) {
-            bool waiting = b2_snd_play_buffer(channel, parameter2);
+        if (command == kCtSndBufferCmd) {
+            bool waiting = ct_snd_play_buffer(channel, parameter2);
             pthread_mutex_unlock(&channel->lock);
             if (waiting) return;
             continue;
         }
-        if (command == kB2SndAmpCmd || command == kB2SndVolumeCmd) {
-            float level = command == kB2SndAmpCmd ? (float)parameter1 / 255.0f :
+        if (command == kCtSndAmpCmd || command == kCtSndVolumeCmd) {
+            float level = command == kCtSndAmpCmd ? (float)parameter1 / 255.0f :
                 (float)(parameter2 & 0xffff) / 256.0f;
             channel->amplitude = level < 0.0f ? 0.0f : level > 1.0f ? 1.0f : level;
             if (channel->queue) {
@@ -317,8 +318,8 @@ static void b2_snd_pump(struct b2_snd_channel *channel)
             pthread_mutex_unlock(&channel->lock);
             continue;
         }
-        if (command == kB2SndCallBackCmd) {
-            uint32_t callback = *(uint32_t *)(uintptr_t)(handle + kB2ChanCallBack);
+        if (command == kCtSndCallBackCmd) {
+            uint32_t callback = *(uint32_t *)(uintptr_t)(handle + kCtChanCallBack);
             uint32_t command_block = channel->command;
             pthread_mutex_unlock(&channel->lock);
             if (callback && command_block) {
@@ -341,19 +342,19 @@ static void b2_snd_pump(struct b2_snd_channel *channel)
 
 /*
  * AudioQueueStop/Dispose block until the queue's own callback thread has
- * finished, and that thread runs b2_snd_pump, so neither may be called with
+ * finished, and that thread runs ct_snd_pump, so neither may be called with
  * the channel lock held or the two would wait on each other.  Every stop
  * therefore reads the queue out under the lock and acts on it outside.
  */
-static void b2_snd_stop(struct b2_snd_channel *channel, bool flush)
+static void ct_snd_stop(struct ct_snd_channel *channel, bool flush)
 {
     pthread_mutex_lock(&channel->lock);
     AudioQueueRef queue = channel->queue;
     channel->started = false;
     channel->buffers_in_flight = 0;
     if (flush && channel->handle) {
-        b2_chan_write16(channel->handle, kB2ChanQHead, -1);
-        b2_chan_write16(channel->handle, kB2ChanQTail, 0);
+        ct_chan_write16(channel->handle, kCtChanQHead, -1);
+        ct_chan_write16(channel->handle, kCtChanQTail, 0);
     }
     pthread_mutex_unlock(&channel->lock);
     if (queue) {
@@ -362,22 +363,22 @@ static void b2_snd_stop(struct b2_snd_channel *channel, bool flush)
     }
 }
 
-static uint32_t b2_snd_new_channel(uint32_t channel_out, uint32_t callback)
+static uint32_t ct_snd_new_channel(uint32_t channel_out, uint32_t callback)
 {
-    struct b2_snd_channel *channel = NULL;
-    for (unsigned i = 0; i < kB2SndChannelCapacity; ++i) {
-        if (!b2_snd_channels[i].handle) { channel = &b2_snd_channels[i]; break; }
+    struct ct_snd_channel *channel = NULL;
+    for (unsigned i = 0; i < kCtSndChannelCapacity; ++i) {
+        if (!ct_snd_channels[i].handle) { channel = &ct_snd_channels[i]; break; }
     }
     if (!channel) return (uint32_t)(int32_t)-203; /* notEnoughHardwareErr */
     uint32_t handle = channel_out && *(uint32_t *)(uintptr_t)channel_out ?
         *(uint32_t *)(uintptr_t)channel_out :
-        compat_runtime32_allocate(kB2ChannelSize, 1);
+        compat_runtime32_allocate(kCtChannelSize, 1);
     if (!handle) return (uint32_t)(int32_t)-108; /* memFullErr */
-    memset((void *)(uintptr_t)handle, 0, kB2ChannelSize);
-    *(uint32_t *)(uintptr_t)(handle + kB2ChanCallBack) = callback;
-    b2_chan_write16(handle, kB2ChanQLength, kB2ChanQSlots);
-    b2_chan_write16(handle, kB2ChanQHead, -1);
-    b2_chan_write16(handle, kB2ChanQTail, 0);
+    memset((void *)(uintptr_t)handle, 0, kCtChannelSize);
+    *(uint32_t *)(uintptr_t)(handle + kCtChanCallBack) = callback;
+    ct_chan_write16(handle, kCtChanQLength, kCtChanQSlots);
+    ct_chan_write16(handle, kCtChanQHead, -1);
+    ct_chan_write16(handle, kCtChanQTail, 0);
     memset(channel, 0, sizeof(*channel));
     pthread_mutex_init(&channel->lock, NULL);
     channel->handle = handle;
@@ -387,53 +388,53 @@ static uint32_t b2_snd_new_channel(uint32_t channel_out, uint32_t callback)
     return 0;
 }
 
-static uint32_t b2_snd_do_command(uint32_t handle, uint32_t command_address)
+static uint32_t ct_snd_do_command(uint32_t handle, uint32_t command_address)
 {
-    struct b2_snd_channel *channel = b2_channel_for(handle);
+    struct ct_snd_channel *channel = ct_channel_for(handle);
     if (!channel || command_address < 0x1000) return (uint32_t)(int32_t)-205; /* badChannel */
     pthread_mutex_lock(&channel->lock);
-    int16_t head = b2_chan_read16(handle, kB2ChanQHead);
-    int16_t tail = b2_chan_read16(handle, kB2ChanQTail);
-    if (tail < 0 || tail >= kB2ChanQSlots) tail = 0;
-    memcpy((void *)(uintptr_t)(handle + kB2ChanQueue + tail * 8),
+    int16_t head = ct_chan_read16(handle, kCtChanQHead);
+    int16_t tail = ct_chan_read16(handle, kCtChanQTail);
+    if (tail < 0 || tail >= kCtChanQSlots) tail = 0;
+    memcpy((void *)(uintptr_t)(handle + kCtChanQueue + tail * 8),
            (const void *)(uintptr_t)command_address, 8);
-    if (head < 0) b2_chan_write16(handle, kB2ChanQHead, tail);
-    b2_chan_write16(handle, kB2ChanQTail, (int16_t)((tail + 1) % kB2ChanQSlots));
+    if (head < 0) ct_chan_write16(handle, kCtChanQHead, tail);
+    ct_chan_write16(handle, kCtChanQTail, (int16_t)((tail + 1) % kCtChanQSlots));
     pthread_mutex_unlock(&channel->lock);
-    b2_snd_pump(channel);
+    ct_snd_pump(channel);
     return 0;
 }
 
-static uint32_t b2_snd_do_immediate(uint32_t handle, uint32_t command_address)
+static uint32_t ct_snd_do_immediate(uint32_t handle, uint32_t command_address)
 {
-    struct b2_snd_channel *channel = b2_channel_for(handle);
+    struct ct_snd_channel *channel = ct_channel_for(handle);
     if (!channel || command_address < 0x1000) return (uint32_t)(int32_t)-205;
     uint16_t command;
     memcpy(&command, (const void *)(uintptr_t)command_address, 2);
     command &= 0x7fff;
     switch (command) {
-    case kB2SndQuietCmd:
-    case kB2SndFlushCmd:
-        b2_snd_stop(channel, true);
+    case kCtSndQuietCmd:
+    case kCtSndFlushCmd:
+        ct_snd_stop(channel, true);
         return 0;
-    case kB2SndPauseCmd:
+    case kCtSndPauseCmd:
         if (channel->queue) AudioQueuePause(channel->queue);
         return 0;
-    case kB2SndResumeCmd:
+    case kCtSndResumeCmd:
         if (channel->queue) AudioQueueStart(channel->queue, NULL);
         return 0;
     default:
         break;
     }
-    return b2_snd_do_command(handle, command_address);
+    return ct_snd_do_command(handle, command_address);
 }
 
-static uint32_t b2_snd_dispose_channel(uint32_t handle)
+static uint32_t ct_snd_dispose_channel(uint32_t handle)
 {
-    struct b2_snd_channel *channel = b2_channel_for(handle);
+    struct ct_snd_channel *channel = ct_channel_for(handle);
     if (!channel) return 0;
-    channel->disposing = true; /* stops b2_snd_pump before it takes the lock */
-    b2_snd_stop(channel, true);
+    channel->disposing = true; /* stops ct_snd_pump before it takes the lock */
+    ct_snd_stop(channel, true);
     pthread_mutex_lock(&channel->lock);
     AudioQueueRef queue = channel->queue;
     channel->queue = NULL;
@@ -445,20 +446,21 @@ static uint32_t b2_snd_dispose_channel(uint32_t handle)
 
 /* --- dispatch ---------------------------------------------------------- */
 
-static int bejeweled2_dispatch(const char *n, const uint32_t *a, uint64_t *r)
+static int classic_toolbox_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 {
 #define IS(s) (strcmp(n, s) == 0)
 #define P(i) ((void *)(uintptr_t)a[i])
 #define OUT(i, v) do { if (a[i]) *(uint32_t *)P(i) = (uint32_t)(v); } while (0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
-    if (lp32_profile()->title != LP32_TITLE_BEJEWELED2) return 0;
+    enum lp32_title title = lp32_profile()->title;
+    if (title != LP32_TITLE_BEJEWELED2 && title != LP32_TITLE_ZUMA) return 0;
 
     /* --- Memory Manager --- */
-    if (IS("_NewPtr")) RET(b2_new_ptr(a[0], false));
-    if (IS("_NewPtrClear")) RET(b2_new_ptr(a[0], true));
-    if (IS("_DisposePtr")) { b2_dispose_ptr(a[0]); RET(0); }
+    if (IS("_NewPtr")) RET(ct_new_ptr(a[0], false));
+    if (IS("_NewPtrClear")) RET(ct_new_ptr(a[0], true));
+    if (IS("_DisposePtr")) { ct_dispose_ptr(a[0]); RET(0); }
     if (IS("_MemError")) RET(0);
-    if (IS("_GetPtrSize")) RET(b2_ptr_size(a[0]));
+    if (IS("_GetPtrSize")) RET(ct_ptr_size(a[0]));
 
     /* --- classic OS queues (QHdr is 68k-aligned: flags@0, head@2, tail@6) --- */
     if (IS("_Enqueue")) {
@@ -513,25 +515,25 @@ static int bejeweled2_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     /* --- Multiprocessing Services --- */
     if (IS("__MPIsFullyInitialized")) RET(1);
     if (IS("_MPCreateTask")) {
-        pthread_mutex_lock(&b2_mp_lock);
+        pthread_mutex_lock(&ct_mp_lock);
         uint32_t identifier = 0;
-        for (uint32_t i = 1; i < kB2MPCapacity; ++i) {
-            if (!b2_mp_tasks[i].live) { identifier = i; break; }
+        for (uint32_t i = 1; i < kCtMPCapacity; ++i) {
+            if (!ct_mp_tasks[i].live) { identifier = i; break; }
         }
-        if (identifier) b2_mp_tasks[identifier].live = true;
-        pthread_mutex_unlock(&b2_mp_lock);
+        if (identifier) ct_mp_tasks[identifier].live = true;
+        pthread_mutex_unlock(&ct_mp_lock);
         if (!identifier) RET((uint32_t)(int32_t)-1); /* out of task slots */
-        struct b2_mp_start *start = malloc(sizeof(*start));
-        *start = (struct b2_mp_start){a[0], a[1], identifier};
+        struct ct_mp_start *start = malloc(sizeof(*start));
+        *start = (struct ct_mp_start){a[0], a[1], identifier};
         pthread_attr_t attributes;
         pthread_attr_init(&attributes);
         if (a[2] >= 65536) pthread_attr_setstacksize(&attributes, a[2]);
-        int error = pthread_create(&b2_mp_tasks[identifier].thread, &attributes,
-                                   b2_mp_run, start);
+        int error = pthread_create(&ct_mp_tasks[identifier].thread, &attributes,
+                                   ct_mp_run, start);
         pthread_attr_destroy(&attributes);
         if (error) {
             free(start);
-            b2_mp_tasks[identifier].live = false;
+            ct_mp_tasks[identifier].live = false;
             RET((uint32_t)(int32_t)-1);
         }
         OUT(7, identifier);
@@ -539,63 +541,63 @@ static int bejeweled2_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     }
     if (IS("_MPTerminateTask")) {
         uint32_t identifier = a[0];
-        if (identifier && identifier < kB2MPCapacity && b2_mp_tasks[identifier].live) {
-            pthread_cancel(b2_mp_tasks[identifier].thread);
-            b2_mp_tasks[identifier].live = false;
+        if (identifier && identifier < kCtMPCapacity && ct_mp_tasks[identifier].live) {
+            pthread_cancel(ct_mp_tasks[identifier].thread);
+            ct_mp_tasks[identifier].live = false;
         }
         RET(0);
     }
-    if (IS("_MPCurrentTaskID")) RET(b2_mp_current_task);
+    if (IS("_MPCurrentTaskID")) RET(ct_mp_current_task);
     if (IS("_MPCreateCriticalRegion")) {
-        pthread_mutex_lock(&b2_mp_lock);
+        pthread_mutex_lock(&ct_mp_lock);
         uint32_t identifier = 0;
-        for (uint32_t i = 1; i < kB2MPCapacity; ++i) {
-            if (!b2_mp_region_live[i]) { identifier = i; break; }
+        for (uint32_t i = 1; i < kCtMPCapacity; ++i) {
+            if (!ct_mp_region_live[i]) { identifier = i; break; }
         }
         if (identifier) {
             pthread_mutexattr_t attributes;
             pthread_mutexattr_init(&attributes);
             pthread_mutexattr_settype(&attributes, PTHREAD_MUTEX_RECURSIVE);
-            pthread_mutex_init(&b2_mp_regions[identifier], &attributes);
+            pthread_mutex_init(&ct_mp_regions[identifier], &attributes);
             pthread_mutexattr_destroy(&attributes);
-            b2_mp_region_live[identifier] = true;
+            ct_mp_region_live[identifier] = true;
         }
-        pthread_mutex_unlock(&b2_mp_lock);
+        pthread_mutex_unlock(&ct_mp_lock);
         if (!identifier) RET((uint32_t)(int32_t)-1);
         OUT(0, identifier);
         RET(0);
     }
     if (IS("_MPDeleteCriticalRegion")) {
-        if (a[0] && a[0] < kB2MPCapacity && b2_mp_region_live[a[0]]) {
-            b2_mp_region_live[a[0]] = false;
-            pthread_mutex_destroy(&b2_mp_regions[a[0]]);
+        if (a[0] && a[0] < kCtMPCapacity && ct_mp_region_live[a[0]]) {
+            ct_mp_region_live[a[0]] = false;
+            pthread_mutex_destroy(&ct_mp_regions[a[0]]);
         }
         RET(0);
     }
     if (IS("_MPEnterCriticalRegion")) {
-        if (!a[0] || a[0] >= kB2MPCapacity || !b2_mp_region_live[a[0]]) RET((uint32_t)(int32_t)-1);
-        if (a[1] == 0) RET(pthread_mutex_trylock(&b2_mp_regions[a[0]]) == 0 ? 0 : (uint32_t)(int32_t)-3);
-        pthread_mutex_lock(&b2_mp_regions[a[0]]);
+        if (!a[0] || a[0] >= kCtMPCapacity || !ct_mp_region_live[a[0]]) RET((uint32_t)(int32_t)-1);
+        if (a[1] == 0) RET(pthread_mutex_trylock(&ct_mp_regions[a[0]]) == 0 ? 0 : (uint32_t)(int32_t)-3);
+        pthread_mutex_lock(&ct_mp_regions[a[0]]);
         RET(0);
     }
     if (IS("_MPExitCriticalRegion")) {
-        if (a[0] && a[0] < kB2MPCapacity && b2_mp_region_live[a[0]]) {
-            pthread_mutex_unlock(&b2_mp_regions[a[0]]);
+        if (a[0] && a[0] < kCtMPCapacity && ct_mp_region_live[a[0]]) {
+            pthread_mutex_unlock(&ct_mp_regions[a[0]]);
         }
         RET(0);
     }
-    if (IS("_MPAllocateAligned")) RET(b2_new_ptr(a[0], false));
-    if (IS("_MPFree")) { b2_dispose_ptr(a[0]); RET(0); }
-    if (IS("_MPGetAllocatedBlockSize")) RET(b2_ptr_size(a[0]));
+    if (IS("_MPAllocateAligned")) RET(ct_new_ptr(a[0], false));
+    if (IS("_MPFree")) { ct_dispose_ptr(a[0]); RET(0); }
+    if (IS("_MPGetAllocatedBlockSize")) RET(ct_ptr_size(a[0]));
     if (IS("_MPBlockCopy")) { if (a[0] && a[1]) memcpy(P(1), P(0), a[2]); RET(0); }
 
     /* --- Sound Manager --- */
     if (IS("_SndSoundManagerVersion")) RET(0x03000000); /* NumVersion 3.0 */
     if (IS("_NewSndCallBackUPP") || IS("_NewSICompletionUPP")) RET(a[0]);
-    if (IS("_SndNewChannel")) RET(b2_snd_new_channel(a[0], a[3]));
-    if (IS("_SndDoCommand")) RET(b2_snd_do_command(a[0], a[1]));
-    if (IS("_SndDoImmediate")) RET(b2_snd_do_immediate(a[0], a[1]));
-    if (IS("_SndDisposeChannel")) RET(b2_snd_dispose_channel(a[0]));
+    if (IS("_SndNewChannel")) RET(ct_snd_new_channel(a[0], a[3]));
+    if (IS("_SndDoCommand")) RET(ct_snd_do_command(a[0], a[1]));
+    if (IS("_SndDoImmediate")) RET(ct_snd_do_immediate(a[0], a[1]));
+    if (IS("_SndDisposeChannel")) RET(ct_snd_dispose_channel(a[0]));
     if (IS("_GetCompressionInfo")) {
         /* Only the uncompressed formats matter here: FMOD hands the Sound
            Manager 8- or 16-bit PCM. */
@@ -646,21 +648,21 @@ static int bejeweled2_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_FSOpenIterator")) {
         FSIterator iterator = NULL;
         OSErr error = FSOpenIterator(P(0), a[1], &iterator);
-        uint32_t handle = error == noErr ? b2_iterator_register(iterator) : 0;
+        uint32_t handle = error == noErr ? ct_iterator_register(iterator) : 0;
         if (error == noErr && !handle) { FSCloseIterator(iterator); error = memFullErr; }
         OUT(2, handle);
         RET((uint32_t)error);
     }
     if (IS("_FSCloseIterator")) {
-        FSIterator iterator = b2_iterator_for(a[0]);
+        FSIterator iterator = ct_iterator_for(a[0]);
         if (iterator) {
             FSCloseIterator(iterator);
-            b2_iterators[a[0] - kB2IteratorBase] = NULL;
+            ct_iterators[a[0] - kCtIteratorBase] = NULL;
         }
         RET(0);
     }
     if (IS("_FSGetCatalogInfoBulk")) {
-        FSIterator iterator = b2_iterator_for(a[0]);
+        FSIterator iterator = ct_iterator_for(a[0]);
         if (!iterator) RET((uint32_t)(int32_t)-1417); /* errFSBadIteratorFlags */
         RET((uint32_t)FSGetCatalogInfoBulk(iterator, a[1], P(2), P(3), a[4],
                                            P(5), P(6), P(7), P(8)));

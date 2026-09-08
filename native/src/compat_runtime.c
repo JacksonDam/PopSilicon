@@ -333,6 +333,7 @@ struct guest_mutex_entry {
 struct guest_cond_entry {
     uint32_t address;
     pthread_cond_t *condition;
+    struct guest_cond_gate *gate;
 };
 
 static struct guest_mutex_entry *guest_mutexes;
@@ -631,6 +632,63 @@ static void recycle_host_mutex(pthread_mutex_t *mutex)
     free_host_mutexes = node;
 }
 
+/*
+ * A signal that arrives while nobody is enqueued is dropped by POSIX, so a
+ * guest that guards its predicate with a different mutex from the one it
+ * waits with sleeps out its whole timeout whenever the two race.  Zuma's
+ * Sexy::WorkerThread does exactly that: ClearSignal reads and clears the
+ * flag under the object's second mutex (this+0x70), then Wait takes the
+ * first (this+0x44) and blocks on the condition, so a Signal landing in
+ * between is lost and the waiter eats its full one-second timeout — the
+ * brief freeze at the end of a level, where the main thread's DoTask is
+ * waiting for the previous task to finish.  Natively that window was a few
+ * instructions; here each of those calls is a bridged import and the mutex
+ * in the middle is held by the worker while it runs the task, so the race
+ * loses routinely.
+ *
+ * The gate closes it: signalling with no waiter leaves a token that the next
+ * wait consumes.  Waiters are counted under the gate lock, which is also the
+ * mutex the host condition is waited on, so the count cannot go stale between
+ * the check and the enqueue.  A token nobody claims costs one spurious
+ * wakeup, which POSIX permits and a correct waiter absorbs by re-testing its
+ * own predicate — WorkerThread's callers loop on theirs.
+ */
+struct guest_cond_gate {
+    pthread_mutex_t lock;
+    uint32_t waiters;
+    uint32_t pending;
+};
+
+static struct host_sync_free_node *free_host_cond_gates;
+
+static struct guest_cond_gate *create_cond_gate(void)
+{
+    struct guest_cond_gate *gate;
+    if (free_host_cond_gates) {
+        struct host_sync_free_node *node = free_host_cond_gates;
+        free_host_cond_gates = node->next;
+        gate = (struct guest_cond_gate *)node;
+    } else {
+        gate = malloc(sizeof(*gate) > sizeof(struct host_sync_free_node) ?
+                      sizeof(*gate) : sizeof(struct host_sync_free_node));
+        if (!gate) return NULL;
+    }
+    if (pthread_mutex_init(&gate->lock, NULL) != 0) {
+        free(gate);
+        return NULL;
+    }
+    gate->waiters = 0;
+    gate->pending = 0;
+    return gate;
+}
+
+static void recycle_cond_gate(struct guest_cond_gate *gate)
+{
+    struct host_sync_free_node *node = (struct host_sync_free_node *)gate;
+    node->next = free_host_cond_gates;
+    free_host_cond_gates = node;
+}
+
 static pthread_cond_t *create_host_condition(void)
 {
     pthread_cond_t *condition;
@@ -751,12 +809,15 @@ static uint32_t guest_mutex_destroy(uint32_t address)
     return 0;
 }
 
-static pthread_cond_t *host_cond_for_guest(uint32_t address, bool create)
+static pthread_cond_t *host_cond_for_guest(uint32_t address, bool create,
+                                           struct guest_cond_gate **gate_out)
 {
+    if (gate_out) *gate_out = NULL;
     pthread_mutex_lock(&guest_sync_table_lock);
     for (uint32_t index = 0; index < guest_cond_count; ++index) {
         if (guest_conditions[index].address == address) {
             pthread_cond_t *condition = guest_conditions[index].condition;
+            if (gate_out) *gate_out = guest_conditions[index].gate;
             pthread_mutex_unlock(&guest_sync_table_lock);
             return condition;
         }
@@ -781,11 +842,81 @@ static pthread_cond_t *host_cond_for_guest(uint32_t address, bool create)
         pthread_mutex_unlock(&guest_sync_table_lock);
         return NULL;
     }
+    struct guest_cond_gate *gate = create_cond_gate();
+    if (!gate) {
+        recycle_host_condition(condition);
+        pthread_mutex_unlock(&guest_sync_table_lock);
+        return NULL;
+    }
     struct guest_cond_entry *entry = &guest_conditions[guest_cond_count++];
     entry->address = address;
     entry->condition = condition;
+    entry->gate = gate;
+    if (gate_out) *gate_out = gate;
     pthread_mutex_unlock(&guest_sync_table_lock);
     return condition;
+}
+
+/* Block on a guest condition.  The host condition is waited on with the gate
+   lock rather than the guest's own mutex, so dropping and retaking the guest
+   mutex happens here, around the wait, exactly where the real call would have
+   done it. */
+static uint32_t guest_cond_block(uint32_t cond_address, uint32_t mutex_address,
+                                 const struct timespec *deadline,
+                                 const struct timespec *relative)
+{
+    struct guest_cond_gate *gate;
+    pthread_cond_t *condition = host_cond_for_guest(cond_address, true, &gate);
+    pthread_mutex_t *mutex = host_mutex_for_guest(mutex_address, false);
+    if (!condition || !gate) return (uint32_t)ENOMEM;
+    if (!mutex) return (uint32_t)EINVAL;
+
+    pthread_mutex_lock(&gate->lock);
+    if (gate->pending) {
+        gate->pending = 0;
+        pthread_mutex_unlock(&gate->lock);
+        return 0;
+    }
+    ++gate->waiters;
+    pthread_mutex_unlock(mutex);
+    /* If the guest's frame/main thread is the one blocking (e.g.
+       CoreAudioSoundInstance::Release waiting for the audio render callback to
+       run DoPostRenderMaintenance), let the audio hold yield so that callback
+       can proceed; otherwise the hold — which keys off the frame clock the
+       blocked thread would advance — never ends. */
+    bool frame_thread = audio_bridge32_is_frame_thread();
+    if (frame_thread) audio_bridge32_frame_thread_wait_begin();
+    int status;
+    if (relative) {
+        status = pthread_cond_timedwait_relative_np(condition, &gate->lock,
+                                                    relative);
+    } else if (deadline) {
+        status = pthread_cond_timedwait(condition, &gate->lock, deadline);
+    } else {
+        status = pthread_cond_wait(condition, &gate->lock);
+    }
+    if (frame_thread) audio_bridge32_frame_thread_wait_end();
+    --gate->waiters;
+    pthread_mutex_unlock(&gate->lock);
+    pthread_mutex_lock(mutex);
+    return (uint32_t)status;
+}
+
+static uint32_t guest_cond_wake(uint32_t address, bool all)
+{
+    struct guest_cond_gate *gate;
+    pthread_cond_t *condition = host_cond_for_guest(address, true, &gate);
+    if (!condition || !gate) return (uint32_t)ENOMEM;
+    pthread_mutex_lock(&gate->lock);
+    int status = 0;
+    if (gate->waiters == 0) {
+        gate->pending = 1;
+    } else {
+        status = all ? pthread_cond_broadcast(condition)
+                     : pthread_cond_signal(condition);
+    }
+    pthread_mutex_unlock(&gate->lock);
+    return (uint32_t)status;
 }
 
 static uint32_t guest_cond_initialize(uint32_t address)
@@ -798,11 +929,14 @@ static uint32_t guest_cond_initialize(uint32_t address)
         if (pthread_cond_destroy(entry->condition) == 0) {
             pthread_cond_init(entry->condition, NULL);
         }
+        pthread_mutex_lock(&entry->gate->lock);
+        entry->gate->pending = 0;
+        pthread_mutex_unlock(&entry->gate->lock);
         pthread_mutex_unlock(&guest_sync_table_lock);
         return 0;
     }
     pthread_mutex_unlock(&guest_sync_table_lock);
-    return host_cond_for_guest(address, true) ? 0 : (uint32_t)ENOMEM;
+    return host_cond_for_guest(address, true, NULL) ? 0 : (uint32_t)ENOMEM;
 }
 
 /* macOS reports success from pthread_cond_destroy even while a thread is
@@ -818,8 +952,10 @@ static uint32_t guest_cond_destroy(uint32_t address)
         if (entry->address != address) continue;
         pthread_cond_broadcast(entry->condition);
         int status = pthread_cond_destroy(entry->condition);
-        if (status == 0) {
+        if (status == 0 && entry->gate->waiters == 0) {
             recycle_host_condition(entry->condition);
+            pthread_mutex_destroy(&entry->gate->lock);
+            recycle_cond_gate(entry->gate);
             *entry = guest_conditions[--guest_cond_count];
             ++guest_sync_released_count;
         }
@@ -3034,7 +3170,12 @@ int compat_runtime32_initialize(struct macho_image32 *image)
     guest_heap_poison = getenv("LP32_GUEST_HEAP_POISON") != NULL;
     guest_heap_trace = getenv("LP32_TRACE_GUEST_HEAP") != NULL;
     timing_trace = getenv("LP32_TRACE_TIMING") != NULL;
-    compat_runtime32_frame_profile_enabled = getenv("LP32_FRAME_STATS") != NULL;
+    /* The per-import timing feeds both the frame report and the slow-import
+       report, so either request turns it on; LP32_SLOW_IMPORT_MS used to do
+       nothing on its own, which is exactly when it is wanted (chasing a hitch
+       without the periodic frame dump). */
+    compat_runtime32_frame_profile_enabled = getenv("LP32_FRAME_STATS") != NULL ||
+                                             getenv("LP32_SLOW_IMPORT_MS") != NULL;
     /* The global guest lock guarded against Rosetta mis-decoding a page that
        held both 32-bit thunks and 64-bit landing pads.  Those now live on
        separate pages, and the lock cost the render thread up to a third of
@@ -3905,10 +4046,20 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return (uint32_t)strncmp((const char *)(uintptr_t)arguments[0],
                                  (const char *)(uintptr_t)arguments[1], arguments[2]);
     }
-    if (import_is(name, "_strcpy")) {
-        strcpy((char *)(uintptr_t)arguments[0],
-               (const char *)(uintptr_t)arguments[1]);
-        return arguments[0];
+    /*
+     * strcpy and strcat with memmove's overlap rules.  The libc these games
+     * were built against copied byte by byte, and they rely on it: the PopCap
+     * logger strips its colour escapes in place with strcpy(p, p + n), which
+     * the host's vectorised strcpy mangles (Bejeweled 2 logged garbled text,
+     * and Zuma hung forever on a '^' the mangling left behind).
+     */
+    if (import_is(name, "_strcpy") || import_is(name, "_stpcpy")) {
+        char *destination = (void *)(uintptr_t)arguments[0];
+        const char *source = (const void *)(uintptr_t)arguments[1];
+        size_t length = strlen(source);
+        memmove(destination, source, length + 1);
+        return import_is(name, "_stpcpy") ?
+            (uint32_t)(uintptr_t)(destination + length) : arguments[0];
     }
     if (import_is(name, "_strncpy")) {
         strncpy((char *)(uintptr_t)arguments[0],
@@ -3916,8 +4067,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return arguments[0];
     }
     if (import_is(name, "_strcat")) {
-        strcat((char *)(uintptr_t)arguments[0],
-               (const char *)(uintptr_t)arguments[1]);
+        char *destination = (void *)(uintptr_t)arguments[0];
+        const char *source = (const void *)(uintptr_t)arguments[1];
+        memmove(destination + strlen(destination), source, strlen(source) + 1);
         return arguments[0];
     }
     if (import_is(name, "_strchr")) {
@@ -4593,27 +4745,13 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return guest_cond_destroy(arguments[0]);
     }
     if (import_is(name, "_pthread_cond_signal")) {
-        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
-        return condition ? (uint32_t)pthread_cond_signal(condition) : (uint32_t)ENOMEM;
+        return guest_cond_wake(arguments[0], false);
     }
     if (import_is(name, "_pthread_cond_broadcast")) {
-        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
-        return condition ? (uint32_t)pthread_cond_broadcast(condition) : (uint32_t)ENOMEM;
+        return guest_cond_wake(arguments[0], true);
     }
     if (import_is(name, "_pthread_cond_wait")) {
-        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
-        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
-        if (!condition || !mutex) return (uint32_t)EINVAL;
-        /* If the guest's frame/main thread is the one blocking (e.g.
-           CoreAudioSoundInstance::Release waiting for the audio render
-           callback to run DoPostRenderMaintenance), let the audio hold yield
-           so that callback can proceed; otherwise the hold — which keys off
-           the frame clock the blocked thread would advance — never ends. */
-        bool frame_thread = audio_bridge32_is_frame_thread();
-        if (frame_thread) audio_bridge32_frame_thread_wait_begin();
-        uint32_t r = (uint32_t)pthread_cond_wait(condition, mutex);
-        if (frame_thread) audio_bridge32_frame_thread_wait_end();
-        return r;
+        return guest_cond_block(arguments[0], arguments[1], NULL, NULL);
     }
     if (import_is(name, "_pthread_exit")) {
         /* Terminate the current host thread that is running this guest thread
@@ -4623,9 +4761,6 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return 0; /* not reached */
     }
     if (import_is(name, "_pthread_cond_timedwait")) {
-        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
-        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
-        if (!condition || !mutex) return (uint32_t)EINVAL;
         /* i386 struct timespec is two 32-bit fields; widen to the host's
            16-byte layout.  The guest computes an absolute CLOCK_REALTIME
            deadline from the host-backed gettimeofday, so it is already in
@@ -4636,21 +4771,18 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             deadline.tv_sec = (time_t)guest_time[0];
             deadline.tv_nsec = (long)guest_time[1];
         }
-        return (uint32_t)pthread_cond_timedwait(condition, mutex, &deadline);
+        return guest_cond_block(arguments[0], arguments[1], &deadline, NULL);
     }
     /* The relative form takes a wait, not a deadline (Bejeweled 2's FMOD
        mixer waits on it); turn it into the absolute deadline the host wants. */
     if (import_is(name, "_pthread_cond_timedwait_relative_np")) {
-        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
-        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
-        if (!condition || !mutex) return (uint32_t)EINVAL;
         const int32_t *guest_time = (const void *)(uintptr_t)arguments[2];
         struct timespec wait = {0, 0};
         if (guest_time) {
             wait.tv_sec = (time_t)guest_time[0];
             wait.tv_nsec = (long)guest_time[1];
         }
-        return (uint32_t)pthread_cond_timedwait_relative_np(condition, mutex, &wait);
+        return guest_cond_block(arguments[0], arguments[1], NULL, &wait);
     }
     if (import_is(name, "_pthread_key_create")) {
         uint32_t *key = (void *)(uintptr_t)arguments[0];
