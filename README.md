@@ -5,12 +5,9 @@ loading their i386 Mach-O image through Rosetta and translating the legacy
 Carbon, CoreFoundation, OpenGL, audio, libc, pthread, and C++ ABI calls to
 current macOS APIs. It ships as two products built from the same runtime:
 
-- **PeggleSilicon** for Peggle Deluxe 1.0.5 and Peggle Nights 1.0.4.
+- **PeggleSilicon** for Peggle Deluxe 1.0.5 and Peggle Nights 1.0.4. Peggle Deluxe has been playtested through all of Adventure Mode stages and works well. Peggle Nights has been tested up to Stage 3-5 and seems to work well.
 - **BejeweledSilicon** for Bejeweled 3 1.1.12 and Bejeweled 2 Deluxe 1.0.0.
-Bejeweled 3 is the newest version, and Classic mode has been playtested, but
-there may still be bugs especially in other modes. Bejeweled 2 is the newest
-addition: it boots, renders and plays, with music and sound effects, but it has
-had the least playtesting of the four.
+Bejeweled 3’s Classic, Zen, Lightning, Quest, Ice Storm, Poker, Butterflies, and Diamond Mine modes work well. Bejeweled 2’s Classic, Action, Puzzle, and Endless modes have been tested and work well.
 
 A single loader serves all four titles; it detects which game an image is and
 applies the right profile.
