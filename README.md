@@ -10,12 +10,8 @@ current macOS APIs. It ships as four products built from the same runtime:
 Bejeweled 3’s Classic, Zen, Lightning, Quest, Ice Storm, Poker, Butterflies, and Diamond Mine modes work well. Bejeweled 2’s Classic, Action, Puzzle, and Endless modes have been tested and work well.
 - **ChuzzleSilicon** for Chuzzle Deluxe 1.0.0. Tested with basic gameplay and 
 seems to work well.
-- **PvZSilicon** for Plants vs. Zombies 1.0.41. The newest addition. It boots,
-renders and plays with sound, but it has had the least playtesting of the six.
-It is also the only title that calls OpenGL through `<OpenGL/CGLMacro.h>`, that
-is, through the context's own function table rather than the `gl*` entry
-points, so the runtime hands it a CGL context of its own whose dispatch table
-routes back into the same GL bridge.
+- **PvZSilicon** for Plants vs. Zombies 1.0.41. Tested with basic gameplay in 
+start of Adventure mode and seems to work well.
 
 A single loader serves all six titles; it detects which game an image is and
 applies the right profile.
