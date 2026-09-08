@@ -6,6 +6,7 @@ import Foundation
 enum Product: String, CaseIterable, Identifiable {
     case peggleSilicon
     case bejeweledSilicon
+    case chuzzleSilicon
 
     var id: String { rawValue }
 
@@ -13,6 +14,7 @@ enum Product: String, CaseIterable, Identifiable {
         switch self {
         case .peggleSilicon: return "PeggleSilicon"
         case .bejeweledSilicon: return "BejeweledSilicon"
+        case .chuzzleSilicon: return "ChuzzleSilicon"
         }
     }
 
@@ -20,6 +22,7 @@ enum Product: String, CaseIterable, Identifiable {
         switch self {
         case .peggleSilicon: return [.deluxe, .nights]
         case .bejeweledSilicon: return [.bejeweled3, .bejeweled2]
+        case .chuzzleSilicon: return [.chuzzle]
         }
     }
 
@@ -34,6 +37,7 @@ enum Product: String, CaseIterable, Identifiable {
         switch self {
         case .peggleSilicon: return "circle.hexagongrid.fill"
         case .bejeweledSilicon: return "diamond.fill"
+        case .chuzzleSilicon: return "circle.grid.3x3.fill"
         }
     }
 

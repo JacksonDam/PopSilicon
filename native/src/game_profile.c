@@ -64,6 +64,23 @@ static const struct lp32_game_profile bejeweled2_profile = {
     .main_address = 0,
 };
 
+/* Chuzzle Deluxe 1.0.0 (Raptisoft for PopCap, 2005; original i386 Mac
+   executable).  Not a "Sexy" engine title at all: it is an SDL 1.2 game whose
+   window, input, threads and image loading come from the SDL and SDL_image
+   frameworks bundled beside it, with BASS (the 2.0-era API) for audio.  Like
+   Bejeweled 2, the Steam copy carries an unencrypted __STEAM ownership stub.
+   main is derived from the crt start stub. */
+static const struct lp32_game_profile chuzzle_profile = {
+    .title = LP32_TITLE_CHUZZLE,
+    .name = "Chuzzle",
+    .display_name = "Chuzzle Deluxe",
+    .log_directory = "Chuzzle",
+    .image_file = "Chuzzle.image",
+    .entry_eip = 0x00002b9c,
+    .image_end = 0x0017a318,
+    .main_address = 0,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -78,6 +95,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &peggle_nights_profile,
     &bejeweled3_profile,
     &bejeweled2_profile,
+    &chuzzle_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -107,6 +125,8 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (strcasecmp(name, "Bejeweled2") == 0 ||
         strcasecmp(name, "Bejeweled 2") == 0 ||
         strcasecmp(name, "Bejeweled 2 Deluxe") == 0) return &bejeweled2_profile;
+    if (strcasecmp(name, "Chuzzle") == 0 ||
+        strcasecmp(name, "Chuzzle Deluxe") == 0) return &chuzzle_profile;
     return NULL;
 }
 

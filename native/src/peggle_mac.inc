@@ -12,6 +12,7 @@ static uint64_t pg_fp_double(double v)
 #include "peggle_window.inc"
 #include "peggle_graphics.inc"
 #include "bejeweled2.inc"
+#include "chuzzle.inc"
 
 /* A small printf for CFStringCreateWithFormat over i386 varargs (%@ takes a
    proxied CFString, %f a two-word double). */
@@ -52,7 +53,7 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
     if (!lp32_title_is_peggle_engine(lp32_profile()->title)) return 0;
     if (peggle_window_dispatch(n, a, r) || peggle_graphics_dispatch(n, a, r) ||
-        bejeweled2_dispatch(n, a, r)) return 1;
+        bejeweled2_dispatch(n, a, r) || chuzzle_dispatch(n, a, r)) return 1;
     if (IS("_CFBundleGetValueForInfoDictionaryKey")) RET(proxy_for_object([O(0) objectForInfoDictionaryKey:O(1)]));
     if (IS("_CFBundleGetVersionNumber")) {
         switch (lp32_profile()->title) {
@@ -92,6 +93,37 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_CFNumberFormatterCreate")) RET(pg_cf_register(CFNumberFormatterCreate(NULL, (CFLocaleRef)O(1), a[2])));
     if (IS("_CFNumberFormatterCreateStringWithValue")) RET(pg_cf_register(CFNumberFormatterCreateStringWithValue(NULL, (CFNumberFormatterRef)O(1), a[2], P(3))));
     if (IS("_CFURLCreateWithBytes")) RET(pg_cf_register(CFURLCreateWithBytes(NULL, P(1), a[2], a[3], (CFURLRef)O(4))));
+    if (IS("_CFURLCopyAbsoluteURL")) RET(pg_cf_register((CFTypeRef)[[O(0) absoluteURL] retain]));
+    if (IS("_CFURLCreateCopyDeletingLastPathComponent"))
+        RET(pg_cf_register((CFTypeRef)[[O(1) URLByDeletingLastPathComponent] retain]));
+    if (IS("_CFBundleGetInfoDictionary")) RET(proxy_for_object([O(0) infoDictionary]));
+    if (IS("_CFBundleCopyBundleURL")) RET(pg_cf_register((CFTypeRef)[[O(0) bundleURL] retain]));
+    if (IS("_CFStringCreateWithBytes"))
+        RET(pg_cf_register(CFStringCreateWithBytes(NULL, P(1), (int32_t)a[2], a[3], a[4] != 0)));
+    /* CFRange is two words on i386, so the buffer arguments start at 6. */
+    if (IS("_CFStringGetBytes")) {
+        CFIndex used = 0;
+        CFIndex converted = CFStringGetBytes((CFStringRef)O(0),
+            CFRangeMake((int32_t)a[1], (int32_t)a[2]), a[3], (uint8_t)a[4],
+            a[5] != 0, a[6] ? P(6) : NULL, (int32_t)a[7], &used);
+        if (a[8]) *(int32_t *)P(8) = (int32_t)used;
+        RET((uint32_t)converted);
+    }
+    if (IS("_CFStringGetPascalString"))
+        RET(CFStringGetPascalString((CFStringRef)O(0), P(1), (int32_t)a[2], a[3]));
+    if (IS("_CopyPascalStringToC")) {
+        const uint8_t *source = P(0);
+        if (source && a[1]) { memcpy(P(1), source + 1, source[0]); ((char *)P(1))[source[0]] = '\0'; }
+        RET(0);
+    }
+    if (IS("_CFPreferencesGetAppBooleanValue") || IS("_CFPreferencesGetAppIntegerValue")) {
+        Boolean exists = false;
+        uint32_t value = IS("_CFPreferencesGetAppBooleanValue")
+            ? (uint32_t)CFPreferencesGetAppBooleanValue((CFStringRef)pg_cf_object(a[0]), CFSTR("local.peggle.compat"), &exists)
+            : (uint32_t)CFPreferencesGetAppIntegerValue((CFStringRef)pg_cf_object(a[0]), CFSTR("local.peggle.compat"), &exists);
+        OUT(2, exists);
+        RET(value);
+    }
     if (IS("_CFURLGetFSRef")) RET(CFURLGetFSRef((CFURLRef)O(0), P(1)));
     if (IS("_CFUserNotificationDisplayAlert")) {
         NSString *title = O(6), *message = O(7);

@@ -616,6 +616,44 @@ static const char *default_image_path(const char *argv0, char *buffer,
     return NULL;
 }
 
+
+/*
+ * Steam's ownership stub takes over the executable's first module
+ * initializer, and every copy of it ends by tail-jumping to the one it
+ * displaced:
+ *
+ *     mov eax, <original initializer>   b8 imm32
+ *     test eax, eax                     85 c0
+ *     je +2                             0f 84 02 00 00 00
+ *     jmp eax                           ff e0
+ *
+ * The stub itself cannot run here (it reads a Mac OS X 10.4 dyld's private
+ * globals), so recover that address and call the game's initializer directly.
+ * Returns 0 when the pattern is absent, which leaves the initializer skipped.
+ */
+static uint32_t steam_stub_displaced_initializer(const struct macho_image32 *image)
+{
+    static const uint8_t tail[] = {
+        0x85, 0xc0,                         /* test eax, eax */
+        0x0f, 0x84, 0x02, 0x00, 0x00, 0x00, /* je +2 */
+        0xff, 0xe0,                         /* jmp eax */
+    };
+    if (!image->steam_stub_end) return 0;
+    const uint8_t *stub = (const void *)(uintptr_t)image->steam_stub_start;
+    size_t length = image->steam_stub_end - image->steam_stub_start;
+    for (size_t offset = 0; offset + 5 + sizeof(tail) <= length; ++offset) {
+        if (stub[offset] != 0xb8) continue;
+        if (memcmp(stub + offset + 5, tail, sizeof(tail)) != 0) continue;
+        uint32_t target;
+        memcpy(&target, stub + offset + 1, sizeof(target));
+        /* It must point at the game's own code, not back into the stub. */
+        if (target >= image->min_address && target < image->steam_stub_start) {
+            return target;
+        }
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     install_guest_crash_diagnostics();
@@ -743,21 +781,25 @@ int main(int argc, char **argv)
            globals through a hardcoded address (0x8fe00010), which no longer
            exists, and it only gates code the wrapper left in the clear, so
            skip it and let the game's own initializers run. */
-        if (image.steam_stub_end &&
-            initializers[index] >= image.steam_stub_start &&
-            initializers[index] < image.steam_stub_end) {
+        uint32_t initializer = initializers[index];
+        if (image.steam_stub_end && initializer >= image.steam_stub_start &&
+            initializer < image.steam_stub_end) {
+            uint32_t displaced = steam_stub_displaced_initializer(&image);
             printf("initializer[%" PRIu32 "]: 0x%08" PRIx32
-                   " skipped (Steam ownership stub)\n",
-                   index, initializers[index]);
-            continue;
+                   " is the Steam ownership stub; running the initializer it "
+                   "displaced (0x%08" PRIx32 ") instead\n",
+                   index, initializer, displaced);
+            fflush(stdout);
+            if (!displaced) continue;
+            initializer = displaced;
         }
         if (index == 0 || index + 1 == image.initializer_count ||
             (index % 32) == 0) {
             printf("initializer[%" PRIu32 "]: 0x%08" PRIx32 "\n",
-                   index, initializers[index]);
+                   index, initializer);
         }
         fflush(stdout);
-        uint32_t result = compat_runtime32_call(initializers[index], NULL, 0);
+        uint32_t result = compat_runtime32_call(initializer, NULL, 0);
         if (compat_runtime32_last_call_trapped()) {
             printf("controlled guest exit after initializer[%" PRIu32
                    "] result=0x%08" PRIx32 "\n", index, result);

@@ -75,7 +75,18 @@ struct Game: Identifiable, Hashable {
         resourceMarker: "properties/resources.xml"
     )
 
-    static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2]
+    static let chuzzle = Game(
+        id: "com.raptisoft.Chuzzle",
+        displayName: "Chuzzle Deluxe",
+        steamFolder: "Chuzzle Deluxe",
+        steamAppName: "Chuzzle Deluxe.app",
+        executableName: "Chuzzle",
+        outputAppName: "Chuzzle.app",
+        imageFileName: "Chuzzle.image",
+        resourceMarker: "Data/gamedata.cfg"
+    )
+
+    static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2, .chuzzle]
 
     /// The game whose original bundle identifier matches this dropped app.
     static func matching(bundleIdentifier: String?) -> Game? {

@@ -111,6 +111,72 @@ static int peggle_bassmod_dispatch(const char *n, const uint32_t *a, uint64_t *r
 #undef IS
 }
 
+/* --- BASS 2.3 over the vendored BASS 2.4 -------------------------------- */
+
+/*
+ * Chuzzle links the 2.3-era BASS API.  Most calls are unchanged in 2.4, but
+ * four are not: the channel attributes were split into one call per
+ * attribute, flags gained a mask, the position gained a mode, and
+ * BASS_CHANNELINFO grew three fields past the five the game's struct has room
+ * for -- so that one is filled through a host struct and truncated.
+ */
+static int chuzzle_bass_dispatch(const char *n, const uint32_t *a, uint64_t *r)
+{
+#define IS(s) (strcmp(n, "_" #s) == 0)
+#define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
+    if (IS(BASS_GetVersion)) RET(0x02030000); /* the version the game checks for */
+    if (IS(BASS_MusicLoad)) {
+        RET(BASS_MusicLoad(a[0], (void *)(uintptr_t)a[1], a[2], a[3], a[4], 0));
+    }
+    if (IS(BASS_SampleLoad)) {
+        RET(BASS_SampleLoad(a[0], (void *)(uintptr_t)a[1], a[2], a[3], a[4], a[5]));
+    }
+    if (IS(BASS_ChannelSetAttributes)) {
+        /* (handle, freq, volume 0-100, pan -100..100); -1 and -101 mean
+           "leave alone". */
+        BOOL ok = TRUE;
+        if ((int32_t)a[1] != -1) {
+            ok &= BASS_ChannelSetAttribute(a[0], BASS_ATTRIB_FREQ, (float)(int32_t)a[1]);
+        }
+        if ((int32_t)a[2] != -1) {
+            ok &= BASS_ChannelSetAttribute(a[0], BASS_ATTRIB_VOL, (float)(int32_t)a[2] / 100.0f);
+        }
+        if ((int32_t)a[3] != -101) {
+            ok &= BASS_ChannelSetAttribute(a[0], BASS_ATTRIB_PAN, (float)(int32_t)a[3] / 100.0f);
+        }
+        RET(ok);
+    }
+    if (IS(BASS_ChannelSetFlags)) {
+        /* The game reads the current flags back and toggles only the loop bit,
+           so that is the only bit worth handing to the masked form. */
+        RET(BASS_ChannelFlags(a[0], a[1], BASS_SAMPLE_LOOP));
+    }
+    if (IS(BASS_ChannelSetPosition)) {
+        /* 2.3 packed "this is an order, not a byte offset" into the position's
+           top bit; 2.4 takes it as a separate mode. */
+        uint64_t position = (uint64_t)a[1] | ((uint64_t)a[2] << 32);
+        DWORD mode = (a[1] & 0x80000000u) ? BASS_POS_MUSIC_ORDER : BASS_POS_BYTE;
+        if (mode == BASS_POS_MUSIC_ORDER) position = a[1] & 0x7fffffffu;
+        RET(BASS_ChannelSetPosition(a[0], position, mode));
+    }
+    if (IS(BASS_ChannelGetInfo)) {
+        BASS_CHANNELINFO info;
+        memset(&info, 0, sizeof(info));
+        BOOL ok = BASS_ChannelGetInfo(a[0], &info);
+        if (ok && a[1] >= 0x1000) {
+            /* Only freq, chans, flags, ctype and origres exist in the guest's
+               20-byte struct; 2.4's extra fields must not be written past it. */
+            uint32_t fields[5] = {info.freq, info.chans, info.flags,
+                                  info.ctype, info.origres};
+            memcpy((void *)(uintptr_t)a[1], fields, sizeof(fields));
+        }
+        RET(ok);
+    }
+    return 0;
+#undef RET
+#undef IS
+}
+
 static int peggle_bass_dispatch(const char *n,const uint32_t *a,uint64_t *r)
 {
 #define IS(s) (strcmp(n,"_" #s)==0)
@@ -119,6 +185,12 @@ static int peggle_bass_dispatch(const char *n,const uint32_t *a,uint64_t *r)
 #define RET(x) do{*r=(uint64_t)(x);if(bass_trace)fprintf(stderr,"compat32: bass %s(%08x,%08x,%08x,%08x,%08x)=%llx err=%d\n",n,a[0],a[1],a[2],a[3],a[4],(unsigned long long)*r,BASS_ErrorGetCode());return 1;}while(0)
     if(strncmp(n,"_BASSMOD_",9)==0){int handled=peggle_bassmod_dispatch(n,a,r);if(handled&&bass_trace)fprintf(stderr,"compat32: bassmod %s(%08x,%08x,%08x,%08x,%08x)=%llx err=%d\n",n,a[0],a[1],a[2],a[3],a[4],(unsigned long long)*r,BASS_ErrorGetCode());return handled;}
     if(strncmp(n,"_BASS_",6))return 0;
+    /* Chuzzle links the older API; its shims come first and fall through for
+       the calls the two versions share. */
+    if(lp32_profile()->title==LP32_TITLE_CHUZZLE&&chuzzle_bass_dispatch(n,a,r)){
+        if(bass_trace)fprintf(stderr,"compat32: bass(2.3) %s(%08x,%08x,%08x,%08x,%08x)=%llx err=%d\n",n,a[0],a[1],a[2],a[3],a[4],(unsigned long long)*r,BASS_ErrorGetCode());
+        return 1;
+    }
     if(IS(BASS_Init))RET(BASS_Init((int)a[0],a[1],a[2],NULL,NULL));
     if(IS(BASS_SetConfig))RET(BASS_SetConfig(a[0],a[1]));
     if(IS(BASS_GetConfig))RET(BASS_GetConfig(a[0]));
@@ -140,6 +212,12 @@ static int peggle_bass_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS(BASS_ChannelGetPosition))RET(BASS_ChannelGetPosition(a[0],a[1]));
     if(IS(BASS_ChannelSetPosition))RET(BASS_ChannelSetPosition(a[0],(uint64_t)a[1]|((uint64_t)a[2]<<32),a[3]));
     if(IS(BASS_ChannelIsActive))RET(BASS_ChannelIsActive(a[0]));
+    if(IS(BASS_ErrorGetCode))RET((uint32_t)BASS_ErrorGetCode());
+    if(IS(BASS_Pause))RET(BASS_Pause());
+    if(IS(BASS_SampleLoad))RET(BASS_SampleLoad(a[0],(void *)(uintptr_t)a[1],(uint64_t)a[2]|((uint64_t)a[3]<<32),a[4],a[5],a[6]));
+    if(IS(BASS_SampleFree))RET(BASS_SampleFree(a[0]));
+    if(IS(BASS_SampleGetChannel))RET(BASS_SampleGetChannel(a[0],a[1]));
+    if(IS(BASS_ChannelGetInfo))RET(BASS_ChannelGetInfo(a[0],(void *)(uintptr_t)a[1]));
     if(IS(BASS_ChannelPause))RET(BASS_ChannelPause(a[0]));
     if(IS(BASS_ChannelPlay))RET(BASS_ChannelPlay(a[0],a[1]));
     if(IS(BASS_ChannelStop))RET(BASS_ChannelStop(a[0]));

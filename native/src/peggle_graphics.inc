@@ -21,6 +21,9 @@ static int peggle_graphics_dispatch(const char *n, const uint32_t *a, uint64_t *
     if (IS("_glOrtho")) { glOrtho(pg_double(a), pg_double(a + 2), pg_double(a + 4), pg_double(a + 6), pg_double(a + 8), pg_double(a + 10)); RET(0); }
     if (IS("_glPixelStorei")) { glPixelStorei(a[0], a[1]); RET(0); }
     if (IS("_glShadeModel")) { glShadeModel(a[0]); RET(0); }
+    if (IS("_glTexEnvi")) { glTexEnvi(a[0], a[1], (GLint)a[2]); RET(0); }
+    if (IS("_glTexEnvf")) { glTexEnvf(a[0], a[1], pg_float(a[2])); RET(0); }
+    if (IS("_glTexEnvfv")) { glTexEnvfv(a[0], a[1], P(2)); RET(0); }
     if (IS("_glReadPixels")) { glReadPixels(a[0], a[1], a[2], a[3], a[4], a[5], P(6)); RET(0); }
     if (IS("_gluErrorString") || IS("_CGLErrorString")) { static uint32_t text; if (!text) text = compat_runtime32_copy_cstring("OpenGL error"); RET(text); }
     if (IS("_CGDisplayBitsPerPixel")) RET(32);

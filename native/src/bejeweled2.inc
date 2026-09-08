@@ -753,13 +753,6 @@ static int bejeweled2_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         }
         RET(device_handle);
     }
-    if (IS("_CFPreferencesGetAppBooleanValue")) {
-        Boolean exists = false;
-        Boolean value = CFPreferencesGetAppBooleanValue(
-            (CFStringRef)pg_cf_object(a[0]), CFSTR("local.peggle.compat"), &exists);
-        OUT(2, exists);
-        RET(value);
-    }
     /* Same "best mode" logic as the older call, with the refresh rate (a
        double, so two words) sitting between the size and the match flag. */
     if (IS("_CGDisplayBestModeForParametersAndRefreshRate")) {

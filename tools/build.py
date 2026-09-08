@@ -105,6 +105,13 @@ GAMES = {
         'bundle_identifier': 'local.bejeweled2.silicon',
         'bundle_name': 'Bejeweled2',
     },
+    'com.raptisoft.Chuzzle': {
+        'display_name': 'Chuzzle Deluxe',
+        'image_file': 'Chuzzle.image',
+        'output_name': 'Chuzzle.app',
+        'bundle_identifier': 'local.chuzzle.silicon',
+        'bundle_name': 'Chuzzle',
+    },
 }
 
 
@@ -114,8 +121,8 @@ def game_for_source(info: dict) -> dict:
     if not game:
         raise SystemExit(
             f'unsupported game bundle: {identifier or "(no identifier)"}.\n'
-            'Supported: Peggle Deluxe, Peggle Nights, Bejeweled 3 and '
-            'Bejeweled 2 Deluxe.')
+            'Supported: Peggle Deluxe, Peggle Nights, Bejeweled 3, '
+            'Bejeweled 2 Deluxe and Chuzzle Deluxe.')
     return game
 
 

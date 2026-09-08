@@ -52,6 +52,39 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_strtoull")||IS("_strtouq")){char *end;unsigned long long v=strtoull((const char *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint64_t)v);}
     if(IS("_atoll")||IS("_atoq"))RET((uint64_t)atoll((const char *)(uintptr_t)a[0]));
     if(IS("_strcasecmp"))RET((uint32_t)strcasecmp((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
+    if(IS("_strcasestr"))RET((uint32_t)(uintptr_t)strcasestr((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
+    if(IS("_strlcpy"))RET((uint32_t)strlcpy((char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]));
+    if(IS("_strlcat"))RET((uint32_t)strlcat((char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]));
+    if(IS("_strncat")){strncat((char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]);RET(a[0]);}
+    if(IS("_access"))RET((uint32_t)access((const char *)(uintptr_t)a[0],(int)a[1]));
+    if(IS("_creat"))RET((uint32_t)open((const char *)(uintptr_t)a[0],O_CREAT|O_TRUNC|O_WRONLY,(mode_t)a[1]));
+    if(IS("_rmdir"))RET((uint32_t)rmdir((const char *)(uintptr_t)a[0]));
+    if(IS("_perror")){fprintf(stderr,"compat32: %s: %s\n",a[0]?(const char *)(uintptr_t)a[0]:"",strerror(errno));RET(0);}
+    if(IS("_putenv"))RET((uint32_t)putenv(strdup((const char *)(uintptr_t)a[0])));
+    if(IS("_log10"))RET(return_guest_double(log10(guest_double(a))));
+    /* div/ldiv return an 8-byte struct, which i386 hands back in edx:eax. */
+    if(IS("_div")||IS("_ldiv")){int32_t n=(int32_t)a[0],d=(int32_t)a[1];if(!d)RET(0);RET(((uint64_t)(uint32_t)(n%d)<<32)|(uint32_t)(n/d));}
+    /* localeconv: a C locale lconv the guest can read decimal_point out of. */
+    if(IS("_localeconv")){
+        static uint32_t conv;
+        if(!conv){
+            conv=compat_runtime32_allocate(64,1);
+            uint32_t point=compat_runtime32_copy_cstring("."),comma=compat_runtime32_copy_cstring(","),empty=compat_runtime32_copy_cstring("");
+            uint32_t *fields=(void *)(uintptr_t)conv;
+            for(int i=0;i<10;i++)fields[i]=empty;
+            fields[0]=point;fields[1]=comma;
+            memset((uint8_t *)(uintptr_t)conv+40,CHAR_MAX,24);
+        }
+        RET(conv);
+    }
+    /* The game shells out only to hand a URL or a file to the default
+       handler; do that directly instead of running a shell. */
+    if(IS("_system")){
+        const char *command=a[0]?(const char *)(uintptr_t)a[0]:"";
+        if(strncmp(command,"open ",5)==0){objc_bridge32_open_url(command+5);RET(0);}
+        fprintf(stderr,"compat32: refused system(\"%s\")\n",command);
+        RET(-1);
+    }
     if(IS("_strncasecmp"))RET((uint32_t)strncasecmp((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]));
     /* Wide-char string helpers: i386 and host wchar_t are both 4 bytes and
        guest memory maps 1:1 in low address space, so host wcs* operate on the

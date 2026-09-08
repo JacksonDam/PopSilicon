@@ -5053,6 +5053,19 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
     }
 }
 
+void objc_bridge32_open_url(const char *url)
+{
+    if (!url || !url[0]) return;
+    @autoreleasepool {
+        NSString *text = [[NSString stringWithUTF8String:url]
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSURL *target = [text hasPrefix:@"/"] ? [NSURL fileURLWithPath:text]
+                                              : [NSURL URLWithString:text];
+        fprintf(stderr, "compat32: open %s\n", url);
+        if (target) [[NSWorkspace sharedWorkspace] openURL:target];
+    }
+}
+
 static int objc_bridge32_dispatch_body(const char *import_name,
                                        size_t import_length,
                                        const uint32_t *arguments,
