@@ -8,10 +8,8 @@ current macOS APIs. It ships as three products built from the same runtime:
 - **PeggleSilicon** for Peggle Deluxe 1.0.5 and Peggle Nights 1.0.4. Peggle Deluxe has been playtested through all of Adventure Mode stages and works well. Peggle Nights has been tested up to Stage 3-5 and seems to work well.
 - **BejeweledSilicon** for Bejeweled 3 1.1.12 and Bejeweled 2 Deluxe 1.0.0.
 Bejeweled 3’s Classic, Zen, Lightning, Quest, Ice Storm, Poker, Butterflies, and Diamond Mine modes work well. Bejeweled 2’s Classic, Action, Puzzle, and Endless modes have been tested and work well.
-- **ChuzzleSilicon** for Chuzzle Deluxe 1.0.0. The newest addition, and the
-only title that is not a PopCap "Sexy" engine game: Raptisoft built it on SDL,
-so the runtime supplies SDL 1.2 and SDL_image as well. It boots, renders and
-plays, with music and sound, but it has had the least playtesting of the five.
+- **ChuzzleSilicon** for Chuzzle Deluxe 1.0.0. Tested with basic gameplay and 
+seems to work well.
 
 A single loader serves all five titles; it detects which game an image is and
 applies the right profile.
