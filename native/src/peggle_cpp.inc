@@ -348,8 +348,41 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
             for(size_t step=0;step<=n;step++){size_t i=reverse?pos-step:pos+step;if(i>n || (reverse&&step>pos))break;bool ok=false;if(set){bool hit=false;for(size_t j=0;j<vn;j++)if(i<n&&!memcmp(s+i*w,v+j*w,w))hit=true;ok=i<n&&(neg?!hit:hit);}else ok=vn<=n-i&&!memcmp(s+i*w,v,vn*w);if(ok){found=(uint32_t)i;break;}}
             PG_RETURN(found);
         }
-        if (strncmp(op,"5eraseE",7)==0 || strncmp(op,"7replaceE",9)==0) {
-            bool iterator=strstr(op,"normal_iterator")!=NULL;size_t pos=iterator?(a[1]-*(uint32_t *)(uintptr_t)obj)/w:a[1];if(pos>n)pos=n;size_t len=iterator?(a[2]-a[1])/w:a[2];if(len>n-pos)len=n-pos;size_t extra=strncmp(op,"7replace",8)==0?a[4]-a[3]:0;char *buf=malloc((n-len+extra+1)*w);memcpy(buf,s,pos*w);if(extra)memcpy(buf+pos*w,(void *)(uintptr_t)a[3],extra*w);memcpy(buf+(pos+extra)*w,s+(pos+len)*w,(n-pos-len)*w);pg_string_set(obj,buf,n-len+extra,w,false);free(buf);PG_RETURN(iterator?*(uint32_t *)(uintptr_t)obj+pos*w:obj);
+        /* erase/replace/insert.  Which arguments follow depends on the
+           overload, and getting that wrong is not survivable: replace(pos, n,
+           const char*) read as the iterator form takes the length from a stack
+           word past the arguments and copies gigabytes.  The iterator forms
+           are the ones whose mangled parameters name __normal_iterator; among
+           those, only the ones carrying a second iterator ("EES2_") have a
+           range to remove. */
+        if (strncmp(op,"5eraseE",7)==0 || strncmp(op,"7replaceE",9)==0 ||
+            strncmp(op,"6insertE",8)==0) {
+            bool iterator=strstr(op,"normal_iterator")!=NULL;
+            bool replace=strncmp(op,"7replace",8)==0;
+            bool insert=strncmp(op,"6insert",7)==0;
+            size_t pos,len;
+            if (iterator) {
+                uint32_t data=*(uint32_t *)(uintptr_t)obj;
+                pos=a[1]>data?(a[1]-data)/w:0;
+                len=strstr(op,"EES2_")?(a[2]>a[1]?(a[2]-a[1])/w:0):(insert?0:1);
+            } else { pos=a[1]; len=a[2]; }
+            if(pos>n)pos=n;
+            if(len>n-pos)len=n-pos;
+            /* The replacement: a pointer range for the iterator forms, a C
+               string or another string for the (pos, count) forms, and one
+               character for insert. */
+            const char *source=NULL;size_t extra=0;char single=0;
+            if(insert){single=(char)a[2];source=&single;extra=1;}
+            else if(replace&&iterator){source=(const void *)(uintptr_t)a[3];extra=a[4]>a[3]?(a[4]-a[3])/w:0;}
+            else if(replace&&strstr(op,"PKc")){source=(const void *)(uintptr_t)a[3];extra=source?strlen(source):0;}
+            else if(replace){source=guest_string_data(a[3]);extra=guest_string_length(a[3]);}
+            char *buf=malloc((n-len+extra+1)*w);
+            memcpy(buf,s,pos*w);
+            if(extra)memcpy(buf+pos*w,source,extra*w);
+            memcpy(buf+(pos+extra)*w,s+(pos+len)*w,(n-pos-len)*w);
+            pg_string_set(obj,buf,n-len+extra,w,false);
+            free(buf);
+            PG_RETURN(iterator?*(uint32_t *)(uintptr_t)obj+pos*w:obj);
         }
     }
     return 0;

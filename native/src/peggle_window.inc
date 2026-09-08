@@ -469,6 +469,18 @@ static NSOpenGLContext *pg_ensure_gl(void)
     pg_gl_handle = proxy_for_object(pg_gl);
     return pg_gl;
 }
+/* The handle the game gets for "the GL context".  Titles that call GL through
+   <OpenGL/CGLMacro.h> read the dispatch table out of it, so they get the
+   synthesized context; everyone else gets the Cocoa proxy they always had. */
+static uint32_t pg_gl_context_handle(void)
+{
+    if (lp32_profile()->title == LP32_TITLE_PLANTSVSZOMBIES) {
+        uint32_t context = pg_gli_context_object();
+        if (context) return context;
+    }
+    return pg_gl_handle;
+}
+
 static void pg_attach_gl(void)
 {
     struct pg_win *w = pg_main_win();
@@ -915,20 +927,26 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     }
     /* --- AGL (windowed) and CGL (emulated fullscreen) share one context --- */
     if (IS("_aglChoosePixelFormat")) RET(1);
-    if (IS("_aglCreateContext")) { pg_ensure_gl(); RET(pg_gl_handle); }
+    /* A title built with CGLMacro.h calls GL straight through whichever
+       context handle it kept, so every handle it can obtain has to be the
+       synthesized dispatch context; the AGL/CGL calls themselves ignore it. */
+    if (IS("_aglCreateContext")) { pg_ensure_gl(); RET(pg_gl_context_handle()); }
     if (IS("_aglSetDrawable")) { pg_attach_gl(); RET(1); }
     if (IS("_aglSetCurrentContext")) { if (a[0]) [pg_gl makeCurrentContext]; else [NSOpenGLContext clearCurrentContext]; RET(1); }
     if (IS("_aglUpdateContext")) { [pg_gl update]; RET(1); }
     if (IS("_aglSwapBuffers")) { pg_present(); RET(1); }
     if (IS("_aglGetError")) RET(0);
+    /* Titles built with CGLMacro.h call GL through the context's own dispatch
+       table, so they get the synthesized one rather than a proxy handle. */
+    if (IS("_aglGetCGLContext")) { pg_ensure_gl(); OUT(1, pg_gl_context_handle()); RET(1); }
     if (IS("_aglErrorString")) { static uint32_t text; if (!text) text = compat_runtime32_copy_cstring("no error"); RET(text); }
     if (IS("_aglDestroyPixelFormat") || IS("_aglDestroyContext")) RET(1);
     if (IS("_CGLChoosePixelFormat")) { OUT(1, 1); OUT(2, 1); RET(0); }
     if (IS("_CGLDestroyPixelFormat")) RET(0);
-    if (IS("_CGLCreateContext")) { pg_ensure_gl(); OUT(2, pg_gl_handle); RET(0); }
+    if (IS("_CGLCreateContext")) { pg_ensure_gl(); OUT(2, pg_gl_context_handle()); RET(0); }
     if (IS("_CGLDestroyContext")) RET(0);
     if (IS("_CGLSetCurrentContext")) { if (a[0]) [pg_gl makeCurrentContext]; else [NSOpenGLContext clearCurrentContext]; RET(0); }
-    if (IS("_CGLGetCurrentContext")) RET([NSOpenGLContext currentContext] == pg_gl ? pg_gl_handle : 0);
+    if (IS("_CGLGetCurrentContext")) RET([NSOpenGLContext currentContext] == pg_gl ? pg_gl_context_handle() : 0);
     if (IS("_CGLSetFullScreen") || IS("_CGLSetFullScreenOnDisplay")) { pg_attach_gl(); RET(0); }
     if (IS("_CGLClearDrawable")) { [pg_gl clearDrawable]; RET(0); }
     if (IS("_CGLFlushDrawable")) { pg_present(); RET(0); }

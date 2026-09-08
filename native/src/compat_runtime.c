@@ -2207,11 +2207,39 @@ static uint32_t guest_string_make(const char *bytes, size_t length,
     return allocation + 12;
 }
 
+/*
+ * Every std::string this bridge hands the guest keeps its representation in
+ * the guest heap, with the length twelve bytes ahead of the data pointer.  A
+ * data pointer anywhere else belongs to an object that is not one of ours --
+ * stale, or built by guest code the bridge never saw -- and reading a
+ * "length" from in front of it yields a wild number that the string
+ * operations would then copy.  Treat such an object as empty and say so once.
+ */
+static bool guest_string_representation_valid(uint32_t data)
+{
+    return data >= kGuestHeapBase + 12 && data < kGuestHeapEnd;
+}
+
+static void report_foreign_string(uint32_t object, uint32_t data)
+{
+    static bool reported;
+    if (reported) return;
+    reported = true;
+    fprintf(stderr, "compat32: std::string at 0x%08" PRIx32 " has a foreign "
+            "representation (data=0x%08" PRIx32 "); treating it as empty\n",
+            object, data);
+}
+
 static const char *guest_string_data(uint32_t object)
 {
     if (!object) return "";
     uint32_t data = *(const uint32_t *)(uintptr_t)object;
-    return data ? (const char *)(uintptr_t)data : "";
+    if (!data) return "";
+    if (!guest_string_representation_valid(data)) {
+        report_foreign_string(object, data);
+        return "";
+    }
+    return (const char *)(uintptr_t)data;
 }
 
 static size_t guest_string_length(uint32_t object)
@@ -2219,6 +2247,10 @@ static size_t guest_string_length(uint32_t object)
     if (!object) return 0;
     uint32_t data = *(const uint32_t *)(uintptr_t)object;
     if (!data) return 0;
+    if (!guest_string_representation_valid(data)) {
+        report_foreign_string(object, data);
+        return 0;
+    }
     return *(const uint32_t *)(uintptr_t)(data - 12);
 }
 

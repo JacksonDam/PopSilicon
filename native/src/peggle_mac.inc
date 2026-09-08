@@ -9,6 +9,7 @@ static uint64_t pg_fp_double(double v)
     lp32_return_fp_kind = 2;
     return 0;
 }
+#include "gli_context.inc"
 #include "peggle_window.inc"
 #include "peggle_graphics.inc"
 #include "bejeweled2.inc"
@@ -52,7 +53,8 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 #define OUT(i, v) do { if (a[i]) *(uint32_t *)P(i) = (uint32_t)(v); } while (0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
     if (!lp32_title_is_peggle_engine(lp32_profile()->title)) return 0;
-    if (peggle_window_dispatch(n, a, r) || peggle_graphics_dispatch(n, a, r) ||
+    if (gli_dispatch(n, a, r) ||
+        peggle_window_dispatch(n, a, r) || peggle_graphics_dispatch(n, a, r) ||
         bejeweled2_dispatch(n, a, r) || chuzzle_dispatch(n, a, r)) return 1;
     if (IS("_CFBundleGetValueForInfoDictionaryKey")) RET(proxy_for_object([O(0) objectForInfoDictionaryKey:O(1)]));
     if (IS("_CFBundleGetVersionNumber")) {
@@ -198,6 +200,48 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     if (IS("_AEInstallEventHandler") || IS("_AEProcessAppleEvent")) RET(0);
     if (IS("_CreateNibReference")) { OUT(1, 1); RET(0); }
     if (IS("_GetMainEventLoop") || IS("_GetApplicationEventTarget") || IS("_GetEventDispatcherTarget")) RET(1);
+    if (IS("_GetMainEventQueue")) RET(1);
+    /* The bridge pumps Cocoa events itself, so nothing is ever parked in a
+       Carbon queue for the game to find or remove. */
+    if (IS("_IsEventInQueue")) RET(0);
+    if (IS("_RemoveEventFromQueue")) RET(0);
+    if (IS("_EnableSecureEventInput") || IS("_DisableSecureEventInput")) RET(0);
+    if (IS("_SetKeyboardFocus")) RET(0);
+    if (IS("_GetControlData")) { OUT(5, 0); RET(-30580); } /* errDataNotSupported */
+    /* System UI mode (hiding the menu bar for full screen) is the presentation
+       policy this bridge decides for itself. */
+    if (IS("_SetSystemUIMode") || IS("_GetSystemUIMode")) RET(0);
+    /* NSApplicationLoad exists to bring up NSApp for a Carbon app; the bridge
+       has already done that. */
+    if (IS("_NSApplicationLoad")) { pg_start_app(); RET(1); }
+    /* Carbon's standard alert, over NSAlert.  The parameter block is only
+       ever the defaults here, so the text and the three buttons are what
+       matter. */
+    if (IS("_GetStandardAlertDefaultParams")) {
+        if (a[0]) memset(P(0), 0, 32);
+        RET(0);
+    }
+    if (IS("_CreateStandardAlert")) {
+        NSAlert *alert = [[NSAlert alloc] init];
+        [alert setMessageText:pg_cf_object(a[1]) ?: @""];
+        [alert setInformativeText:pg_cf_object(a[2]) ?: @""];
+        OUT(4, pg_cf_register((CFTypeRef)alert));
+        RET(0);
+    }
+    if (IS("_RunStandardAlert")) {
+        NSAlert *alert = (NSAlert *)pg_cf_object(a[0]);
+        NSModalResponse response = NSAlertFirstButtonReturn;
+        if ([alert isKindOfClass:[NSAlert class]]) {
+            pg_start_app();
+            response = [alert runModal];
+        }
+        OUT(2, response == NSAlertSecondButtonReturn ? 2 :
+               response == NSAlertThirdButtonReturn ? 3 : 1);
+        pg_cf_release(a[0]);
+        RET(0);
+    }
+    /* IOKit handles the bridge never created. */
+    if (IS("_IONotificationPortDestroy") || IS("_IOServiceClose")) RET(0);
     return 0;
 #undef RET
 #undef OUT

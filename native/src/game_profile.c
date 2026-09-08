@@ -64,6 +64,22 @@ static const struct lp32_game_profile bejeweled2_profile = {
     .main_address = 0,
 };
 
+/* Plants vs. Zombies 1.0.41 (PopCap, 2009; original i386 Mac executable).
+   The same "Sexy" engine generation as Bejeweled 3 -- Cocoa, AGL, BASS and
+   libsteam_api -- and, like the Peggle titles, its Steam copy is wrapped in
+   Valve's Mach-O DRM, so tools/build.py unwraps it first.  main is derived
+   from the crt start stub. */
+static const struct lp32_game_profile plantsvszombies_profile = {
+    .title = LP32_TITLE_PLANTSVSZOMBIES,
+    .name = "PlantsVsZombies",
+    .display_name = "Plants vs. Zombies",
+    .log_directory = "PlantsVsZombies",
+    .image_file = "PlantsVsZombies.image",
+    .entry_eip = 0x0000a710,
+    .image_end = 0x003fd000,
+    .main_address = 0,
+};
+
 /* Chuzzle Deluxe 1.0.0 (Raptisoft for PopCap, 2005; original i386 Mac
    executable).  Not a "Sexy" engine title at all: it is an SDL 1.2 game whose
    window, input, threads and image loading come from the SDL and SDL_image
@@ -96,6 +112,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &bejeweled3_profile,
     &bejeweled2_profile,
     &chuzzle_profile,
+    &plantsvszombies_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -125,6 +142,9 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
     if (strcasecmp(name, "Bejeweled2") == 0 ||
         strcasecmp(name, "Bejeweled 2") == 0 ||
         strcasecmp(name, "Bejeweled 2 Deluxe") == 0) return &bejeweled2_profile;
+    if (strcasecmp(name, "PlantsVsZombies") == 0 ||
+        strcasecmp(name, "Plants vs. Zombies") == 0 ||
+        strcasecmp(name, "PvZ") == 0) return &plantsvszombies_profile;
     if (strcasecmp(name, "Chuzzle") == 0 ||
         strcasecmp(name, "Chuzzle Deluxe") == 0) return &chuzzle_profile;
     return NULL;

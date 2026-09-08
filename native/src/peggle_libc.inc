@@ -35,7 +35,9 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_mmap")) {
         static uint32_t cursor=0x71000000;size_t len=(a[1]+4095)&~4095u;uint32_t addr=__atomic_fetch_add(&cursor,(uint32_t)len,__ATOMIC_RELAXED);
         if(addr+len>0x7b000000)RET(UINT32_MAX);
-        void *p=mmap((void *)(uintptr_t)addr,len,a[2],a[3]|MAP_FIXED,a[4],(uint64_t)a[5]|((uint64_t)a[6]<<32));RET(p==MAP_FAILED?UINT32_MAX:(uint32_t)(uintptr_t)p);
+        void *p=mmap((void *)(uintptr_t)addr,len,a[2],a[3]|MAP_FIXED,a[4],(uint64_t)a[5]|((uint64_t)a[6]<<32));
+        if(getenv("LP32_TRACE_MMAP"))fprintf(stderr,"compat32: mmap len=%zu prot=%x flags=%x fd=%d off=%u -> 0x%08x\n",len,a[2],a[3],(int)a[4],a[5],p==MAP_FAILED?0:(uint32_t)(uintptr_t)p);
+        RET(p==MAP_FAILED?UINT32_MAX:(uint32_t)(uintptr_t)p);
     }
     if(IS("_munmap"))RET((uint32_t)munmap((void *)(uintptr_t)a[0],a[1]));
     if(IS("_time")){int32_t t=(int32_t)time(NULL);if(a[0])*(int32_t *)(uintptr_t)a[0]=t;RET((uint32_t)t);}
@@ -52,6 +54,8 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_strtoull")||IS("_strtouq")){char *end;unsigned long long v=strtoull((const char *)(uintptr_t)a[0],&end,(int)a[2]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)(uintptr_t)end;RET((uint64_t)v);}
     if(IS("_atoll")||IS("_atoq"))RET((uint64_t)atoll((const char *)(uintptr_t)a[0]));
     if(IS("_strcasecmp"))RET((uint32_t)strcasecmp((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
+    if(IS("_strspn"))RET((uint32_t)strspn((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
+    if(IS("_strcspn"))RET((uint32_t)strcspn((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
     if(IS("_strcasestr"))RET((uint32_t)(uintptr_t)strcasestr((const char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1]));
     if(IS("_strlcpy"))RET((uint32_t)strlcpy((char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]));
     if(IS("_strlcat"))RET((uint32_t)strlcat((char *)(uintptr_t)a[0],(const char *)(uintptr_t)a[1],a[2]));

@@ -5,6 +5,10 @@
 #include "steam_unwrap.h"
 #include "guest_profiler.h"
 
+#include <dlfcn.h>
+#include <execinfo.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -505,6 +509,45 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             context->uc_mcontext->__ss.__rdi,
             context->uc_mcontext->__ss.__rbp,
             context->uc_mcontext->__ss.__r14);
+    /* A fault in 64-bit mode is host code -- the bridge, or a system library
+       it called -- so name the image and symbol it stopped in; the guest
+       registers alone rarely say which. */
+    /* What the faulting address belongs to: a guest segment, the bridge, a
+       mapping the game made, or nothing at all. */
+    {
+        mach_vm_address_t region = (mach_vm_address_t)(uintptr_t)info->si_addr;
+        mach_vm_size_t region_size = 0;
+        vm_region_basic_info_data_64_t region_info;
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &region, &region_size,
+                           VM_REGION_BASIC_INFO_64,
+                           (vm_region_info_t)&region_info, &count,
+                           &object) == KERN_SUCCESS) {
+            GUEST_DIAGNOSTIC("compat32: crash address is %s region "
+                             "0x%llx-0x%llx prot=%x/%x\n",
+                             region > (mach_vm_address_t)(uintptr_t)info->si_addr ?
+                                 "before the next" : "inside",
+                             (unsigned long long)region,
+                             (unsigned long long)(region + region_size),
+                             region_info.protection, region_info.max_protection);
+        } else {
+            GUEST_DIAGNOSTIC("compat32: crash address is above every mapping\n");
+        }
+    }
+    extern uint16_t lp32_cs32;
+    if (context->uc_mcontext->__ss.__cs != lp32_cs32) {
+        void *frames[24];
+        int frame_count = backtrace(frames, 24);
+        for (int frame = 0; frame < frame_count; ++frame) {
+            Dl_info info64;
+            if (!dladdr(frames[frame], &info64) || !info64.dli_fname) continue;
+            const char *image = strrchr(info64.dli_fname, '/');
+            GUEST_DIAGNOSTIC("compat32: crash host frame %2d %-28s %s\n", frame,
+                             image ? image + 1 : info64.dli_fname,
+                             info64.dli_sname ? info64.dli_sname : "?");
+        }
+    }
     if (rsp >= UINT32_C(0x1000) && rsp < UINT32_C(0x80000000)) {
         const uint32_t *words = (const void *)(uintptr_t)rsp;
         for (unsigned index = 0; index < 16; ++index) {

@@ -18,6 +18,7 @@ enum lp32_title {
     LP32_TITLE_BEJEWELED3,
     LP32_TITLE_BEJEWELED2,
     LP32_TITLE_CHUZZLE,
+    LP32_TITLE_PLANTSVSZOMBIES,
 };
 
 /* All shipping titles are the same PopCap "Sexy" engine, so the compatibility
@@ -29,7 +30,8 @@ static inline int lp32_title_is_peggle_engine(enum lp32_title title)
            title == LP32_TITLE_PEGGLE_NIGHTS ||
            title == LP32_TITLE_BEJEWELED3 ||
            title == LP32_TITLE_BEJEWELED2 ||
-           title == LP32_TITLE_CHUZZLE;
+           title == LP32_TITLE_CHUZZLE ||
+           title == LP32_TITLE_PLANTSVSZOMBIES;
 }
 
 /* Splash-dismiss repeat latch (see game_loader.c). */

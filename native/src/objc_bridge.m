@@ -6933,13 +6933,15 @@ static int objc_bridge32_dispatch_body(const char *import_name,
            guest pool a no-op sentinel instead. */
         enum { kAutoreleasePoolSentinel = 0xFACE9001u };
         if (arguments[0] == kAutoreleasePoolSentinel) {
-            *result = (selector_name && strcmp(selector_name, "init") == 0)
+            *result = (selector_name && (strcmp(selector_name, "init") == 0 ||
+                                         strcmp(selector_name, "retain") == 0))
                 ? kAutoreleasePoolSentinel : 0;
             return 1;
         }
         if (selector_name &&
             (strcmp(selector_name, "alloc") == 0 ||
-             strcmp(selector_name, "allocWithZone:") == 0) &&
+             strcmp(selector_name, "allocWithZone:") == 0 ||
+             strcmp(selector_name, "new") == 0) &&
             object_for_receiver(arguments[0]) == (id)objc_getClass("NSAutoreleasePool")) {
             *result = kAutoreleasePoolSentinel;
             return 1;

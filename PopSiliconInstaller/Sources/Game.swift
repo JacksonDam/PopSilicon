@@ -86,7 +86,19 @@ struct Game: Identifiable, Hashable {
         resourceMarker: "Data/gamedata.cfg"
     )
 
-    static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2, .chuzzle]
+    static let plantsVsZombies = Game(
+        id: "com.popcap.plantsvszombies",
+        displayName: "Plants vs. Zombies",
+        steamFolder: "Plants Vs Zombies",
+        steamAppName: "Plants vs. Zombies.app",
+        executableName: "PlantsvsZombies",
+        outputAppName: "PlantsVsZombies.app",
+        imageFileName: "PlantsVsZombies.image",
+        resourceMarker: "main.pak"
+    )
+
+    static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2, .chuzzle,
+                              .plantsVsZombies]
 
     /// The game whose original bundle identifier matches this dropped app.
     static func matching(bundleIdentifier: String?) -> Game? {
