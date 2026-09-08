@@ -197,6 +197,10 @@ static int inspect_commands(const struct source_file *source,
                     max_address = segment->vmaddr + segment->vmsize;
                 }
                 ++segment_count;
+                if (strncmp(segment->segname, "__STEAM", 16) == 0) {
+                    image->steam_stub_start = segment->vmaddr;
+                    image->steam_stub_end = segment->vmaddr + segment->vmsize;
+                }
             }
 
             const struct section *section = (const void *)(segment + 1);

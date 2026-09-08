@@ -738,6 +738,19 @@ int main(int argc, char **argv)
         (const void *)(uintptr_t)image.initializer_address;
     int initialization_trapped = 0;
     for (uint32_t index = 0; index < image.initializer_count; ++index) {
+        /* Steam's ownership stub lives in its own __STEAM segment and runs as
+           a module initializer.  It reads the Mac OS X 10.4 dyld's private
+           globals through a hardcoded address (0x8fe00010), which no longer
+           exists, and it only gates code the wrapper left in the clear, so
+           skip it and let the game's own initializers run. */
+        if (image.steam_stub_end &&
+            initializers[index] >= image.steam_stub_start &&
+            initializers[index] < image.steam_stub_end) {
+            printf("initializer[%" PRIu32 "]: 0x%08" PRIx32
+                   " skipped (Steam ownership stub)\n",
+                   index, initializers[index]);
+            continue;
+        }
         if (index == 0 || index + 1 == image.initializer_count ||
             (index % 32) == 0) {
             printf("initializer[%" PRIu32 "]: 0x%08" PRIx32 "\n",

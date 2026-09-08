@@ -48,6 +48,22 @@ static const struct lp32_game_profile bejeweled3_profile = {
     .main_address = 0x00194a10,
 };
 
+/* Bejeweled 2 Deluxe 1.0.0 (PopCap, 2004; original i386 Mac executable).  The
+   earliest "Sexy" engine of the four: a pure Carbon/AGL title (no Cocoa) whose
+   music comes from BASSMOD rather than BASS.  The Steam copy carries a __STEAM
+   segment but leaves __TEXT in the clear, so no unwrap step is needed.  main is
+   derived from the crt start stub. */
+static const struct lp32_game_profile bejeweled2_profile = {
+    .title = LP32_TITLE_BEJEWELED2,
+    .name = "Bejeweled2",
+    .display_name = "Bejeweled 2 Deluxe",
+    .log_directory = "Bejeweled2",
+    .image_file = "Bejeweled2.image",
+    .entry_eip = 0x000021dc,
+    .image_end = 0x002d8338,
+    .main_address = 0,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -61,6 +77,7 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &peggle_profile,
     &peggle_nights_profile,
     &bejeweled3_profile,
+    &bejeweled2_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -87,6 +104,9 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
         strcasecmp(name, "Peggle Nights") == 0) return &peggle_nights_profile;
     if (strcasecmp(name, "Bejeweled3") == 0 ||
         strcasecmp(name, "Bejeweled 3") == 0) return &bejeweled3_profile;
+    if (strcasecmp(name, "Bejeweled2") == 0 ||
+        strcasecmp(name, "Bejeweled 2") == 0 ||
+        strcasecmp(name, "Bejeweled 2 Deluxe") == 0) return &bejeweled2_profile;
     return NULL;
 }
 

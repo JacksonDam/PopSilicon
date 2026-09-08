@@ -56,12 +56,68 @@ static void pg_bass_remove_sync(DWORD channel, HSYNC sync)
     pthread_mutex_unlock(&pg_bass_sync_lock);
 }
 
+/* BASSMOD (un4seen's cut-down MOD-only library) over BASS.  Bejeweled 2 ships
+   an i386-only libbassmod.dylib and plays its single Impulse Tracker module
+   through it; the two libraries share module flags, position encoding and
+   activity codes, so each BASSMOD entry point is BASS on the one module the
+   API allows.  BASSMOD has no handles: the module is implicit global state. */
+static HMUSIC pg_bassmod_music;
+static DWORD pg_bassmod_volume = 100;
+
+static void pg_bassmod_apply_volume(void)
+{
+    if (pg_bassmod_music) {
+        BASS_ChannelSetAttribute(pg_bassmod_music, BASS_ATTRIB_VOL,
+                                 (float)pg_bassmod_volume / 100.0f);
+    }
+}
+
+static int peggle_bassmod_dispatch(const char *n, const uint32_t *a, uint64_t *r)
+{
+#define IS(s) (strcmp(n, "_" #s) == 0)
+#define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
+    if (IS(BASSMOD_Init)) RET(BASS_Init((int)a[0], a[1], 0, NULL, NULL));
+    if (IS(BASSMOD_Free)) { pg_bassmod_music = 0; RET(BASS_Free()); }
+    if (IS(BASSMOD_ErrorGetCode)) RET((uint32_t)BASS_ErrorGetCode());
+    if (IS(BASSMOD_SetVolume)) {
+        pg_bassmod_volume = a[0] > 100 ? 100 : a[0];
+        pg_bassmod_apply_volume();
+        RET(1);
+    }
+    if (IS(BASSMOD_MusicLoad)) {
+        if (pg_bassmod_music) BASS_MusicFree(pg_bassmod_music);
+        /* BASSMOD's music flags have the same values as BASS's, so the game's
+           request passes through unchanged. */
+        pg_bassmod_music = BASS_MusicLoad(a[0], (void *)(uintptr_t)a[1],
+                                          a[2], a[3], a[4], 0);
+        pg_bassmod_apply_volume();
+        RET(pg_bassmod_music != 0);
+    }
+    if (IS(BASSMOD_MusicFree)) {
+        if (pg_bassmod_music) BASS_MusicFree(pg_bassmod_music);
+        pg_bassmod_music = 0;
+        RET(0);
+    }
+    /* MusicPlay resumes at the current position: the game sets the song's
+       order with MusicSetPosition first and expects playback to start there. */
+    if (IS(BASSMOD_MusicPlay)) RET(BASS_ChannelPlay(pg_bassmod_music, FALSE));
+    if (IS(BASSMOD_MusicPause)) RET(BASS_ChannelPause(pg_bassmod_music));
+    if (IS(BASSMOD_MusicStop)) RET(BASS_ChannelStop(pg_bassmod_music));
+    if (IS(BASSMOD_MusicSetPosition))
+        RET(BASS_ChannelSetPosition(pg_bassmod_music, a[0], BASS_POS_MUSIC_ORDER));
+    if (IS(BASSMOD_MusicIsActive)) RET(BASS_ChannelIsActive(pg_bassmod_music));
+    return 0;
+#undef RET
+#undef IS
+}
+
 static int peggle_bass_dispatch(const char *n,const uint32_t *a,uint64_t *r)
 {
 #define IS(s) (strcmp(n,"_" #s)==0)
     static int bass_trace=-1;
     if(bass_trace<0)bass_trace=getenv("LP32_TRACE_BASS")!=NULL;
 #define RET(x) do{*r=(uint64_t)(x);if(bass_trace)fprintf(stderr,"compat32: bass %s(%08x,%08x,%08x,%08x,%08x)=%llx err=%d\n",n,a[0],a[1],a[2],a[3],a[4],(unsigned long long)*r,BASS_ErrorGetCode());return 1;}while(0)
+    if(strncmp(n,"_BASSMOD_",9)==0){int handled=peggle_bassmod_dispatch(n,a,r);if(handled&&bass_trace)fprintf(stderr,"compat32: bassmod %s(%08x,%08x,%08x,%08x,%08x)=%llx err=%d\n",n,a[0],a[1],a[2],a[3],a[4],(unsigned long long)*r,BASS_ErrorGetCode());return handled;}
     if(strncmp(n,"_BASS_",6))return 0;
     if(IS(BASS_Init))RET(BASS_Init((int)a[0],a[1],a[2],NULL,NULL));
     if(IS(BASS_SetConfig))RET(BASS_SetConfig(a[0],a[1]));

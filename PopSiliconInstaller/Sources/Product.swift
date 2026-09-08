@@ -19,7 +19,7 @@ enum Product: String, CaseIterable, Identifiable {
     var games: [Game] {
         switch self {
         case .peggleSilicon: return [.deluxe, .nights]
-        case .bejeweledSilicon: return [.bejeweled3]
+        case .bejeweledSilicon: return [.bejeweled3, .bejeweled2]
         }
     }
 

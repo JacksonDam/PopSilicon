@@ -11,6 +11,10 @@ struct Game: Identifiable, Hashable {
     let executableName: String     // Contents/MacOS/<executableName> Steam launches
     let outputAppName: String      // standalone export bundle name
     let imageFileName: String      // SharedSupport/<imageFileName> a PeggleSilicon install stores
+    /// A resource the installed bundle must still carry, relative to
+    /// Contents/Resources.  The Peggle-era titles pack everything into
+    /// main.pak; Bejeweled 2 predates that and ships loose folders.
+    let resourceMarker: String
 
     /// Steam install location for this game, if the folder/app exist.
     var steamInstallationURL: URL? {
@@ -34,7 +38,8 @@ struct Game: Identifiable, Hashable {
         steamAppName: "Peggle Deluxe.app",
         executableName: "Peggle",
         outputAppName: "PeggleSilicon.app",
-        imageFileName: "Peggle.image"
+        imageFileName: "Peggle.image",
+        resourceMarker: "main.pak"
     )
 
     static let nights = Game(
@@ -44,7 +49,8 @@ struct Game: Identifiable, Hashable {
         steamAppName: "Peggle Nights.app",
         executableName: "Peggle Nights",
         outputAppName: "PeggleNights.app",
-        imageFileName: "PeggleNights.image"
+        imageFileName: "PeggleNights.image",
+        resourceMarker: "main.pak"
     )
 
     static let bejeweled3 = Game(
@@ -54,10 +60,22 @@ struct Game: Identifiable, Hashable {
         steamAppName: "Bejeweled 3.app",
         executableName: "Bejeweled3",
         outputAppName: "Bejeweled3.app",
-        imageFileName: "Bejeweled3.image"
+        imageFileName: "Bejeweled3.image",
+        resourceMarker: "main.pak"
     )
 
-    static let all: [Game] = [.deluxe, .nights, .bejeweled3]
+    static let bejeweled2 = Game(
+        id: "com.popcap.bejeweled2.app",
+        displayName: "Bejeweled 2 Deluxe",
+        steamFolder: "Bejeweled 2 Deluxe",
+        steamAppName: "Bejeweled 2 Deluxe.app",
+        executableName: "Bejeweled 2",
+        outputAppName: "Bejeweled2.app",
+        imageFileName: "Bejeweled2.image",
+        resourceMarker: "properties/resources.xml"
+    )
+
+    static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2]
 
     /// The game whose original bundle identifier matches this dropped app.
     static func matching(bundleIdentifier: String?) -> Game? {

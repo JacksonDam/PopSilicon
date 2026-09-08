@@ -15,6 +15,120 @@ static uint32_t pg_string_set(uint32_t obj, const void *src, size_t n, size_t wi
     return obj;
 }
 static struct { uint32_t obj; uint32_t text; } pg_streams[64];
+
+/* std::ifstream/std::fstream over stdio (Bejeweled 2 reads its backdrop list
+   with one).  The guest reaches the stream's sub-objects at fixed offsets it
+   computed at compile time -- the filebuf a few words in, the basic_ios
+   virtual base at the end -- so a stream is matched by the address range its
+   object covers rather than by an exact pointer.  Nothing here needs to know
+   the layout beyond that it fits in kPgFileSpan bytes. */
+enum { kPgFileSpan = 0x240 };
+static struct { uint32_t base; FILE *file; bool eof, fail; } pg_files[16];
+
+static int pg_file_slot(uint32_t address)
+{
+    for (int i = 0; i < 16; ++i) {
+        if (pg_files[i].base && address >= pg_files[i].base &&
+            address < pg_files[i].base + kPgFileSpan) return i;
+    }
+    return -1;
+}
+
+/* libstdc++'s _Ios_Openmode bits: app=1 ate=2 binary=4 in=8 out=16 trunc=32. */
+static const char *pg_file_mode(uint32_t openmode)
+{
+    if (openmode & 1) return (openmode & 8) ? "a+b" : "ab";
+    if ((openmode & 8) && (openmode & 16)) return (openmode & 32) ? "w+b" : "r+b";
+    if (openmode & 16) return "wb";
+    return "rb";
+}
+
+static void pg_file_close(int slot)
+{
+    if (slot < 0) return;
+    if (pg_files[slot].file) fclose(pg_files[slot].file);
+    pg_files[slot].file = NULL;
+    pg_files[slot].base = 0;
+}
+
+static int peggle_file_stream_dispatch(const char *name, const uint32_t *a, uint64_t *out)
+{
+#define PG_RETURN(x) do { *out = (uint64_t)(x); return 1; } while (0)
+    bool file_stream = strstr(name, "basic_ifstream") || strstr(name, "basic_fstream") ||
+                       strstr(name, "basic_ofstream");
+    if (file_stream && (strstr(name, "C1E") || strstr(name, "C2E"))) {
+        int slot = -1;
+        for (int i = 0; i < 16; ++i) if (!pg_files[i].base) { slot = i; break; }
+        if (slot < 0) PG_RETURN(a[0]);
+        /* The (const char*, openmode) form is the only one the games use; the
+           default ctor opens nothing. */
+        const char *path = strstr(name, "EPKc") ? (const char *)(uintptr_t)a[1] : NULL;
+        pg_files[slot].base = a[0];
+        pg_files[slot].eof = pg_files[slot].fail = false;
+        pg_files[slot].file = path ? fopen(path, pg_file_mode(a[2])) : NULL;
+        if (path && !pg_files[slot].file) pg_files[slot].fail = true;
+        PG_RETURN(a[0]);
+    }
+    if (file_stream && (strstr(name, "D1E") || strstr(name, "D2E"))) {
+        pg_file_close(pg_file_slot(a[0]));
+        PG_RETURN(0);
+    }
+    if (file_stream && strstr(name, "5closeEv")) {
+        pg_file_close(pg_file_slot(a[0]));
+        PG_RETURN(0);
+    }
+    /* Below here the call must belong to a live file stream; anything else
+       (a string stream's basic_ios, say) falls through to its own handler. */
+    int slot = pg_file_slot(a[0]);
+    if (slot < 0) return 0;
+    if (strstr(name, "basic_filebuf") && strstr(name, "7is_openEv")) {
+        PG_RETURN(pg_files[slot].file != NULL);
+    }
+    if (strstr(name, "basic_ios") && strstr(name, "3eofEv")) {
+        PG_RETURN(pg_files[slot].eof);
+    }
+    if (strstr(name, "basic_ios") && (strstr(name, "4failEv") || strstr(name, "3badEv"))) {
+        PG_RETURN(pg_files[slot].fail || !pg_files[slot].file);
+    }
+    if (!pg_files[slot].file) return 0;
+    FILE *file = pg_files[slot].file;
+    /* istream::getline(char*, streamsize): up to n-1 characters, the newline
+       consumed but not stored. */
+    if (strcmp(name, "__ZNSi7getlineEPci") == 0) {
+        char *buffer = (void *)(uintptr_t)a[1];
+        int32_t limit = (int32_t)a[2];
+        if (!buffer || limit <= 0) PG_RETURN(a[0]);
+        if (!fgets(buffer, limit, file)) {
+            buffer[0] = '\0';
+            pg_files[slot].eof = pg_files[slot].fail = true;
+            PG_RETURN(a[0]);
+        }
+        size_t length = strlen(buffer);
+        if (length && buffer[length - 1] == '\n') buffer[length - 1] = '\0';
+        if (feof(file)) pg_files[slot].eof = true;
+        PG_RETURN(a[0]);
+    }
+    if (strcmp(name, "__ZNSi4readEPci") == 0) {
+        size_t want = (size_t)(int32_t)a[2];
+        size_t got = a[1] && want ? fread((void *)(uintptr_t)a[1], 1, want, file) : 0;
+        if (got < want) pg_files[slot].eof = pg_files[slot].fail = true;
+        PG_RETURN(a[0]);
+    }
+    if (strcmp(name, "__ZNSirsERi") == 0) {
+        int value = 0;
+        if (fscanf(file, "%d", &value) != 1) pg_files[slot].eof = pg_files[slot].fail = true;
+        else if (a[1]) *(int32_t *)(uintptr_t)a[1] = value;
+        PG_RETURN(a[0]);
+    }
+    if (strcmp(name, "__ZStrsIcSt11char_traitsIcEERSt13basic_istreamIT_T0_ES6_RS3_") == 0) {
+        int value = fgetc(file);
+        if (value == EOF) pg_files[slot].eof = pg_files[slot].fail = true;
+        else if (a[1]) *(char *)(uintptr_t)a[1] = (char)value;
+        PG_RETURN(a[0]);
+    }
+    return 0;
+#undef PG_RETURN
+}
 static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *out)
 {
 #define PG_RETURN(x) do { *out = (uint64_t)(x); return 1; } while (0)
@@ -55,6 +169,45 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         }
         PG_RETURN(0);
     }
+    /* std::__detail::_List_node_base::hook/unhook: the same pointer surgery
+       on the guest's own nodes as ::transfer above (Bejeweled 2's lists). */
+    if (strcmp(name,"__ZNSt15_List_node_base4hookEPS_")==0) {
+        uint32_t self=a[0], position=a[1];
+        uint32_t previous=*(uint32_t *)(uintptr_t)(position+4);
+        *(uint32_t *)(uintptr_t)(self+0)=position;
+        *(uint32_t *)(uintptr_t)(self+4)=previous;
+        *(uint32_t *)(uintptr_t)(previous+0)=self;
+        *(uint32_t *)(uintptr_t)(position+4)=self;
+        PG_RETURN(0);
+    }
+    if (strcmp(name,"__ZNSt15_List_node_base6unhookEv")==0) {
+        uint32_t self=a[0];
+        uint32_t next=*(uint32_t *)(uintptr_t)(self+0);
+        uint32_t previous=*(uint32_t *)(uintptr_t)(self+4);
+        *(uint32_t *)(uintptr_t)(previous+0)=next;
+        *(uint32_t *)(uintptr_t)(next+4)=previous;
+        PG_RETURN(0);
+    }
+    /* operator+(string): all three forms return the new string through the
+       hidden sret pointer in a[0]. */
+    static const char plus[] = "__ZStplIcSt11char_traitsIcESaIcEESbIT_T0_T1_E";
+    if (strncmp(name,plus,sizeof(plus)-1)==0) {
+        const char *form=name+sizeof(plus)-1;
+        const char *left; size_t left_length; char single;
+        if (strncmp(form,"PK",2)==0) { left=(void *)(uintptr_t)a[1]; left_length=strlen(left); }
+        else if (strncmp(form,"RK",2)==0) { left=guest_string_data(a[1]); left_length=guest_string_length(a[1]); }
+        else { single=(char)a[1]; left=&single; left_length=1; }
+        const char *right=guest_string_data(a[2]);
+        size_t right_length=guest_string_length(a[2]);
+        char *joined=malloc(left_length+right_length+1);
+        memcpy(joined,left,left_length);
+        memcpy(joined+left_length,right,right_length);
+        compat_runtime32_struct_return();
+        pg_string_set(a[0],joined,left_length+right_length,1,true);
+        free(joined);
+        PG_RETURN(a[0]);
+    }
+    if (peggle_file_stream_dispatch(name, a, out)) return 1;
     if (peggle_tree_dispatch(name, a, out)) return 1;
     if (peggle_cxx_dispatch(name, a, out)) return 1;
     if (strncmp(name,"__ZNSaI",7)==0) PG_RETURN(0); /* empty allocator */
@@ -92,8 +245,10 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
         /* str(const string&) setter: this is a[0], the replacement string a[1]. */
         if(strstr(name,"3strERK")){int s2=-1;for(int i=0;i<64;i++)if(pg_streams[i].obj && a[0]>=pg_streams[i].obj && a[0]<pg_streams[i].obj+32){s2=i;break;}if(s2>=0)pg_string_set(pg_streams[s2].text,guest_string_data(a[1]),guest_string_length(a[1]),1,false);PG_RETURN(0);}
     }
-    if (strcmp(name,"__ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc")==0 || strcmp(name,"__ZNSolsEi")==0) {
+    if (strcmp(name,"__ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_PKc")==0 || strcmp(name,"__ZNSolsEi")==0 ||
+        strcmp(name,"__ZStlsISt11char_traitsIcEERSt13basic_ostreamIcT_ES5_c")==0) {
         char number[64];const char *value=(void *)(uintptr_t)a[1];if(strcmp(name,"__ZNSolsEi")==0){snprintf(number,sizeof(number),"%d",(int)a[1]);value=number;}
+        else if(name[strlen(name)-1]=='c'&&name[strlen(name)-2]=='_'){number[0]=(char)a[1];number[1]='\0';value=number;}
         for(int i=0;i<64;i++)if(pg_streams[i].obj && a[0]>=pg_streams[i].obj && a[0]<pg_streams[i].obj+32){uint32_t obj=pg_streams[i].text;size_t n=guest_string_length(obj),v=strlen(value);char *b=malloc(n+v+1);memcpy(b,guest_string_data(obj),n);memcpy(b+n,value,v+1);pg_string_set(obj,b,n+v,1,false);free(b);PG_RETURN(a[0]);}
         fputs(value,stdout);PG_RETURN(a[0]);
     }

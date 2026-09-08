@@ -8,6 +8,7 @@
 
 #define GL_SILENCE_DEPRECATION 1
 #import <AppKit/AppKit.h>
+#import <AudioToolbox/AudioToolbox.h>
 #import <Carbon/Carbon.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>

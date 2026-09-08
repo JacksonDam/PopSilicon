@@ -140,7 +140,8 @@ static int peggle_cxx_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     }
     if (IS("___cxa_rethrow") || IS("___cxa_call_unexpected") || IS("__Unwind_Resume") ||
         IS("__ZSt9terminatev") || IS("__ZSt17__throw_bad_allocv") ||
-        IS("__ZSt20__throw_length_errorPKc") || IS("___cxa_pure_virtual") || IS("_longjmp")) {
+        IS("__ZSt20__throw_length_errorPKc") || IS("___cxa_pure_virtual") ||
+        IS("_longjmp") || IS("_abort")) {
         char reason[160];
         snprintf(reason, sizeof(reason), "unsupported C++ runtime call %s", n);
         pg_escape_guest(reason);

@@ -44,6 +44,12 @@ struct macho_image32 {
     uint32_t cstring_end;
     uint32_t cfstring_start;
     uint32_t cfstring_end;
+    /* Steam's ownership stub (a __STEAM segment holding its own module
+       initializer).  It reads the 10.4 dyld's private globals at a fixed
+       address, so it cannot run here; the loader skips initializers inside
+       this range.  Zero when the image has no such segment. */
+    uint32_t steam_stub_start;
+    uint32_t steam_stub_end;
     uint32_t import_count;
     struct macho_import32 imports[MACHO_IMAGE32_MAX_IMPORTS];
     uint32_t relocation_count;

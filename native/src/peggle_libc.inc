@@ -131,6 +131,13 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_isspace"))RET(isspace(a[0]));
     if(IS("_isalnum"))RET(isalnum(a[0]));
     if(IS("_isxdigit"))RET(isxdigit(a[0]));
+    if(IS("_isprint"))RET(isprint(a[0]));
+    if(IS("_ispunct"))RET(ispunct(a[0]));
+    if(IS("_puts")){puts((const char *)(uintptr_t)a[0]);RET(0);}
+    /* syslog is only ever used for diagnostics here; mirror it to stderr so a
+       message the game logs still shows up in the session log. */
+    if(IS("_openlog")||IS("_closelog"))RET(0);
+    if(IS("_syslog")){fprintf(stderr,"compat32: syslog(%d) %s\n",(int)a[0],(const char *)(uintptr_t)a[1]);RET(0);}
     if(IS("_atoi"))RET(atoi((void *)(uintptr_t)a[0]));
     if(IS("_atof"))RET(return_guest_double(atof((void *)(uintptr_t)a[0])));
     if(IS("_atol"))RET((uint32_t)atol((void *)(uintptr_t)a[0]));
@@ -145,6 +152,7 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_lrint"))RET((uint32_t)lrint(guest_double(a)));
     if(IS("_ldexp"))RET(return_guest_double(ldexp(guest_double(a),(int)a[2])));
     if(IS("_frexp"))RET(return_guest_double(frexp(guest_double(a),(void *)(uintptr_t)a[2])));
+    if(IS("_frexpf"))RET(return_guest_float(frexpf(guest_float(a[0]),(void *)(uintptr_t)a[1])));
     if(IS("_acosf"))RET(return_guest_float(acosf(guest_float(a[0]))));
     if(IS("_asinf"))RET(return_guest_float(asinf(guest_float(a[0]))));
     if(IS("_atanf"))RET(return_guest_float(atanf(guest_float(a[0]))));

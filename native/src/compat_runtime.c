@@ -4488,6 +4488,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         import_is(name, "_pthread_attr_init") ||
         import_is(name, "_pthread_attr_destroy") ||
         import_is(name, "_pthread_attr_setstacksize") ||
+        import_is(name, "_pthread_attr_setschedparam") ||
+        import_is(name, "_pthread_attr_setschedpolicy") ||
+        import_is(name, "_pthread_attr_setinheritsched") ||
         import_is(name, "_pthread_setschedparam")) {
         return 0;
     }
@@ -4602,6 +4605,20 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             deadline.tv_nsec = (long)guest_time[1];
         }
         return (uint32_t)pthread_cond_timedwait(condition, mutex, &deadline);
+    }
+    /* The relative form takes a wait, not a deadline (Bejeweled 2's FMOD
+       mixer waits on it); turn it into the absolute deadline the host wants. */
+    if (import_is(name, "_pthread_cond_timedwait_relative_np")) {
+        pthread_cond_t *condition = host_cond_for_guest(arguments[0], true);
+        pthread_mutex_t *mutex = host_mutex_for_guest(arguments[1], false);
+        if (!condition || !mutex) return (uint32_t)EINVAL;
+        const int32_t *guest_time = (const void *)(uintptr_t)arguments[2];
+        struct timespec wait = {0, 0};
+        if (guest_time) {
+            wait.tv_sec = (time_t)guest_time[0];
+            wait.tv_nsec = (long)guest_time[1];
+        }
+        return (uint32_t)pthread_cond_timedwait_relative_np(condition, mutex, &wait);
     }
     if (import_is(name, "_pthread_key_create")) {
         uint32_t *key = (void *)(uintptr_t)arguments[0];

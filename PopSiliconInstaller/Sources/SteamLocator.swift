@@ -21,7 +21,7 @@ enum SteamLocator {
     static func state(of installation: URL, game: Game) -> InstallationState {
         let contents = installation.appendingPathComponent("Contents")
         let executable = contents.appendingPathComponent("MacOS/\(game.executableName)")
-        let resources = contents.appendingPathComponent("Resources/main.pak")
+        let resources = contents.appendingPathComponent("Resources/\(game.resourceMarker)")
         let sharedImage = contents.appendingPathComponent("SharedSupport/\(game.imageFileName)")
 
         guard FileManager.default.fileExists(atPath: executable.path),
