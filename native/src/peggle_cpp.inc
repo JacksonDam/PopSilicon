@@ -1,9 +1,47 @@
 #include <wchar.h>
 #include "peggle_tree.inc"
 #include "peggle_cxx.inc"
+/* Which bridged operation is currently running, so a string probe can name
+   the culprit.  Diagnostic only; costs one store per dispatch. */
+static const char *pg_current_op = "?";
+
+/* LP32_DEBUG_STRINGS=<text>: report every string whose new value contains
+   <text>, naming the operation that wrote it.  A corrupted accumulator is
+   otherwise invisible -- the guest never prints it until it fails a
+   comparison much later, by which point the operation that spoiled it is
+   long gone. */
+static void pg_string_watch(uint32_t obj, const void *src, size_t n, size_t width)
+{
+    static int enabled = -1;
+    static const char *prefix;
+    static size_t prefix_length;
+    if (enabled < 0) {
+        prefix = getenv("LP32_DEBUG_STRINGS");
+        enabled = prefix != NULL;
+        prefix_length = prefix ? strlen(prefix) : 0;
+    }
+    if (!enabled || !src || n < prefix_length) return;
+    /* Flatten to low bytes so one probe covers both string and wstring; the
+       text being hunted is ASCII either way. */
+    size_t shown = n > 160 ? 160 : n;
+    char flat[161];
+    for (size_t i = 0; i < shown; ++i) {
+        unsigned char byte = ((const unsigned char *)src)[i * width];
+        flat[i] = (byte >= 0x20 && byte < 0x7f) ? (char)byte : '.';
+    }
+    flat[shown] = 0;
+    bool hit = false;
+    for (size_t i = 0; !hit && i + prefix_length <= shown; ++i)
+        hit = memcmp(flat + i, prefix, prefix_length) == 0;
+    if (!hit) return;
+    fprintf(stderr, "compat32: string %08" PRIx32 " len=%zu w=%zu op=%s value='%s'\n",
+            obj, n, width, pg_current_op, flat);
+}
+
 /* GCC 4 i386 COW string ABI used by PopCap's Mac framework. */
 static uint32_t pg_string_set(uint32_t obj, const void *src, size_t n, size_t width, bool init)
 {
+    pg_string_watch(obj, src, n, width);
     uint32_t old = init ? 0 : *(uint32_t *)(uintptr_t)obj;
     uint32_t rep = guest_allocate_at(12 + (n + 1) * width, true, kGuestHeapStringSite);
     if (!rep) return 0;
@@ -14,6 +52,23 @@ static uint32_t pg_string_set(uint32_t obj, const void *src, size_t n, size_t wi
     if (old >= 12) guest_string_dispose_rep(old - 12);
     return obj;
 }
+/* True when a mangled member name carries a second __normal_iterator, i.e.
+   names a range.  The second one is always a substitution back reference
+   ("S<index>_") sitting immediately after the "EE" that closes the first
+   iterator's template arguments, whatever the index happens to be. */
+static bool pg_iterator_range(const char *op)
+{
+    const char *iterator = strstr(op, "normal_iterator");
+    if (!iterator) return false;
+    const char *close = strstr(iterator, "EE");
+    if (!close) return false;
+    const char *cursor = close + 2;
+    if (*cursor++ != 'S') return false;
+    while ((*cursor >= '0' && *cursor <= '9') ||
+           (*cursor >= 'A' && *cursor <= 'Z')) ++cursor;
+    return *cursor == '_';
+}
+
 static struct { uint32_t obj; uint32_t text; } pg_streams[64];
 
 /* std::ifstream/std::fstream over stdio (Bejeweled 2 reads its backdrop list
@@ -137,6 +192,7 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
     static int trace_cpp = -1;
     if (trace_cpp < 0) trace_cpp = getenv("LP32_TRACE_CPP") ? 1 : 0;
     if (trace_cpp) { fprintf(stderr, "compat32: cpp %s a0=%08x a1=%08x a2=%08x\n", name, a[0], a[1], a[2]); }
+    pg_current_op = name;
     /* std::copy(reverse_iterator first, reverse_iterator last, wchar_t* dest):
        EncodingParser::PutString copies a wstring in reverse into a vector<wchar_t>.
        The iterators (single "current" pointers) are passed by address; operator*
@@ -354,8 +410,11 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
            const char*) read as the iterator form takes the length from a stack
            word past the arguments and copies gigabytes.  The iterator forms
            are the ones whose mangled parameters name __normal_iterator; among
-           those, only the ones carrying a second iterator ("EES2_") have a
-           range to remove. */
+           those, only the ones carrying a second iterator have a range to
+           remove, and that second iterator is a substitution back reference
+           whose index depends on how many types the mangling already
+           substituted -- S2_ for std::string but S6_ for std::wstring -- so
+           it has to be matched by shape rather than by number. */
         if (strncmp(op,"5eraseE",7)==0 || strncmp(op,"7replaceE",9)==0 ||
             strncmp(op,"6insertE",8)==0) {
             bool iterator=strstr(op,"normal_iterator")!=NULL;
@@ -365,17 +424,17 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
             if (iterator) {
                 uint32_t data=*(uint32_t *)(uintptr_t)obj;
                 pos=a[1]>data?(a[1]-data)/w:0;
-                len=strstr(op,"EES2_")?(a[2]>a[1]?(a[2]-a[1])/w:0):(insert?0:1);
+                len=pg_iterator_range(op)?(a[2]>a[1]?(a[2]-a[1])/w:0):(insert?0:1);
             } else { pos=a[1]; len=a[2]; }
             if(pos>n)pos=n;
             if(len>n-pos)len=n-pos;
             /* The replacement: a pointer range for the iterator forms, a C
                string or another string for the (pos, count) forms, and one
                character for insert. */
-            const char *source=NULL;size_t extra=0;char single=0;
-            if(insert){single=(char)a[2];source=&single;extra=1;}
+            const char *source=NULL;size_t extra=0;char single[4]={0,0,0,0};
+            if(insert){uint32_t c=a[2];memcpy(single,&c,w<4?w:4);source=single;extra=1;}
             else if(replace&&iterator){source=(const void *)(uintptr_t)a[3];extra=a[4]>a[3]?(a[4]-a[3])/w:0;}
-            else if(replace&&strstr(op,"PKc")){source=(const void *)(uintptr_t)a[3];extra=source?strlen(source):0;}
+            else if(replace&&(strstr(op,"PKc")||strstr(op,"PKw"))){source=(const void *)(uintptr_t)a[3];extra=source?(wide?wcslen((const wchar_t *)(const void *)source):strlen(source)):0;}
             else if(replace){source=guest_string_data(a[3]);extra=guest_string_length(a[3]);}
             char *buf=malloc((n-len+extra+1)*w);
             memcpy(buf,s,pos*w);
