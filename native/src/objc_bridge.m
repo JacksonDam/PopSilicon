@@ -1327,29 +1327,9 @@ static void trace_guest_display_selection(void)
     }
 }
 
-/*
- * Frame pacing.
- *
- * The game asks for a CGL swap interval of 1 (pcconfig VerticalSync=1).  On a
- * double-buffered context that quantises presentation to whole refresh
- * periods: a 13 ms frame costs 16.7 ms and an 18 ms frame costs 33 ms, so a
- * scene hovering around the refresh budget alternates between 60 and 30 fps
- * and reads as constant frame drops.  The window server composites the
- * window at the display's refresh anyway, so the bridge runs the context
- * with swap interval 0 and paces presentation itself.  Frames then present
- * as soon as they are ready, and a slow frame costs only its own time.
- *
- * The target is the display's refresh rate capped at 60.  The engine's
- * simulation is tied to the frame rate (the Windows build is documented to
- * break puzzles and physics above 60), so the pacer never runs the game
- * faster than that by default even on a 120 Hz panel.
- * LP32_HONOR_SWAP_INTERVAL keeps the game's setting; LP32_MAX_FPS=<n>
- * overrides the pacing target (0 = uncapped, at the player's own risk).
- */
-enum { kFramePacerDefaultCap = 60 };
-/* Pacing is on from the first frame: Clone Wars ships without a pcconfig
-   VerticalSync entry, asks for swap interval 0, and would otherwise run its
-   frame-rate-bound simulation at 1000+ fps on this hardware. */
+/* The bridge owns the swap interval from the first frame, so a title that
+   ships without a VerticalSync setting and asks for interval 0 still presents
+   through the pacer rather than running free at the driver's mercy. */
 static bool frame_pacer_enabled = true;
 static int frame_pacer_requested_interval;
 
@@ -1380,18 +1360,13 @@ static double frame_pacer_target_fps(NSWindow *window)
         override_fps = text ? (atoi(text) > 0 ? atoi(text) : 0) : -2;
     }
     if (override_fps >= 0) return override_fps;
-
-    NSScreen *screen = [window screen];
-    if (!screen) screen = [NSScreen mainScreen];
-    if (@available(macOS 12.0, *)) {
-        NSInteger maximum = screen ? [screen maximumFramesPerSecond] : 0;
-        if (maximum > 0 && maximum < kFramePacerDefaultCap) return (double)maximum;
-    }
-    return (double)kFramePacerDefaultCap;
+    (void)window;
+    return 0.0;
 }
 
 /*
- * Only reached with LP32_MAX_FPS at or above 100 (the default cap is 60).
+ * Only reached with LP32_MAX_FPS at or above 100; without it the pacer has no
+ * target and never waits.
  * On a 120 Hz display a cap of 120 is only smooth if the game reaches it.
  * Gameplay frames take 8-15 ms of CPU here, so at 120 the pacer never
  * waits and every frame lands at a different time, which reads as constant
@@ -2919,8 +2894,9 @@ static NSMutableArray *legacy_modes_for_display(CGDirectDisplayID display)
 
     /* The legacy API always listed the active mode.  On Retina displays the
        active (scaled) mode is usually absent from CGDisplayCopyAllDisplayModes
-       without the duplicate-low-resolution option, and Clone Wars discards
-       every mode larger than the active one, so make sure it is present. */
+       without the duplicate-low-resolution option, and a game that discards
+       every mode larger than the active one is then left with nothing, so
+       make sure it is present. */
     CGDisplayModeRef current = CGDisplayCopyDisplayMode(display);
     if (current) {
         size_t width = CGDisplayModeGetWidth(current);
@@ -3211,6 +3187,11 @@ static void arm_pending_gl_trace(void)
 
 static bool trace_gl_render_call(void)
 {
+    /* Called from every GL fast handler, tens of thousands of times a frame,
+       and almost always with tracing off.  Settle that with one branch. */
+    if (__builtin_expect(gl_render_trace_initialized &&
+                         !gl_render_trace_remaining && !pending_gl_trace_arm, 1))
+        return false;
     initialize_gl_render_trace();
     arm_pending_gl_trace();
     if (!gl_render_trace_remaining ||
