@@ -125,6 +125,23 @@ static int chuzzle_bass_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 #define IS(s) (strcmp(n, "_" #s) == 0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
     if (IS(BASS_GetVersion)) RET(0x02030000); /* the version the game checks for */
+    if (IS(BASS_SetConfig) || IS(BASS_GetConfig)) {
+        /* 2.3 took the global volumes as a percentage; 2.4 takes them in
+           hundredths of a percent.  Chuzzle asks for sample 100 and music 75,
+           which 2.4 read as 1% and 0.75% -- the game was mixing and playing
+           everything correctly, just far below hearing. */
+        uint32_t option = a[0];
+        bool global_volume = option == BASS_CONFIG_GVOL_SAMPLE ||
+                             option == BASS_CONFIG_GVOL_STREAM ||
+                             option == BASS_CONFIG_GVOL_MUSIC;
+        if (IS(BASS_GetConfig)) {
+            DWORD value = BASS_GetConfig(option);
+            RET(global_volume && value != (DWORD)-1 ? value / 100 : value);
+        }
+        uint32_t value = a[1];
+        if (global_volume) value = (value > 100 ? 100 : value) * 100;
+        RET(BASS_SetConfig(option, value));
+    }
     if (IS(BASS_MusicLoad)) {
         RET(BASS_MusicLoad(a[0], (void *)(uintptr_t)a[1], a[2], a[3], a[4], 0));
     }

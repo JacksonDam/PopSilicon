@@ -139,7 +139,7 @@ static NSOpenGLContext *pg_gl;
 static uint32_t pg_gl_handle;
 static uint32_t pg_current_port;
 static bool pg_app_started, pg_cursor_hidden, pg_cursor_applied;
-static struct { uint32_t cls, kind; NSEvent *native; } pg_pending[16];
+static struct { uint32_t cls, kind; NSEvent *native; uint32_t command; } pg_pending[16];
 static unsigned pg_pending_count;
 static struct { uint32_t target, callback, user, count; EventTypeSpec types[64]; } pg_handlers[64];
 static uint32_t pg_handler_count;
@@ -153,6 +153,11 @@ struct pg_event {
 };
 static struct pg_event pg_events[kPgEventCapacity];
 static unsigned pg_event_next;
+/* Set when the title bar's close button produced a kEventWindowClose the game
+   did not handle.  The quit that answers it is queued from the event pump
+   rather than from inside the guest call that declined the close, so the game
+   receives it the way it receives any other event. */
+static bool pg_close_unhandled;
 static int pg_trace_events = -1;
 static bool pg_tracing(void)
 {
@@ -239,8 +244,16 @@ static void pg_queue_event(uint32_t cls, uint32_t kind, NSEvent *native)
         pg_pending[pg_pending_count].cls = cls;
         pg_pending[pg_pending_count].kind = kind;
         pg_pending[pg_pending_count].native = [native retain];
+        pg_pending[pg_pending_count].command = 0;
         ++pg_pending_count;
     }
+}
+/* A menu command, as Carbon's own menu bar would deliver it: the command id
+   travels in the event's direct object as an HICommand. */
+static void pg_queue_command(uint32_t command)
+{
+    pg_queue_event(kEventClassCommand, kEventCommandProcess, nil);
+    if (pg_pending_count) pg_pending[pg_pending_count - 1].command = command;
 }
 static void pg_post_window_event(uint32_t kind) { pg_queue_event(kEventClassWindow, kind, nil); }
 /* Carbon's toolbox turns an unhandled raw key down into a Unicode text-input
@@ -544,6 +557,24 @@ static uint32_t pg_dispatch_event(uint32_t handle, uint32_t target)
             uint32_t status = compat_runtime32_call(pg_handlers[i].callback, arguments, 3);
             if (status == 0) return 0;
         }
+    }
+    /* The close box did nothing because Peggle registers no handler for
+       kEventWindowClose and Carbon's standard window handler -- which would
+       have turned it into a quit -- is not here to fall back on.  It does
+       register kEventCommandProcess, which is how the Apple menu's Quit
+       reaches a Carbon app, so hand it that instead and let the game shut
+       itself down the way it always has.  [NSApp terminate:] is no use: this
+       app never enters [NSApp run], so there is no loop for it to unwind. */
+    if (event->cls == kEventClassWindow && event->kind == kEventWindowClose) {
+        pg_close_unhandled = true;
+    }
+    /* If the game will not take the quit command either, nothing else will
+       end the process, so do it here. */
+    if (event->cls == kEventClassCommand && event->kind == kEventCommandProcess &&
+        event->param_count && event->params[0].name == kEventParamDirectObject) {
+        uint32_t command;
+        memcpy(&command, event->params[0].bytes + 4, sizeof(command));
+        if (command == kHICommandQuit) exit(0);
     }
     return (uint32_t)eventNotHandledErr;
 }
@@ -886,12 +917,27 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
             compat_runtime32_call(pg_timer_callback, arguments, 2);
         }
         pg_update_cursor();
+        if (pg_close_unhandled) { pg_close_unhandled = false; pg_queue_command(kHICommandQuit); }
         { struct pg_win *w = pg_main_win(); if (w) pg_run_script(w->window); }
         if (pg_pending_count) {
             uint32_t cls = pg_pending[0].cls, kind = pg_pending[0].kind;
             NSEvent *native = [pg_pending[0].native autorelease];
+            uint32_t command = pg_pending[0].command;
             memmove(pg_pending, pg_pending + 1, (--pg_pending_count) * sizeof(pg_pending[0]));
-            OUT(5, pg_make_event(cls, kind, native));
+            uint32_t handle = pg_make_event(cls, kind, native);
+            if (command) {
+                /* i386 HICommand: attributes, commandID, then the menu the
+                   command came from -- none, here. */
+                struct pg_event *e = pg_event_for(handle);
+                uint32_t hi_command[4] = {kHICommandFromMenu, command, 0, 0};
+                if (!e) { OUT(5, handle); RET(0); }
+                e->params[0].name = kEventParamDirectObject;
+                e->params[0].type = typeHICommand;
+                e->params[0].size = 14;
+                memcpy(e->params[0].bytes, hi_command, sizeof(hi_command));
+                e->param_count = 1;
+            }
+            OUT(5, handle);
             RET(0);
         }
         double timeout;
