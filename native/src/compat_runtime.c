@@ -2944,6 +2944,7 @@ static uint8_t *import_stage_slot(uint32_t import_id)
  * and reacquires it immediately before returning to i386 code.
  */
 int compat_runtime32_frame_profile_enabled;
+static uint64_t import_profile_interval_ns;
 static _Thread_local struct compat_runtime32_frame_profile frame_profile;
 /* Time the bridge frame pacer deliberately slept inside the current import
    (set by frame_pacer_wait); excluded from the slow-import report. */
@@ -3174,8 +3175,12 @@ int compat_runtime32_initialize(struct macho_image32 *image)
        report, so either request turns it on; LP32_SLOW_IMPORT_MS used to do
        nothing on its own, which is exactly when it is wanted (chasing a hitch
        without the periodic frame dump). */
+    const char *profile_secs = getenv("LP32_IMPORT_PROFILE_SECS");
+    import_profile_interval_ns = profile_secs ?
+        (uint64_t)(strtod(profile_secs, NULL) * 1e9) : 0;
     compat_runtime32_frame_profile_enabled = getenv("LP32_FRAME_STATS") != NULL ||
-                                             getenv("LP32_SLOW_IMPORT_MS") != NULL;
+                                             getenv("LP32_SLOW_IMPORT_MS") != NULL ||
+                                             import_profile_interval_ns != 0;
     /* The global guest lock guarded against Rosetta mis-decoding a page that
        held both 32-bit thunks and 64-bit landing pads.  Those now live on
        separate pages, and the lock cost the render thread up to a third of
@@ -3293,6 +3298,23 @@ uint64_t lp32_dispatch_import(uint32_t import_id, const uint32_t *arguments,
         frame_profile.dispatch_ns += elapsed;
     }
     ++frame_profile.calls;
+    /* LP32_IMPORT_PROFILE_SECS=<n>: dump the costliest imports every n
+       seconds.  Dispatch overhead spread over tens of thousands of tiny calls
+       is invisible to LP32_SLOW_IMPORT_MS, which only ever sees one call at a
+       time; this is the view that shows it. */
+    if (import_profile_interval_ns) {
+        static uint64_t next_report;
+        uint64_t due = __atomic_load_n(&next_report, __ATOMIC_RELAXED);
+        if (!due) {
+            __atomic_store_n(&next_report, start + import_profile_interval_ns,
+                             __ATOMIC_RELAXED);
+        } else if (start > due &&
+                   __atomic_compare_exchange_n(
+                       &next_report, &due, start + import_profile_interval_ns,
+                       false, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+            compat_runtime32_report_import_profile(12);
+        }
+    }
     struct import_profile_entry *entry = import_profile_slot(import_id);
     if (entry) {
         entry->name = name;

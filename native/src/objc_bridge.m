@@ -4927,6 +4927,35 @@ FAST_GL(glColorPointer) { (void)return_address; glColorPointer((GLint)arguments[
 FAST_GL(glTexCoordPointer) { (void)return_address; glTexCoordPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
 FAST_GL(glNormalPointer) { (void)return_address; glNormalPointer(arguments[0], (GLsizei)arguments[1], (const void *)(uintptr_t)arguments[2]); return 0; }
 FAST_GL(glEnableClientState) { (void)return_address; glEnableClientState(arguments[0]); return 0; }
+/* The immediate-mode entry points, which Bejeweled 2 and Zuma draw everything
+   with: one glBegin, four each of colour/texcoord/vertex, one glEnd per quad.
+   A board's worth of sprites is thousands of calls a frame and a full-screen
+   effect -- Bejeweled 2's between-level warp -- is tens of thousands, every
+   one of which otherwise walks the whole name chain down to
+   peggle_graphics_dispatch before doing a few nanoseconds of work.  That cost
+   is invisible to LP32_SLOW_IMPORT_MS because no single call is slow; it only
+   shows up as the frame rate collapsing when the geometry count jumps. */
+FAST_GL(glBegin)      { (void)return_address; glBegin(arguments[0]); return 0; }
+FAST_GL(glEnd)        { (void)return_address; (void)arguments; glEnd(); return 0; }
+FAST_GL(glVertex2i)   { (void)return_address; glVertex2i((GLint)arguments[0], (GLint)arguments[1]); return 0; }
+FAST_GL(glVertex2f)   { (void)return_address; glVertex2f(guest_float_argument(arguments[0]), guest_float_argument(arguments[1])); return 0; }
+FAST_GL(glTexCoord2f) { (void)return_address; glTexCoord2f(guest_float_argument(arguments[0]), guest_float_argument(arguments[1])); return 0; }
+FAST_GL(glColor4ub)   { (void)return_address; glColor4ub((GLubyte)arguments[0], (GLubyte)arguments[1], (GLubyte)arguments[2], (GLubyte)arguments[3]); return 0; }
+FAST_GL(glColor4ubv)  { (void)return_address; glColor4ubv((const GLubyte *)(uintptr_t)arguments[0]); return 0; }
+/* Bejeweled 2 checks glGetError once per quad, so it is as hot as the vertex
+   calls; the driver round trip is the game's own cost but the dispatch around
+   it need not be. */
+FAST_GL(glGetError)
+{
+    (void)return_address;
+    (void)arguments;
+    GLenum error = glGetError();
+    if (error != GL_NO_ERROR && trace_gl_render_call()) {
+        fprintf(stderr, "compat32: glGetError swap=%llu error=%04x\n",
+                (unsigned long long)objc_bridge_swap_count, error);
+    }
+    return error;
+}
 FAST_GL(glDisableClientState) { (void)return_address; glDisableClientState(arguments[0]); return 0; }
 FAST_GL(glLoadMatrixf) { (void)return_address; glLoadMatrixf((const GLfloat *)(uintptr_t)arguments[0]); return 0; }
 /* Shader uniforms are updated every frame by Bejeweled 3's flame/ripple GLSL
@@ -5000,6 +5029,14 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"_glTexCoordPointer", fast_glTexCoordPointer},
         {"_glNormalPointer", fast_glNormalPointer},
         {"_glEnableClientState", fast_glEnableClientState},
+        {"_glBegin", fast_glBegin},
+        {"_glEnd", fast_glEnd},
+        {"_glVertex2i", fast_glVertex2i},
+        {"_glVertex2f", fast_glVertex2f},
+        {"_glTexCoord2f", fast_glTexCoord2f},
+        {"_glColor4ub", fast_glColor4ub},
+        {"_glColor4ubv", fast_glColor4ubv},
+        {"_glGetError", fast_glGetError},
         {"_glDisableClientState", fast_glDisableClientState},
         {"_glLoadMatrixf", fast_glLoadMatrixf},
         {"_glUseProgram", fast_glUseProgram},
@@ -5426,13 +5463,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glGetError")) {
-        *result = glGetError();
-        if (*result != GL_NO_ERROR && trace_gl_render_call()) {
-            fprintf(stderr, "compat32: glGetError swap=%llu error=%04llx\n",
-                    (unsigned long long)objc_bridge_swap_count,
-                    (unsigned long long)*result);
-        }
-        return 1;
+        *result = fast_glGetError(arguments, 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "glActiveTexture") ||
         LP32_NAME_IS(import_name, import_length, "glActiveTextureARB")) {
@@ -6476,12 +6507,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     /* Fixed-function immediate mode used by the legacy display path for
        its loading/letterbox quads. */
     if (LP32_NAME_IS(import_name, import_length, "_glBegin")) {
-        glBegin(arguments[0]);
-        *result = 0; return 1;
+        *result = fast_glBegin(arguments, 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glEnd")) {
-        glEnd();
-        *result = 0; return 1;
+        *result = fast_glEnd(arguments, 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glColor4f")) {
         glColor4f(guest_float_argument(arguments[0]),

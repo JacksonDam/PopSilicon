@@ -11,11 +11,13 @@ static int peggle_graphics_dispatch(const char *n, const uint32_t *a, uint64_t *
 #define O(i) object_for_argument(a[i])
 #define CG(i) pg_cf_object(a[i])
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
-    if (IS("_glColor4ub")) { glColor4ub(a[0], a[1], a[2], a[3]); RET(0); }
-    if (IS("_glColor4ubv")) { glColor4ubv(P(0)); RET(0); }
-    if (IS("_glVertex2f")) { glVertex2f(pg_float(a[0]), pg_float(a[1])); RET(0); }
-    if (IS("_glVertex2i")) { glVertex2i(a[0], a[1]); RET(0); }
-    if (IS("_glTexCoord2f")) { glTexCoord2f(pg_float(a[0]), pg_float(a[1])); RET(0); }
+    /* These five are on the memoized fast path; call it rather than repeating
+       the implementation, so the two can never drift apart. */
+    if (IS("_glColor4ub")) RET(fast_glColor4ub(a, 0));
+    if (IS("_glColor4ubv")) RET(fast_glColor4ubv(a, 0));
+    if (IS("_glVertex2f")) RET(fast_glVertex2f(a, 0));
+    if (IS("_glVertex2i")) RET(fast_glVertex2i(a, 0));
+    if (IS("_glTexCoord2f")) RET(fast_glTexCoord2f(a, 0));
     if (IS("_glLineWidth")) { glLineWidth(pg_float(a[0])); RET(0); }
     if (IS("_glPointSize")) { glPointSize(pg_float(a[0])); RET(0); }
     if (IS("_glOrtho")) { glOrtho(pg_double(a), pg_double(a + 2), pg_double(a + 4), pg_double(a + 6), pg_double(a + 8), pg_double(a + 10)); RET(0); }
