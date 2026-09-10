@@ -12,10 +12,8 @@ Bejeweled 3’s Classic, Zen, Lightning, Quest, Ice Storm, Poker, Butterflies, a
 seems to work well.
 - **PvZSilicon** for Plants vs. Zombies 1.0.41. Tested with basic gameplay in 
 start of Adventure mode and seems to work well.
-- **ZumaSilicon** for Zuma Deluxe 1.0.0. The newest addition, and Bejeweled 2's
-twin: the same early Carbon/AGL engine, so the two share the classic Toolbox
-bridge. It boots, renders and plays with sound, but it has had the least
-playtesting of the seven.
+- **ZumaSilicon** for Zuma Deluxe 1.0.0. Passed basic testing and seems to 
+work well.
 
 A single loader serves all seven titles; it detects which game an image is and
 applies the right profile.
