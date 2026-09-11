@@ -557,6 +557,28 @@ static uint32_t cz_ticks(void)
     return (uint32_t)(milliseconds - cz_start_ticks);
 }
 
+/* SDL 1.2 hands back the same screen surface every time the mode changes, and
+   a caller is entitled to have kept the pointer from the first call.  Reshape
+   the existing object rather than freeing it and returning a new address. */
+static void cz_reshape_surface(uint32_t surface, uint32_t width,
+                               uint32_t height, uint32_t bits, uint32_t flags)
+{
+    uint32_t bytes = (bits + 7) / 8;
+    uint32_t format = cz_read32(surface + kSdlSurfaceFormat);
+    cz_write32(surface + kSdlSurfaceFlags, flags);
+    cz_write32(surface + kSdlSurfaceW, width);
+    cz_write32(surface + kSdlSurfaceH, height);
+    cz_write16(surface + kSdlSurfacePitch, (uint16_t)(width * bytes));
+    cz_write16(surface + kSdlSurfaceClipRect + 0, 0);
+    cz_write16(surface + kSdlSurfaceClipRect + 2, 0);
+    cz_write16(surface + kSdlSurfaceClipRect + 4, (uint16_t)width);
+    cz_write16(surface + kSdlSurfaceClipRect + 6, (uint16_t)height);
+    if (format) {
+        cz_write8(format + kSdlFormatBits, (uint8_t)bits);
+        cz_write8(format + kSdlFormatBytes, (uint8_t)bytes);
+    }
+}
+
 static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
                                   uint32_t bits, uint32_t flags)
 {
@@ -567,11 +589,20 @@ static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
         pg_create_window(content, false);
         window = pg_main_win();
         if (!window) return 0;
-        /* pg_create_window is shaped for the 4:3 Sexy titles; hold this one to
-           the size SDL was asked for instead. */
-        [window->window setContentAspectRatio:NSMakeSize(width, height)];
-        [window->window setMinSize:NSMakeSize(width, height)];
         [window->window setTitle:@"Chuzzle"];
+    }
+    /* pg_create_window is shaped for the 4:3 Sexy titles, so hold this one to
+       the size SDL asked for -- and re-apply that on every mode change, not
+       just the first.  The options screen switches modes while the game runs,
+       and 800x600 is 4:3 where 1280x1024 is 5:4, so a window and letterbox
+       still pinned to the previous mode's ratio sized the drawable wrongly. */
+    [window->window setContentAspectRatio:NSMakeSize(width, height)];
+    [window->window setContentMinSize:NSMakeSize(width, height)];
+    if ([[window->window contentView] isKindOfClass:[PeggleLetterboxView class]]) {
+        PeggleLetterboxView *letterbox =
+            (PeggleLetterboxView *)[window->window contentView];
+        [letterbox setContentAspect:NSMakeSize(width, height)];
+        [letterbox setNeedsLayout:YES];
     }
     if (!NSEqualSizes(cz_video_size, content.size)) {
         window->logical_content_size = content.size;
@@ -580,12 +611,18 @@ static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
     }
     [window->window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    /* Not on the first mode set -- there is nothing to replace then. */
+    if (cz_screen_surface) pg_recreate_gl();
     pg_attach_gl();
-    if (cz_screen_surface) cz_free_surface(cz_screen_surface);
     /* An OpenGL video surface carries no pixels, exactly as SDL returns it. */
-    cz_screen_surface = cz_create_surface(width, height, bits ? bits : 32,
-                                          0x00ff0000, 0x0000ff00, 0x000000ff, 0,
-                                          0, flags | kSdlOpenGL);
+    if (cz_screen_surface) {
+        cz_reshape_surface(cz_screen_surface, width, height, bits ? bits : 32,
+                           flags | kSdlOpenGL);
+    } else {
+        cz_screen_surface = cz_create_surface(width, height, bits ? bits : 32,
+                                              0x00ff0000, 0x0000ff00, 0x000000ff,
+                                              0, 0, flags | kSdlOpenGL);
+    }
     return cz_screen_surface;
 }
 
@@ -676,7 +713,16 @@ static int chuzzle_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         if (surface && a[4]) cz_write16(surface + kSdlSurfacePitch, (uint16_t)a[4]);
         RET(surface);
     }
-    if (IS("_SDL_FreeSurface")) { cz_free_surface(a[0]); RET(0); }
+    if (IS("_SDL_FreeSurface")) {
+        /* SDL 1.2 ignores a free of the screen surface -- SDL_SetVideoMode
+           owns it and hands back the same object on every mode change.
+           Chuzzle frees it immediately before switching resolution, so
+           honouring that released the surface out from under the mode change
+           and the window went black. */
+        if (a[0] && a[0] == cz_screen_surface) RET(0);
+        cz_free_surface(a[0]);
+        RET(0);
+    }
     if (IS("_SDL_LockSurface")) RET(0);
     if (IS("_SDL_UnlockSurface")) RET(0);
     if (IS("_SDL_UpperBlit") || IS("_SDL_BlitSurface")) RET(cz_blit(a[0], a[1], a[2], a[3]));

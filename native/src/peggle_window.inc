@@ -12,13 +12,25 @@
 - (void)keyUp:(NSEvent *)event { (void)event; }
 @end
 
-/* The game draws in a 4:3 surface even when AppKit makes its window fill an
-   ultrawide display.  Keeping that surface as a child view lets native full
-   screen scale it to the largest undistorted size and leaves the remainder
-   black, just like a classic display mode. */
+/* The game draws in a fixed-shape surface even when AppKit makes its window
+   fill an ultrawide display.  Keeping that surface as a child view lets native
+   full screen scale it to the largest undistorted size and leaves the
+   remainder black, just like a classic display mode.
+
+   The shape is 4:3 for the Sexy titles but follows the video mode for Chuzzle,
+   whose options screen switches between 4:3 (800x600) and 5:4 (1280x1024)
+   while the game runs -- laying its 5:4 drawable out as 4:3 left the view and
+   the game's viewport disagreeing, and the window stopped showing anything. */
 @interface PeggleLetterboxView : NSView
+@property (nonatomic) NSSize contentAspect;
 @end
 @implementation PeggleLetterboxView
+- (instancetype)initWithFrame:(NSRect)frame
+{
+    self = [super initWithFrame:frame];
+    if (self) _contentAspect = NSMakeSize(4, 3);
+    return self;
+}
 - (BOOL)isOpaque { return YES; }
 - (void)drawRect:(NSRect)dirty
 {
@@ -30,8 +42,12 @@
     [super layout];
     if (![[self subviews] count]) return;
     NSRect bounds = [self bounds];
-    CGFloat scale = fmin(bounds.size.width / 4.0, bounds.size.height / 3.0);
-    NSSize size = NSMakeSize(floor(4.0 * scale), floor(3.0 * scale));
+    NSSize aspect = _contentAspect;
+    if (aspect.width <= 0 || aspect.height <= 0) aspect = NSMakeSize(4, 3);
+    CGFloat scale = fmin(bounds.size.width / aspect.width,
+                         bounds.size.height / aspect.height);
+    NSSize size = NSMakeSize(floor(aspect.width * scale),
+                             floor(aspect.height * scale));
     NSRect frame = NSMakeRect(floor((bounds.size.width - size.width) / 2.0),
                               floor((bounds.size.height - size.height) / 2.0),
                               size.width, size.height);
@@ -465,6 +481,13 @@ static void pg_set_bounds(struct pg_win *w, NSRect rect, bool is_content)
     }
     [w->window setFrame:frame display:YES];
     if (!w->overlay) {
+        /* The letterbox sizes the render view from its own bounds, and those
+           only just changed.  Lay it out now: [pg_gl update] binds the context
+           to whatever the view's frame currently is, and AppKit would not run
+           layout until the next display pass -- leaving the drawable stuck at
+           the previous mode's size, which is what blanked Chuzzle when its
+           options screen switched resolution. */
+        [[w->window contentView] layoutSubtreeIfNeeded];
         [pg_gl update];
         NSRect c = pg_content_rect(w);
         fprintf(stderr, "compat32: window frame %.0f,%.0f,%.0f,%.0f\n", c.origin.x, pg_screen_top() - NSMaxY(c), c.size.width, c.size.height);
@@ -482,6 +505,22 @@ static NSOpenGLContext *pg_ensure_gl(void)
     pg_gl_handle = proxy_for_object(pg_gl);
     return pg_gl;
 }
+/* SDL 1.2 destroys and rebuilds the GL context on every SDL_SetVideoMode, so
+   a game written against it expects the context that comes back to start at
+   its defaults with no textures, and reloads accordingly.  Ours survived the
+   mode change, which left Chuzzle drawing with GL state and texture names it
+   had already written off.  Drop the context so the next attach builds a new
+   one; the proxy table still owns the old object, so nothing the guest holds
+   dangles. */
+static void pg_recreate_gl(void)
+{
+    if (!pg_gl) return;
+    [NSOpenGLContext clearCurrentContext];
+    [pg_gl clearDrawable];
+    pg_gl = nil;
+    pg_gl_handle = 0;
+}
+
 /* The handle the game gets for "the GL context".  Titles that call GL through
    <OpenGL/CGLMacro.h> read the dispatch table out of it, so they get the
    synthesized context; everyone else gets the Cocoa proxy they always had. */
