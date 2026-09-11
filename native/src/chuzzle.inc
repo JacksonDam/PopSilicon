@@ -611,6 +611,14 @@ static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
     }
     [window->window makeKeyAndOrderFront:nil];
     [NSApp activateIgnoringOtherApps:YES];
+    /* The letterbox sizes the render view from its own bounds, which
+       pg_set_bounds has only just changed, and AppKit would not lay it out
+       until the next display pass.  Lay it out before attaching, so the
+       drawable and the input mapping take the new mode's size rather than the
+       previous one's.  Only here: done in pg_set_bounds for every title, it
+       bound Bejeweled 2's drawable at its full window size before the game had
+       settled on what it draws, and Bejeweled 2 started too big (#13). */
+    [[window->window contentView] layoutSubtreeIfNeeded];
     /* Not on the first mode set -- there is nothing to replace then. */
     if (cz_screen_surface) pg_recreate_gl();
     pg_attach_gl();

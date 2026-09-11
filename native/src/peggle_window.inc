@@ -19,8 +19,7 @@
 
    The shape is 4:3 for the Sexy titles but follows the video mode for Chuzzle,
    whose options screen switches between 4:3 (800x600) and 5:4 (1280x1024)
-   while the game runs -- laying its 5:4 drawable out as 4:3 left the view and
-   the game's viewport disagreeing, and the window stopped showing anything. */
+   while the game runs. */
 @interface PeggleLetterboxView : NSView
 @property (nonatomic) NSSize contentAspect;
 @end
@@ -481,13 +480,6 @@ static void pg_set_bounds(struct pg_win *w, NSRect rect, bool is_content)
     }
     [w->window setFrame:frame display:YES];
     if (!w->overlay) {
-        /* The letterbox sizes the render view from its own bounds, and those
-           only just changed.  Lay it out now: [pg_gl update] binds the context
-           to whatever the view's frame currently is, and AppKit would not run
-           layout until the next display pass -- leaving the drawable stuck at
-           the previous mode's size, which is what blanked Chuzzle when its
-           options screen switched resolution. */
-        [[w->window contentView] layoutSubtreeIfNeeded];
         [pg_gl update];
         NSRect c = pg_content_rect(w);
         fprintf(stderr, "compat32: window frame %.0f,%.0f,%.0f,%.0f\n", c.origin.x, pg_screen_top() - NSMaxY(c), c.size.width, c.size.height);
