@@ -6,7 +6,7 @@ struct SteamInstallationView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if model.steamReplacementSucceeded {
-                Label("\(model.productName) installed in Steam", systemImage: "checkmark.circle.fill")
+                Label("\(model.productName) \(model.steamCompletionLabel)", systemImage: "checkmark.circle.fill")
                     .foregroundColor(.green)
                 if let backupURL = model.steamBackupURL {
                     Text("Original saved as \(backupURL.lastPathComponent).")
@@ -42,7 +42,7 @@ struct SteamInstallationView: View {
     private var headline: String {
         switch model.steamInstallationState {
         case .unpatched: return "Steam installation detected"
-        case .peggleSilicon: return "\(model.productName) already installed in Steam"
+        case .peggleSilicon: return "\(model.productName) installed in Steam"
         case .needsRepair: return "\(model.productName) in Steam needs repair"
         case .unsupported: return "Unsupported Steam installation"
         }
@@ -65,7 +65,9 @@ struct SteamInstallationView: View {
                 ? "The game image is still DRM-encrypted; it can be repaired from the backup."
                 : "The game image is DRM-encrypted and no \(model.selectedGame.steamAppName).bak backup was found to rebuild from."
         case .peggleSilicon:
-            return nil
+            return model.canReplaceSteam
+                ? "It can be rebuilt from the backup so that it matches this copy of the project."
+                : "No \(model.selectedGame.steamAppName).bak backup was found, so it cannot be rebuilt."
         case .unsupported:
             return "This app is not an unmodified 32-bit \(model.selectedGame.displayName) installation."
         }

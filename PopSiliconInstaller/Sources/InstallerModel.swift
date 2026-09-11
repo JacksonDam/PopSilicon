@@ -3,6 +3,17 @@ import Combine
 import Foundation
 import UniformTypeIdentifiers
 
+/// Which confirmation the installer's single alert presentation is showing.
+/// SwiftUI honours one alert per view hierarchy, and the chooser sits inside
+/// the view that already carries one, so a second `.alert` there never
+/// presents — the button would appear to do nothing.
+enum InstallerAlert: Int, Identifiable {
+    case steamReplacement
+    case bulkUpdate
+
+    var id: Int { rawValue }
+}
+
 @MainActor
 final class InstallerModel: ObservableObject {
     /// The game the drop box and Steam box currently target.  Defaults to
@@ -34,8 +45,14 @@ final class InstallerModel: ObservableObject {
     @Published private(set) var steamInstallationURL: URL?
     @Published private(set) var steamInstallationState: SteamLocator.InstallationState = .unsupported
     @Published private(set) var steamReplacementSucceeded = false
+    /// How the finished Steam action is described once it has succeeded.
+    @Published private(set) var steamCompletionLabel = "installed in Steam"
     @Published private(set) var steamBackupURL: URL?
-    @Published var showSteamReplacementConfirmation = false
+    @Published var activeAlert: InstallerAlert?
+    /// The chooser's "update everything in Steam" pass.
+    @Published private(set) var isBulkUpdating = false
+    @Published private(set) var bulkUpdateProgress: String?
+    @Published private(set) var bulkUpdateSummary: String?
 
     init() {
         refreshSteamInstallation()
@@ -78,9 +95,35 @@ final class InstallerModel: ObservableObject {
         sourceURL != nil && destinationDirectory != nil && !isBuilding
     }
 
-    /// Steam's install can be installed into or repaired.
+    /// Steam's install can be installed into, repaired, or updated in place to
+    /// this copy of the project.  An install that is already PopSilicon is
+    /// rebuilt from its backup, so `steamBuildSource` still decides whether the
+    /// action can run.
     private var steamIsInstallable: Bool {
-        steamInstallationState == .unpatched || steamInstallationState == .needsRepair
+        steamInstallationState != .unsupported
+    }
+
+    /// What the Steam action does in the current state: install over Valve's
+    /// copy, repair an install whose game image is still encrypted, or update
+    /// a good install to the current build.
+    private enum SteamAction {
+        case replace, repair, update
+
+        var completionLabel: String {
+            switch self {
+            case .replace: return "installed in Steam"
+            case .repair: return "repaired in Steam"
+            case .update: return "updated in Steam"
+            }
+        }
+    }
+
+    private var steamAction: SteamAction {
+        switch steamInstallationState {
+        case .needsRepair: return .repair
+        case .peggleSilicon: return .update
+        case .unpatched, .unsupported: return .replace
+        }
     }
 
     /// The bundle whose executable becomes the game image of the Steam install.
@@ -109,15 +152,19 @@ final class InstallerModel: ObservableObject {
     }
 
     var steamActionTitle: String {
-        steamInstallationState == .needsRepair
-            ? "Repair Steam installation…"
-            : "Replace Steam installation…"
+        switch steamAction {
+        case .repair: return "Repair Steam installation…"
+        case .update: return "Update Steam installation…"
+        case .replace: return "Replace Steam installation…"
+        }
     }
 
     var steamAlertTitle: String {
-        steamInstallationState == .needsRepair
-            ? "Repair Steam installation?"
-            : "Replace Steam installation?"
+        switch steamAction {
+        case .repair: return "Repair Steam installation?"
+        case .update: return "Update Steam installation?"
+        case .replace: return "Replace Steam installation?"
+        }
     }
 
     var steamAlertMessage: String {
@@ -126,16 +173,138 @@ final class InstallerModel: ObservableObject {
             ? "\n\nSteam must be running and signed in to the account that owns "
                 + "\(selectedGame.displayName), which is used once to unwrap the game's DRM."
             : ""
-        if steamInstallationState == .needsRepair {
+        switch steamAction {
+        case .repair:
             return "\(productName) in Steam will be rebuilt in place; the existing "
                 + "\(selectedGame.steamAppName).bak backup is kept." + needsSteam
+        case .update:
+            return "The \(productName) installed in Steam will be rebuilt from this "
+                + "copy of the project and replaced; the existing "
+                + "\(selectedGame.steamAppName).bak backup is kept." + needsSteam
+        case .replace:
+            return "The original will be renamed to \(selectedGame.steamAppName).bak before "
+                + "\(productName) is installed." + needsSteam
         }
-        return "The original will be renamed to \(selectedGame.steamAppName).bak before "
-            + "\(productName) is installed." + needsSteam
     }
 
     var steamAlertButtonTitle: String {
-        steamInstallationState == .needsRepair ? "Repair" : "Replace and Install"
+        switch steamAction {
+        case .repair: return "Repair"
+        case .update: return "Update"
+        case .replace: return "Replace and Install"
+        }
+    }
+
+    /// Every game whose Steam copy already runs PopSilicon and still has the
+    /// backup a rebuild needs.  The chooser offers these in one pass, so a new
+    /// build reaches all of them without walking the products one at a time.
+    var updatableSteamGames: [Game] {
+        Game.all.filter { game in
+            guard let installation = SteamLocator.find(game) else { return false }
+            let state = SteamLocator.state(of: installation, game: game)
+            guard state == .peggleSilicon || state == .needsRepair else { return false }
+            return FileManager.default.fileExists(
+                atPath: installation.appendingPathExtension("bak").path)
+        }
+    }
+
+    var canBulkUpdateSteam: Bool {
+        !isBulkUpdating && !isBuilding && !updatableSteamGames.isEmpty
+    }
+
+    var bulkUpdateActionTitle: String {
+        isBulkUpdating
+            ? "Updating…"
+            : "Update All Steam Installations (\(updatableSteamGames.count))"
+    }
+
+    var bulkUpdateHeadline: String {
+        if isBulkUpdating { return "Updating Steam installations" }
+        return bulkUpdateSummary ?? "PopSilicon is installed in Steam"
+    }
+
+    var bulkUpdateSymbol: String {
+        if isBulkUpdating { return "arrow.triangle.2.circlepath" }
+        guard let summary = bulkUpdateSummary else { return "arrow.down.circle" }
+        return summary.contains("could not") ? "exclamationmark.triangle" : "checkmark.circle"
+    }
+
+    var bulkUpdateDetail: String? {
+        if let bulkUpdateProgress { return bulkUpdateProgress }
+        let names = updatableSteamGames.map(\.displayName)
+        guard !names.isEmpty else { return nil }
+        return "Reinstall each one from unmodified backup so the games have the "
+            + "newest version of PopSilicon: " + names.joined(separator: ", ") + "."
+    }
+
+    var bulkUpdateAlertMessage: String {
+        let games = updatableSteamGames
+        let drmWrapped = games.filter { game in
+            guard let installation = SteamLocator.find(game) else { return false }
+            return SteamLocator.sourceNeedsSteam(
+                installation.appendingPathExtension("bak"), for: game)
+        }
+        let plural = games.count == 1 ? "" : "s"
+        let needsSteam = drmWrapped.isEmpty
+            ? ""
+            : "\n\nSteam must be running and signed in: "
+                + drmWrapped.map(\.displayName).joined(separator: ", ")
+                + (drmWrapped.count == 1 ? " is" : " are") + " DRM-wrapped and "
+                + (drmWrapped.count == 1 ? "its" : "their") + " code is unwrapped again."
+        return "\(games.count) Steam installation\(plural) will be rebuilt in place; "
+            + "each existing backup is kept." + needsSteam
+    }
+
+    func requestBulkSteamUpdate() {
+        guard canBulkUpdateSteam else { return }
+        errorMessage = nil
+        bulkUpdateSummary = nil
+        activeAlert = .bulkUpdate
+    }
+
+    func confirmBulkSteamUpdate() {
+        activeAlert = nil
+        guard let projectRoot = ProjectLocator.find() else {
+            errorMessage = "PopSilicon project files could not be found next to this app."
+            return
+        }
+        let games = updatableSteamGames
+        guard !games.isEmpty else { return }
+        isBulkUpdating = true
+        errorMessage = nil
+        bulkUpdateSummary = nil
+
+        Task { [weak self] in
+            var updated: [String] = []
+            var failed: [String] = []
+            for (index, game) in games.enumerated() {
+                guard let installation = SteamLocator.find(game) else { continue }
+                self?.bulkUpdateProgress =
+                    "\(index + 1) of \(games.count): \(game.displayName)…"
+                let result = await SteamReplacementRunner.run(
+                    source: installation.appendingPathExtension("bak"),
+                    target: installation,
+                    game: game,
+                    projectRoot: projectRoot
+                )
+                if result.succeeded {
+                    updated.append(game.displayName)
+                } else {
+                    failed.append(game.displayName)
+                }
+                self?.buildOutput = result.output
+            }
+
+            guard let self else { return }
+            isBulkUpdating = false
+            bulkUpdateProgress = nil
+            let plural = updated.count == 1 ? "" : "s"
+            bulkUpdateSummary = failed.isEmpty
+                ? "Updated \(updated.count) Steam installation\(plural)"
+                : "Updated \(updated.count); could not update "
+                    + failed.joined(separator: ", ")
+            refreshSteamInstallation()
+        }
     }
 
     var dropZoneHint: String {
@@ -219,19 +388,21 @@ final class InstallerModel: ObservableObject {
     func requestSteamReplacement() {
         guard steamInstallationURL != nil, !isBuilding else { return }
         guard steamIsInstallable, steamBuildSource != nil else {
-            errorMessage = "The Steam app is already patched or is not an unmodified 32-bit \(selectedGame.displayName) installation."
+            errorMessage = steamIsInstallable
+                ? "No \(selectedGame.steamAppName).bak backup was found to rebuild this installation from."
+                : "The Steam app is not an unmodified 32-bit \(selectedGame.displayName) installation."
             return
         }
         errorMessage = nil
-        showSteamReplacementConfirmation = true
+        activeAlert = .steamReplacement
     }
 
     func confirmSteamReplacement() {
-        showSteamReplacementConfirmation = false
+        activeAlert = nil
         guard let steamInstallationURL, let source = steamBuildSource else { return }
         let game = selectedGame
         guard steamIsInstallable else {
-            errorMessage = "The Steam app is already patched or is not an unmodified 32-bit \(game.displayName) installation."
+            errorMessage = "The Steam app is not an unmodified 32-bit \(game.displayName) installation."
             return
         }
         guard let projectRoot = ProjectLocator.find() else {
@@ -239,7 +410,7 @@ final class InstallerModel: ObservableObject {
             return
         }
 
-        let repairing = steamInstallationState == .needsRepair
+        let action = steamAction
         let backup = steamInstallationURL.appendingPathExtension("bak")
         isBuilding = true
         errorMessage = nil
@@ -248,7 +419,11 @@ final class InstallerModel: ObservableObject {
         successProgress = 0
         steamReplacementSucceeded = false
         steamBackupURL = backup
-        statusMessage = repairing ? "Repairing the Steam installation…" : "Installing into Steam…"
+        switch action {
+        case .repair: statusMessage = "Repairing the Steam installation…"
+        case .update: statusMessage = "Updating the Steam installation…"
+        case .replace: statusMessage = "Installing into Steam…"
+        }
 
         Task { [weak self] in
             let result = await SteamReplacementRunner.run(
@@ -264,6 +439,7 @@ final class InstallerModel: ObservableObject {
             if result.succeeded {
                 statusMessage = "Installation complete."
                 steamReplacementSucceeded = true
+                steamCompletionLabel = action.completionLabel
                 installationSucceeded = true
                 steamInstallationState = .peggleSilicon
                 steamBackupURL = FileManager.default.fileExists(atPath: backup.path) ? backup : nil
@@ -274,9 +450,11 @@ final class InstallerModel: ObservableObject {
                 }
             } else {
                 statusMessage = "Installation failed."
-                errorMessage = repairing
-                    ? "The Steam installation was not repaired."
-                    : "The Steam installation was not replaced."
+                switch action {
+                case .repair: errorMessage = "The Steam installation was not repaired."
+                case .update: errorMessage = "The Steam installation was not updated."
+                case .replace: errorMessage = "The Steam installation was not replaced."
+                }
             }
         }
     }
@@ -301,7 +479,9 @@ final class InstallerModel: ObservableObject {
                 ? "\(productName) in Steam needs repair. It can be repaired directly."
                 : "\(productName) in Steam needs repair, but no backup was found to rebuild from."
         case .peggleSilicon:
-            statusMessage = "\(productName) is already installed in \(selectedGame.displayName) on Steam."
+            statusMessage = steamBuildSource != nil
+                ? "\(productName) is installed in \(selectedGame.displayName) on Steam. It can be updated to this build."
+                : "\(productName) is installed in \(selectedGame.displayName) on Steam, but no backup was found to rebuild from."
         case .unsupported:
             statusMessage = "\(selectedGame.displayName) Steam installation found, but it is not an unmodified 32-bit copy."
         }

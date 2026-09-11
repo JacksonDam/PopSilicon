@@ -14,6 +14,34 @@ struct ProductPickerView: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
 
+            // Updating what Steam already has is not a per-product job, so it
+            // lives here rather than behind a product and its game menu.
+            if !model.updatableSteamGames.isEmpty || model.bulkUpdateSummary != nil {
+                VStack(alignment: .leading, spacing: 8) {
+                    Label(model.bulkUpdateHeadline, systemImage: model.bulkUpdateSymbol)
+                        .font(.headline)
+                    if let detail = model.bulkUpdateDetail {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundColor(.gray)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    HStack(spacing: 10) {
+                        Button(model.bulkUpdateActionTitle, action: model.requestBulkSteamUpdate)
+                            .disabled(!model.canBulkUpdateSteam)
+                        if model.isBulkUpdating {
+                            ProgressView().controlSize(.small)
+                        }
+                    }
+                }
+                .padding(14)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(
+                    RoundedRectangle(cornerRadius: 12)
+                        .fill(Color.gray.opacity(0.08))
+                )
+            }
+
             // The list grows with every product added, so let it scroll rather
             // than push the heading off the top of the window.
             ScrollView {

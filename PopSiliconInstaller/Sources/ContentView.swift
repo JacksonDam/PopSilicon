@@ -13,16 +13,31 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 520, idealWidth: 560, minHeight: 520, idealHeight: 600)
-        .alert(isPresented: $model.showSteamReplacementConfirmation) {
-            Alert(
-                title: Text(model.steamAlertTitle),
-                message: Text(model.steamAlertMessage),
-                primaryButton: .destructive(
-                    Text(model.steamAlertButtonTitle),
-                    action: model.confirmSteamReplacement
-                ),
-                secondaryButton: .cancel(Text("Cancel"))
-            )
+        // One presentation for both confirmations: a second `.alert` further
+        // down the hierarchy never shows.
+        .alert(item: $model.activeAlert) { alert in
+            switch alert {
+            case .steamReplacement:
+                return Alert(
+                    title: Text(model.steamAlertTitle),
+                    message: Text(model.steamAlertMessage),
+                    primaryButton: .destructive(
+                        Text(model.steamAlertButtonTitle),
+                        action: model.confirmSteamReplacement
+                    ),
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
+            case .bulkUpdate:
+                return Alert(
+                    title: Text("Update every Steam installation?"),
+                    message: Text(model.bulkUpdateAlertMessage),
+                    primaryButton: .destructive(
+                        Text("Update All"),
+                        action: model.confirmBulkSteamUpdate
+                    ),
+                    secondaryButton: .cancel(Text("Cancel"))
+                )
+            }
         }
     }
 
