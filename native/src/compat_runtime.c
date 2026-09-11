@@ -861,6 +861,28 @@ static pthread_cond_t *host_cond_for_guest(uint32_t address, bool create,
     return condition;
 }
 
+/* A wait with no deadline of its own still sleeps in slices, each expiry
+   reported to the guest as a spurious wakeup.  Peggle's audio maintenance
+   signals a sound's condition before it publishes the state that condition's
+   waiter tests, and publishes it only after dropping the mutex (0x209d1d
+   signals, 0x20a24f stores), so a waiter woken by that signal re-tests too
+   early, sleeps again, and is never signalled a second time — that call is the
+   only pthread_cond_signal in the whole game.  Natively the two are a few
+   hundred instructions apart and the waiter loses that race; here every guest
+   call between them is a bridged import, so it wins routinely and the game
+   freezes with "Waiting for sound maintenance thread to clean-up" in the log
+   (issue #14).  POSIX permits spurious wakeups and a correct waiter re-tests
+   its own predicate, so this costs one re-test per interval and bounds a lost
+   wakeup to that interval instead of the run. */
+#define GUEST_COND_WAIT_SLICE_NS (25 * 1000 * 1000)
+
+static int guest_cond_wait_slice(pthread_cond_t *condition, pthread_mutex_t *mutex)
+{
+    struct timespec slice = {0, GUEST_COND_WAIT_SLICE_NS};
+    int status = pthread_cond_timedwait_relative_np(condition, mutex, &slice);
+    return status == ETIMEDOUT ? 0 : status;
+}
+
 /* Block on a guest condition.  The host condition is waited on with the gate
    lock rather than the guest's own mutex, so dropping and retaking the guest
    mutex happens here, around the wait, exactly where the real call would have
@@ -887,7 +909,7 @@ static uint32_t guest_cond_block(uint32_t cond_address, uint32_t mutex_address,
         }
         bool frame_thread = audio_bridge32_is_frame_thread();
         if (frame_thread) audio_bridge32_frame_thread_wait_begin();
-        int status = pthread_cond_wait(condition, mutex);
+        int status = guest_cond_wait_slice(condition, mutex);
         if (frame_thread) audio_bridge32_frame_thread_wait_end();
         return (uint32_t)status;
     }
@@ -914,7 +936,7 @@ static uint32_t guest_cond_block(uint32_t cond_address, uint32_t mutex_address,
     } else if (deadline) {
         status = pthread_cond_timedwait(condition, &gate->lock, deadline);
     } else {
-        status = pthread_cond_wait(condition, &gate->lock);
+        status = guest_cond_wait_slice(condition, &gate->lock);
     }
     if (frame_thread) audio_bridge32_frame_thread_wait_end();
     --gate->waiters;
@@ -5884,6 +5906,31 @@ static void *sync_self_test_condition_waiter(void *opaque)
     return NULL;
 }
 
+/* A wait that nothing ever signals: it must still come back, because
+   guest_cond_block sleeps in slices and reports each expiry as a spurious
+   wakeup.  Without that, one early wakeup left Peggle's sound release asleep
+   for good (issue #14). */
+struct sync_self_test_slice {
+    uint32_t condition;
+    uint32_t mutex;
+    uint32_t returned;
+};
+
+static void *sync_self_test_slice_waiter(void *opaque)
+{
+    struct sync_self_test_slice *slice = opaque;
+    uint32_t arguments[4] = {0};
+    arguments[0] = slice->mutex;
+    compat_runtime32_dispatch_import("_pthread_mutex_lock", arguments);
+    arguments[0] = slice->condition;
+    arguments[1] = slice->mutex;
+    compat_runtime32_dispatch_import("_pthread_cond_wait", arguments);
+    arguments[0] = slice->mutex;
+    compat_runtime32_dispatch_import("_pthread_mutex_unlock", arguments);
+    __atomic_store_n(&slice->returned, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
 static uint32_t sync_self_test_free_list_length(struct host_sync_free_node *node)
 {
     uint32_t length = 0;
@@ -6036,6 +6083,41 @@ int compat_runtime32_run_sync_self_test(void)
         if (live != initial_conditions || free_nodes != object_total) {
             failure = "condition destroy did not release every entry";
             break;
+        }
+    }
+
+    /* A wait nobody signals must return by itself, in about one slice. */
+    if (!failure) {
+        struct sync_self_test_slice slice = {
+            .condition = condition_base + UINT32_C(0x01000000),
+            .mutex = mutex_base + UINT32_C(0x01000000),
+        };
+        arguments[0] = slice.mutex;
+        arguments[1] = 0;
+        compat_runtime32_dispatch_import("_pthread_mutex_init", arguments);
+        arguments[0] = slice.condition;
+        compat_runtime32_dispatch_import("_pthread_cond_init", arguments);
+        pthread_t thread;
+        if (pthread_create(&thread, NULL, sync_self_test_slice_waiter, &slice) != 0) {
+            failure = "pthread_create failed";
+        } else {
+            uint32_t waited_ms = 0;
+            while (!__atomic_load_n(&slice.returned, __ATOMIC_ACQUIRE) &&
+                   waited_ms < 2000) {
+                usleep(1000);
+                ++waited_ms;
+            }
+            if (!__atomic_load_n(&slice.returned, __ATOMIC_ACQUIRE)) {
+                /* Still inside the wait: joining would hang the test as well,
+                   so report it and leave the thread where it is. */
+                failure = "an unsignalled condition wait never returned";
+            } else {
+                pthread_join(thread, NULL);
+                arguments[0] = slice.condition;
+                compat_runtime32_dispatch_import("_pthread_cond_destroy", arguments);
+                arguments[0] = slice.mutex;
+                compat_runtime32_dispatch_import("_pthread_mutex_destroy", arguments);
+            }
         }
     }
 
