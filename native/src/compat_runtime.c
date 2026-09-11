@@ -652,6 +652,16 @@ static void recycle_host_mutex(pthread_mutex_t *mutex)
  * the check and the enqueue.  A token nobody claims costs one spurious
  * wakeup, which POSIX permits and a correct waiter absorbs by re-testing its
  * own predicate — WorkerThread's callers loop on theirs.
+ *
+ * Only the titles built on that WorkerThread (Zuma and Bejeweled 2) get a
+ * gate; for everyone else a guest condition is exactly the host condition,
+ * as it was before the gate existed.  Peggle is why (issue #14): its
+ * CoreAudioSoundInstance::Release destroys and re-creates its condition
+ * straight after waiting, without the mutex, while the audio thread may be
+ * signalling it — and a gate torn down under a signaller that had already
+ * looked it up left its lock wedged, freezing or crashing the game on the
+ * screen changes that release sounds.  So a gate, once made, is also never
+ * freed: a stale pointer to it always finds a live lock.
  */
 struct guest_cond_gate {
     pthread_mutex_t lock;
@@ -659,34 +669,25 @@ struct guest_cond_gate {
     uint32_t pending;
 };
 
-static struct host_sync_free_node *free_host_cond_gates;
+static bool guest_cond_gates_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enum lp32_title title = lp32_profile()->title;
+        enabled = title == LP32_TITLE_ZUMA || title == LP32_TITLE_BEJEWELED2;
+    }
+    return enabled;
+}
 
 static struct guest_cond_gate *create_cond_gate(void)
 {
-    struct guest_cond_gate *gate;
-    if (free_host_cond_gates) {
-        struct host_sync_free_node *node = free_host_cond_gates;
-        free_host_cond_gates = node->next;
-        gate = (struct guest_cond_gate *)node;
-    } else {
-        gate = malloc(sizeof(*gate) > sizeof(struct host_sync_free_node) ?
-                      sizeof(*gate) : sizeof(struct host_sync_free_node));
-        if (!gate) return NULL;
-    }
+    struct guest_cond_gate *gate = calloc(1, sizeof(*gate));
+    if (!gate) return NULL;
     if (pthread_mutex_init(&gate->lock, NULL) != 0) {
         free(gate);
         return NULL;
     }
-    gate->waiters = 0;
-    gate->pending = 0;
     return gate;
-}
-
-static void recycle_cond_gate(struct guest_cond_gate *gate)
-{
-    struct host_sync_free_node *node = (struct host_sync_free_node *)gate;
-    node->next = free_host_cond_gates;
-    free_host_cond_gates = node;
 }
 
 static pthread_cond_t *create_host_condition(void)
@@ -842,11 +843,14 @@ static pthread_cond_t *host_cond_for_guest(uint32_t address, bool create,
         pthread_mutex_unlock(&guest_sync_table_lock);
         return NULL;
     }
-    struct guest_cond_gate *gate = create_cond_gate();
-    if (!gate) {
-        recycle_host_condition(condition);
-        pthread_mutex_unlock(&guest_sync_table_lock);
-        return NULL;
+    struct guest_cond_gate *gate = NULL;
+    if (guest_cond_gates_enabled()) {
+        gate = create_cond_gate();
+        if (!gate) {
+            recycle_host_condition(condition);
+            pthread_mutex_unlock(&guest_sync_table_lock);
+            return NULL;
+        }
     }
     struct guest_cond_entry *entry = &guest_conditions[guest_cond_count++];
     entry->address = address;
@@ -868,8 +872,25 @@ static uint32_t guest_cond_block(uint32_t cond_address, uint32_t mutex_address,
     struct guest_cond_gate *gate;
     pthread_cond_t *condition = host_cond_for_guest(cond_address, true, &gate);
     pthread_mutex_t *mutex = host_mutex_for_guest(mutex_address, false);
-    if (!condition || !gate) return (uint32_t)ENOMEM;
+    if (!condition) return (uint32_t)ENOMEM;
     if (!mutex) return (uint32_t)EINVAL;
+    if (!gate) {
+        /* No gate: the host condition, waited on with the guest's own mutex
+           as before the gate existed.  The frame-thread hooks are explained
+           below. */
+        if (relative) {
+            return (uint32_t)pthread_cond_timedwait_relative_np(condition, mutex,
+                                                                relative);
+        }
+        if (deadline) {
+            return (uint32_t)pthread_cond_timedwait(condition, mutex, deadline);
+        }
+        bool frame_thread = audio_bridge32_is_frame_thread();
+        if (frame_thread) audio_bridge32_frame_thread_wait_begin();
+        int status = pthread_cond_wait(condition, mutex);
+        if (frame_thread) audio_bridge32_frame_thread_wait_end();
+        return (uint32_t)status;
+    }
 
     pthread_mutex_lock(&gate->lock);
     if (gate->pending) {
@@ -906,7 +927,11 @@ static uint32_t guest_cond_wake(uint32_t address, bool all)
 {
     struct guest_cond_gate *gate;
     pthread_cond_t *condition = host_cond_for_guest(address, true, &gate);
-    if (!condition || !gate) return (uint32_t)ENOMEM;
+    if (!condition) return (uint32_t)ENOMEM;
+    if (!gate) {
+        return (uint32_t)(all ? pthread_cond_broadcast(condition)
+                              : pthread_cond_signal(condition));
+    }
     pthread_mutex_lock(&gate->lock);
     int status = 0;
     if (gate->waiters == 0) {
@@ -929,9 +954,11 @@ static uint32_t guest_cond_initialize(uint32_t address)
         if (pthread_cond_destroy(entry->condition) == 0) {
             pthread_cond_init(entry->condition, NULL);
         }
-        pthread_mutex_lock(&entry->gate->lock);
-        entry->gate->pending = 0;
-        pthread_mutex_unlock(&entry->gate->lock);
+        if (entry->gate) {
+            pthread_mutex_lock(&entry->gate->lock);
+            entry->gate->pending = 0;
+            pthread_mutex_unlock(&entry->gate->lock);
+        }
         pthread_mutex_unlock(&guest_sync_table_lock);
         return 0;
     }
@@ -952,10 +979,13 @@ static uint32_t guest_cond_destroy(uint32_t address)
         if (entry->address != address) continue;
         pthread_cond_broadcast(entry->condition);
         int status = pthread_cond_destroy(entry->condition);
-        if (status == 0 && entry->gate->waiters == 0) {
+        if (status == 0) {
             recycle_host_condition(entry->condition);
-            pthread_mutex_destroy(&entry->gate->lock);
-            recycle_cond_gate(entry->gate);
+            /* The gate stays allocated: a signaller may already hold it, and
+               a waiter the broadcast just woke still has to leave it.
+               Keeping the entry until its waiters had gone, as this once
+               did, left it holding a destroyed condition that every later
+               call — re-initialising included — failed on. */
             *entry = guest_conditions[--guest_cond_count];
             ++guest_sync_released_count;
         }
