@@ -12,8 +12,8 @@ Bejeweled 3’s Classic, Zen, Lightning, Quest, Ice Storm, Poker, Butterflies, a
 seems to work well.
 - **PvZSilicon** for Plants vs. Zombies 1.0.41. Tested with basic gameplay in 
 start of Adventure mode and seems to work well.
-- **ZumaSilicon** for Zuma Deluxe 1.0.0. Passed basic testing and seems to 
-work well.
+- **ZumaSilicon** for Zuma Deluxe 1.0.0 and Zuma's Revenge 1.0.0. Passed basic 
+testing and seems to work well.
 - **BookwormSilicon** for Bookworm Deluxe 1.0.5. Boots to the main menu, with a
 new player profile created in the game's own name dialog; the Classic and Action
 modes have not been played through yet.
