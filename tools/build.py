@@ -73,6 +73,28 @@ def copy_clean(source: pathlib.Path, destination: pathlib.Path) -> None:
                    check=True)
 
 
+def thin_i386(source: pathlib.Path, destination: pathlib.Path) -> None:
+    """Write the i386 slice of the source; a thin i386 file copies through.
+
+    The loader maps one thin i386 executable, so the PowerPC-era titles, which
+    ship ppc/i386 universal binaries, have to be thinned first."""
+    if source.read_bytes()[:4] in (b'\xca\xfe\xba\xbe', b'\xbe\xba\xfe\xca'):
+        subprocess.run(['lipo', '-thin', 'i386', str(source), '-output', str(destination)],
+                       check=True)
+    else:
+        copy_clean(source, destination)
+
+
+def unswizzle_macprotect(payload: pathlib.Path, destination: pathlib.Path) -> None:
+    data = payload.read_bytes()
+    whole = len(data) - len(data) % 16
+    recovered = b''.join(data[i:i + 16][::-1] for i in range(0, whole, 16))
+    with tempfile.TemporaryDirectory(prefix='popsilicon-unswizzle-') as tmp:
+        universal = pathlib.Path(tmp)/'payload.fat'
+        universal.write_bytes(recovered + data[whole:])
+        thin_i386(universal, destination)
+
+
 # Per-title build settings, keyed by the source bundle identifier.  The image
 # file name must match the corresponding profile's image_file in
 # native/src/game_profile.c so the loader finds and auto-detects it.
@@ -126,6 +148,31 @@ GAMES = {
         'bundle_identifier': 'local.chuzzle.silicon',
         'bundle_name': 'Chuzzle',
     },
+    'com.sproutgames.feedingfrenzy': {
+        'display_name': 'Feeding Frenzy Deluxe',
+        'image_file': 'FeedingFrenzy.image',
+        'output_name': 'FeedingFrenzy.app',
+        'bundle_identifier': 'local.feedingfrenzy.silicon',
+        'bundle_name': 'FeedingFrenzy',
+        'extras': ('FFArchive.saf', 'resources'),
+    },
+    "com.PopCap.Zuma's Revenge!": {
+        'display_name': "Zuma's Revenge!",
+        'image_file': 'ZumaRevenge.image',
+        'output_name': 'ZumaRevenge.app',
+        'bundle_identifier': 'local.zumarevenge.silicon',
+        'bundle_name': 'ZumaRevenge',
+        'companion': 'Contents/Frameworks/SmartDX.framework/Versions/A/SmartDX',
+    },
+    'com.popcap.bookworm': {
+        'display_name': 'Bookworm Deluxe',
+        'image_file': 'Bookworm.image',
+        'output_name': 'Bookworm.app',
+        'bundle_identifier': 'local.bookworm.silicon',
+        'bundle_name': 'Bookworm',
+        'payload': 'Contents/Resources/Bookworm.payload',
+        'resources': 'Contents/Resources/Bookworm.app/Contents/Resources',
+    },
 }
 
 
@@ -157,7 +204,8 @@ if not source.is_dir():
     raise SystemExit(f'game bundle not found: {source}')
 source_info=plistlib.loads((source/'Contents/Info.plist').read_bytes())
 game=game_for_source(source_info)
-executable=source/'Contents/MacOS'/source_info.get('CFBundleExecutable','')
+payload=source/game['payload'] if 'payload' in game else None
+executable=payload or source/'Contents/MacOS'/source_info.get('CFBundleExecutable','')
 if not executable.is_file():
     raise SystemExit(f'game executable not found: {executable}')
 
@@ -175,17 +223,36 @@ drm=is_steam_drm(executable)
 # Regenerate the image when it is missing, or (for a plain retail source) when
 # the source executable changed.  A DRM source needs an unwrap step, so only
 # regenerate it when the image is absent.
-if not image.exists() or (not drm and not filecmp.cmp(executable,image,shallow=False)):
+if not image.exists() or (not drm and not payload and not filecmp.cmp(executable,image,shallow=False)):
  if drm:
   print(f"{executable.name} is a Steam DRM copy of {game['display_name']}; unwrapping its game code…")
   unwrap_steam_drm(loader,executable,image)
+ elif payload:
+  print(f"{executable.name} is a protected copy of {game['display_name']}; recovering its game code…")
+  unswizzle_macprotect(payload,image)
  else:
-  copy_clean(executable,image)
- subprocess.run(['ditto','--noextattr','--noqtn',str(source/'Contents/Resources'),str(c/'Resources')],check=True)
+  thin_i386(executable,image)
+ subprocess.run(['ditto','--noextattr','--noqtn',str(source/game.get('resources','Contents/Resources')),str(c/'Resources')],check=True)
+
+# A game that reaches part of itself through a second i386 library (Zuma's
+# Revenge and SmartDX) gets that binary beside its image, where the loader
+# maps it as guest code.  This sits outside the block above so that a cached
+# image never leaves a stale or missing copy behind.
+if 'companion' in game:
+    origin=source/game['companion']
+    if not origin.is_file():
+        raise SystemExit(f'companion library not found: {origin}')
+    thin_i386(origin,c/'SharedSupport'/origin.name)
 
 copy_clean(loader,c/'MacOS/PeggleSilicon')
 copy_clean(root/'native/vendor/bass/libbass.dylib',c/'MacOS/libbass.dylib')
 p=dict(source_info);p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier=game['bundle_identifier'],CFBundleName=game['bundle_name'],LSMinimumSystemVersion='11.0',NSHighResolutionCapable=False)
 (c/'Info.plist').write_bytes(plistlib.dumps(p))
+subprocess.run(['xattr','-cr',str(bundle)],check=True)
 subprocess.run(['codesign','--force','--deep','--sign','-',str(bundle)],check=True)
+
+for extra in game.get('extras',()):
+    origin=source/extra
+    if origin.exists():
+        subprocess.run(['ditto','--noextattr','--noqtn',str(origin),str(bundle/extra)],check=True)
 print(bundle)

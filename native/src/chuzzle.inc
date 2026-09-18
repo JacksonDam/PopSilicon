@@ -375,11 +375,32 @@ static void cz_queue_modifiers(NSEvent *native)
     previous = flags;
 }
 
+/* SDL reports a pointer confined to the drawable, and games lean on that.
+   Clamping only at zero let a pointer to the right of the picture -- the
+   pillarbox bars in full screen, or anywhere outside the window -- read as an
+   ever-larger x: Feeding Frenzy steers its fish toward that x, so the fish
+   swam right and stayed there until the pointer came back inside. */
 static void cz_update_mouse(NSPoint local)
 {
+    struct pg_win *window = pg_main_win();
+    NSSize logical = window ? window->logical_content_size : NSMakeSize(0, 0);
     int32_t x = (int32_t)local.x, y = (int32_t)local.y;
-    cz_mouse_x = (uint32_t)(x < 0 ? 0 : x);
-    cz_mouse_y = (uint32_t)(y < 0 ? 0 : y);
+    int32_t last_x = logical.width > 0 ? (int32_t)logical.width - 1 : x;
+    int32_t last_y = logical.height > 0 ? (int32_t)logical.height - 1 : y;
+    if (x < 0) x = 0; else if (x > last_x) x = last_x;
+    if (y < 0) y = 0; else if (y > last_y) y = last_y;
+    cz_mouse_x = (uint32_t)x;
+    cz_mouse_y = (uint32_t)y;
+    static int trace = -1;
+    if (trace < 0) trace = getenv("LP32_TRACE_MOUSE") != NULL;
+    if (trace) {
+        NSRect content = window ? pg_content_rect(window) : NSMakeRect(0, 0, 0, 0);
+        fprintf(stderr, "compat32: mouse %.1f,%.1f -> %u,%u logical=%.0fx%.0f "
+                "content=%.0f,%.0f %.0fx%.0f\n", local.x, local.y,
+                cz_mouse_x, cz_mouse_y, logical.width, logical.height,
+                content.origin.x, content.origin.y,
+                content.size.width, content.size.height);
+    }
 }
 
 static void cz_queue_mouse(NSEvent *native, uint8_t type, uint8_t button)
@@ -589,7 +610,8 @@ static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
         pg_create_window(content, false);
         window = pg_main_win();
         if (!window) return 0;
-        [window->window setTitle:@"Chuzzle"];
+        [window->window setTitle:[NSString stringWithUTF8String:
+                                     lp32_profile()->display_name]];
     }
     /* pg_create_window is shaped for the 4:3 Sexy titles, so hold this one to
        the size SDL asked for -- and re-apply that on every mode change, not
@@ -634,6 +656,60 @@ static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
     return cz_screen_surface;
 }
 
+/* Pack 8-bit channels through a surface's masks: SDL_MapRGB/MapRGBA, and the
+   inverse of cz_unpack_pixel above. */
+static uint32_t cz_map_rgba(uint32_t format, uint8_t red, uint8_t green,
+                            uint8_t blue, uint8_t alpha)
+{
+    if (format < 0x1000) return 0;
+    const uint8_t channels[4] = {red, green, blue, alpha};
+    uint32_t packed = 0;
+    for (int i = 0; i < 4; ++i) {
+        uint32_t mask = cz_read32(format + kSdlFormatRmask + i * 4);
+        uint8_t loss = *(const uint8_t *)(uintptr_t)(format + kSdlFormatLoss + i);
+        uint8_t shift = *(const uint8_t *)(uintptr_t)(format + kSdlFormatShift + i);
+        if (mask) packed |= (((uint32_t)channels[i] >> loss) << shift) & mask;
+    }
+    return packed;
+}
+
+/* SDL_FillRect: the whole surface, or one rectangle of it.  An OpenGL video
+   surface carries no pixels, and SDL fills nothing for it either. */
+static uint32_t cz_fill_rect(uint32_t surface, uint32_t rect, uint32_t colour)
+{
+    if (surface < 0x1000) return (uint32_t)-1;
+    uint32_t pixels = cz_read32(surface + kSdlSurfacePixels);
+    uint32_t format = cz_read32(surface + kSdlSurfaceFormat);
+    if (!pixels || !format) return 0;
+    uint32_t bytes = *(const uint8_t *)(uintptr_t)(format + kSdlFormatBytes);
+    if (!bytes || bytes > 4) return (uint32_t)-1;
+    int32_t x = 0, y = 0;
+    int32_t width = (int32_t)cz_read32(surface + kSdlSurfaceW);
+    int32_t height = (int32_t)cz_read32(surface + kSdlSurfaceH);
+    if (rect >= 0x1000) {
+        const int16_t *bounds = (const void *)(uintptr_t)rect;
+        x = bounds[0]; y = bounds[1];
+        width = (uint16_t)bounds[2]; height = (uint16_t)bounds[3];
+    }
+    int32_t surface_width = (int32_t)cz_read32(surface + kSdlSurfaceW);
+    int32_t surface_height = (int32_t)cz_read32(surface + kSdlSurfaceH);
+    if (x < 0) { width += x; x = 0; }
+    if (y < 0) { height += y; y = 0; }
+    if (x + width > surface_width) width = surface_width - x;
+    if (y + height > surface_height) height = surface_height - y;
+    if (width <= 0 || height <= 0) return 0;
+    uint16_t pitch;
+    memcpy(&pitch, (const void *)(uintptr_t)(surface + kSdlSurfacePitch), 2);
+    for (int32_t row = 0; row < height; ++row) {
+        uint8_t *out = (void *)(uintptr_t)
+            (pixels + (uint32_t)(y + row) * pitch + (uint32_t)x * bytes);
+        for (int32_t column = 0; column < width; ++column, out += bytes) {
+            memcpy(out, &colour, bytes);
+        }
+    }
+    return 0;
+}
+
 /* --- dispatch ------------------------------------------------------------ */
 
 static int chuzzle_dispatch(const char *n, const uint32_t *a, uint64_t *r)
@@ -642,7 +718,10 @@ static int chuzzle_dispatch(const char *n, const uint32_t *a, uint64_t *r)
 #define P(i) ((void *)(uintptr_t)a[i])
 #define OUT(i, v) do { if (a[i]) *(uint32_t *)P(i) = (uint32_t)(v); } while (0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
-    if (lp32_profile()->title != LP32_TITLE_CHUZZLE) return 0;
+    /* Feeding Frenzy is SDL 1.2 too, so it shares all of this; its OpenAL and
+       SDL_sound live in feeding_frenzy.inc. */
+    enum lp32_title title = lp32_profile()->title;
+    if (title != LP32_TITLE_CHUZZLE && title != LP32_TITLE_FEEDING_FRENZY) return 0;
 
     /* --- SDL: startup and time --- */
     if (IS("_SDL_Init") || IS("_SDL_InitSubSystem")) { cz_ticks(); pg_start_app(); RET(0); }
@@ -659,6 +738,46 @@ static int chuzzle_dispatch(const char *n, const uint32_t *a, uint64_t *r)
     /* --- SDL: video --- */
     if (IS("_SDL_SetVideoMode")) RET(cz_set_video_mode(a[0], a[1], a[2], a[3]));
     if (IS("_SDL_GL_SwapBuffers")) { pg_present(); RET(0); }
+    /* The video surface here is always an OpenGL one, and SDL presents such a
+       surface on Flip exactly as it does on GL_SwapBuffers; the UpdateRect
+       calls do nothing for it, as in SDL. */
+    if (IS("_SDL_Flip")) { pg_present(); RET(0); }
+    if (IS("_SDL_UpdateRects") || IS("_SDL_UpdateRect")) RET(0);
+    if (IS("_SDL_GetVideoSurface")) RET(cz_screen_surface);
+    if (IS("_SDL_FillRect")) RET(cz_fill_rect(a[0], a[1], a[2]));
+    if (IS("_SDL_MapRGB")) RET(cz_map_rgba(a[0], (uint8_t)a[1], (uint8_t)a[2],
+                                           (uint8_t)a[3], 255));
+    if (IS("_SDL_MapRGBA")) RET(cz_map_rgba(a[0], (uint8_t)a[1], (uint8_t)a[2],
+                                            (uint8_t)a[3], (uint8_t)a[4]));
+    if (IS("_SDL_ShowCursor")) {
+        /* SDL_ENABLE/SDL_DISABLE/SDL_QUERY(-1), returning the previous state. */
+        static int shown = 1;
+        int previous = shown;
+        if ((int32_t)a[0] >= 0) {
+            shown = a[0] != 0;
+            if (shown) [NSCursor unhide]; else [NSCursor hide];
+        }
+        RET(previous);
+    }
+    if (IS("_SDL_WM_GrabInput")) RET(0); /* SDL_GRAB_OFF: the pointer stays free */
+    if (IS("_SDL_EnableUNICODE")) {
+        /* Key events already carry their characters; this only reports state. */
+        static int unicode = 1;
+        int previous = unicode;
+        if ((int32_t)a[0] >= 0) unicode = a[0] != 0;
+        RET(previous);
+    }
+    if (IS("_SDL_EnableKeyRepeat")) RET(0);
+    if (IS("_SDL_Linked_Version")) {
+        /* SDL_version: the release the games were built against. */
+        static uint32_t version;
+        if (!version) {
+            version = compat_runtime32_allocate(3, 1);
+            uint8_t *bytes = (void *)(uintptr_t)version;
+            if (bytes) { bytes[0] = 1; bytes[1] = 2; bytes[2] = 15; }
+        }
+        RET(version);
+    }
     if (IS("_SDL_GetVideoInfo")) {
         if (!cz_video_info) {
             cz_video_info = compat_runtime32_allocate(32, 1);
@@ -783,6 +902,11 @@ static int chuzzle_dispatch(const char *n, const uint32_t *a, uint64_t *r)
             CGWarpMouseCursorPosition(CGPointMake(
                 content.origin.x + (uint16_t)a[0] * scale_x,
                 pg_screen_top() - NSMaxY(content) + (uint16_t)a[1] * scale_y));
+            /* A warp detaches the pointer from the mouse and suppresses real
+               movement for about a quarter second, so a game that warps once
+               and then reads the position keeps seeing where it warped to.
+               Re-associate immediately, as SDL's own Quartz backend does. */
+            CGAssociateMouseAndMouseCursorPosition(true);
             cz_mouse_x = (uint16_t)a[0];
             cz_mouse_y = (uint16_t)a[1];
         }

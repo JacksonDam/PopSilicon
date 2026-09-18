@@ -10,6 +10,9 @@
 #import <AppKit/AppKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <Carbon/Carbon.h>
+/* CGImageSource lives in ImageIO rather than CoreGraphics; Zuma's Revenge
+   loads images through it. */
+#import <ImageIO/ImageIO.h>
 #import <OpenGL/OpenGL.h>
 #import <OpenGL/gl.h>
 #import <OpenGL/glext.h>
@@ -63,10 +66,27 @@ enum {
 struct proxy_entry {
     uint32_t handle;
     id object;
+    /* How many references the guest holds.  A CoreFoundation object arrives
+       from a Create/Copy owning one; CFRetain adds and CFRelease removes, and
+       the slot returns to the free list at zero.  Without this, every
+       CFDictionaryCreateMutable the guest made and then dutifully CFReleased
+       kept its slot forever -- and the registry writer alone builds twelve of
+       them per flush, so 2048 slots went in well under an hour of play. */
+    uint32_t references;
+    /* Bumped each time the slot is reused.  It rides in the low bits of the
+       handle (kProxyStride is 16, so four bits are free), which makes a handle
+       the guest kept past its release fail object_for_receiver's
+       proxies[index].handle == receiver check rather than silently resolve to
+       whatever object landed in the slot next. */
+    uint32_t generation;
 };
 
 static struct proxy_entry proxies[kProxyCapacity];
+/* High-water mark, never lowered: object_for_receiver bounds its O(1) lookup
+   with it, so recycled slots are reused from the free list below it instead. */
 static uint32_t proxy_count;
+static uint32_t proxy_free_indices[kProxyCapacity];
+static uint32_t proxy_free_count;
 static struct proxy_entry event_proxies[kEventProxyCapacity];
 static uint32_t event_proxy_count;
 static NSEvent *current_proxy_event;
@@ -84,6 +104,13 @@ static uint64_t objc_bridge_swap_count;
  * only add keys (stale ones are rejected by the proxies[] re-check).
  */
 enum { kProxyHashSize = 1u << 13, kProxyHashMask = kProxyHashSize - 1 };
+
+/* The io_service_t the bridge hands out for the display's registry entry.
+   CGDisplayIOServicePort is gone from macOS, but a caller that gets zero back
+   cannot ask the entry for IOFBMemorySize, and Zuma's Revenge picks its art
+   resolution from that answer.  Kept clear of the proxy handle range above so
+   object_for_argument never mistakes it for one. */
+enum { kGuestDisplayServicePort = 0x7f0d0002 };
 static uint32_t proxy_object_hash[kProxyHashSize];
 
 static inline uint32_t proxy_hash_pointer(const void *pointer)
@@ -92,11 +119,18 @@ static inline uint32_t proxy_hash_pointer(const void *pointer)
     return (uint32_t)((value * 2654435761u) & kProxyHashMask);
 }
 
+/* A released slot leaves a tombstone rather than a hole.  Open addressing
+   needs the probe chain intact: clear the slot outright and a later find stops
+   at the gap, concludes the object is absent, and appends a second entry for
+   something that already has one -- which is the leak this fix exists to end. */
+enum { kProxyHashTombstone = UINT32_MAX };
+
 static void proxy_object_hash_insert(uint32_t index)
 {
     uint32_t slot = proxy_hash_pointer((const void *)proxies[index].object);
     for (uint32_t probe = 0; probe < kProxyHashSize; ++probe) {
-        if (proxy_object_hash[slot] == 0) {
+        if (proxy_object_hash[slot] == 0 ||
+            proxy_object_hash[slot] == kProxyHashTombstone) {
             proxy_object_hash[slot] = index + 1;
             return;
         }
@@ -105,13 +139,31 @@ static void proxy_object_hash_insert(uint32_t index)
     /* Table saturated: leave it; proxy_for_object falls back to appending. */
 }
 
+/* Call before the entry's object pointer is cleared: the slot is identified by
+   that pointer. */
+static void proxy_object_hash_remove(id object)
+{
+    uint32_t slot = proxy_hash_pointer((const void *)object);
+    for (uint32_t probe = 0; probe < kProxyHashSize; ++probe) {
+        uint32_t stored = proxy_object_hash[slot];
+        if (stored == 0) return;
+        if (stored != kProxyHashTombstone &&
+            proxies[stored - 1].object == object) {
+            proxy_object_hash[slot] = kProxyHashTombstone;
+            return;
+        }
+        slot = (slot + 1) & kProxyHashMask;
+    }
+}
+
 static int32_t proxy_object_hash_find(id object)
 {
     uint32_t slot = proxy_hash_pointer((const void *)object);
     for (uint32_t probe = 0; probe < kProxyHashSize; ++probe) {
         uint32_t stored = proxy_object_hash[slot];
         if (stored == 0) return -1;
-        if (proxies[stored - 1].object == object) return (int32_t)(stored - 1);
+        if (stored != kProxyHashTombstone &&
+            proxies[stored - 1].object == object) return (int32_t)(stored - 1);
         slot = (slot + 1) & kProxyHashMask;
     }
     return -1;
@@ -154,6 +206,10 @@ static void arm_pending_gl_trace(void);
 static void trace_gl_frame_boundary(void);
 static void present_frame_with_stats(NSOpenGLContext *context,
                                      NSWindow *window, bool pace);
+/* Carbon fullscreen keeps the game's logical 1080x810 projection, while the
+   Cocoa child view grows to the largest 4:3 rectangle on the display. */
+static bool pg_adjust_fullscreen_viewport(GLint *x, GLint *y,
+                                          GLsizei *width, GLsizei *height);
 
 /*
  * Finder launches discard stderr.  Rendering diagnostics therefore need a
@@ -520,7 +576,12 @@ static uint32_t proxy_for_object(id object)
     }
     int32_t existing = proxy_object_hash_find(object);
     if (existing >= 0) return proxies[existing].handle;
-    if (proxy_count >= kProxyCapacity) {
+    uint32_t index;
+    if (proxy_free_count) {
+        index = proxy_free_indices[--proxy_free_count];
+    } else if (proxy_count < kProxyCapacity) {
+        index = proxy_count++;
+    } else {
         if (!logged_proxy_exhaustion) {
             fprintf(stderr,
                     "compat32: persistent Objective-C proxy pool exhausted "
@@ -531,13 +592,72 @@ static uint32_t proxy_for_object(id object)
         }
         return 0;
     }
-    uint32_t handle = kProxyBase + proxy_count * kProxyStride;
-    proxies[proxy_count].handle = handle;
-    proxies[proxy_count].object = object;
+    uint32_t handle = kProxyBase + index * kProxyStride +
+                      (proxies[index].generation & (kProxyStride - 1));
+    proxies[index].handle = handle;
+    proxies[index].object = object;
+    proxies[index].references = 1;
     if (proxy_object_is_retained(object)) [object retain];
-    proxy_object_hash_insert(proxy_count);
-    ++proxy_count;
+    proxy_object_hash_insert(index);
     return handle;
+}
+
+/* Handle -> slot, rejecting a handle whose generation no longer matches (the
+   guest kept it past its own CFRelease) or that never came from this pool. */
+static int32_t proxy_index_for_handle(uint32_t handle)
+{
+    if (handle < kProxyBase || handle >= kProxyLimit) return -1;
+    uint32_t index = (handle - kProxyBase) / kProxyStride;
+    if (index >= proxy_count || proxies[index].handle != handle) return -1;
+    return (int32_t)index;
+}
+
+/* The guest giving a CoreFoundation object back.  Drops one reference and, at
+   zero, returns the slot to the free list so the pool stops being a one-way
+   ratchet.  Anything that is not one of our pool handles is ignored. */
+static void proxy_release_handle(uint32_t handle)
+{
+    /*
+     * OFF by default, and it must stay that way until the aliasing below is
+     * solved.  Reclaiming a slot on CFRelease breaks the ordinary CoreFoundation
+     * idiom of create -> put into a container -> release -> keep using the
+     * pointer, which is valid because the container now owns the object.
+     * SystemX::CRegistry::WriteRegistryKey does exactly that: it creates a node
+     * dictionary, CFDictionarySetValues it into its parent, CFReleases it, and
+     * then passes the same pointer down as the parent of its own subkeys.  With
+     * recycling on, that handle was freed and its generation bumped, so every
+     * recursive call resolved to nil and the entire registry below the root was
+     * dropped -- the file serialised as "<key>registry</key><dict/>".
+     *
+     * Measured: with recycling on, 17 of 17 flushes wrote an empty tree; with it
+     * off, 0 of 17 did.  The slot leak it was written to fix (about sixteen
+     * handles per registry flush) only mattered because of the periodic flush,
+     * which is itself off by default now.  LP32_PROXY_RECYCLE=1 re-enables this
+     * for work on a version that tracks object liveness rather than guest
+     * reference counts.
+     */
+    static int recycling_enabled = -1;
+    if (recycling_enabled < 0) {
+        recycling_enabled = getenv("LP32_PROXY_RECYCLE") != NULL;
+    }
+    if (!recycling_enabled) return;
+    int32_t found = proxy_index_for_handle(handle);
+    if (found < 0) return;
+    struct proxy_entry *entry = &proxies[found];
+    if (entry->references > 1) {
+        --entry->references;
+        return;
+    }
+    id object = entry->object;
+    proxy_object_hash_remove(object);
+    entry->object = nil;
+    entry->handle = 0;
+    entry->references = 0;
+    entry->generation = (entry->generation + 1) & (kProxyStride - 1);
+    if (proxy_free_count < kProxyCapacity) {
+        proxy_free_indices[proxy_free_count++] = (uint32_t)found;
+    }
+    if (object && proxy_object_is_retained(object)) [object release];
 }
 
 static uint32_t proxy_for_returned_object(id receiver, id object)
@@ -701,33 +821,48 @@ static id object_for_receiver(uint32_t receiver)
 
     id peggle_object = peggle_object_for_handle(receiver);
     if (peggle_object) return peggle_object;
-    /* Old 32-bit CF constant strings are four-word records in __DATA. */
-    if (receiver >= bridge_image->cfstring_start &&
-        receiver < bridge_image->cfstring_end) {
+    /*
+     * Old 32-bit CF constant strings are four-word records in __DATA.  A
+     * library mapped beside the game keeps its own, so both images are
+     * consulted: resolving only the game's left every key SmartDX looked a
+     * display mode up with as nil, and the guest then handed that null
+     * straight to CFNumberGetValue.
+     */
+    for (int which = 0; which < 2; ++which) {
+        const struct macho_image32 *image =
+            which == 0 ? bridge_image : compat_runtime32_companion_image();
+        if (!image || receiver < image->cfstring_start ||
+            receiver >= image->cfstring_end) {
+            continue;
+        }
         const uint32_t *constant = (const void *)(uintptr_t)receiver;
         uint32_t bytes_address = constant[2];
         uint32_t length = constant[3];
-        if (bytes_address >= UINT32_C(0x00001000) &&
-            bytes_address < bridge_image->max_address && length < UINT32_C(0x100000)) {
-            NSString *string = [[[NSString alloc]
+        if (bytes_address < UINT32_C(0x00001000) ||
+            bytes_address >= image->max_address || length >= UINT32_C(0x100000)) {
+            continue;
+        }
+        NSString *string = [[[NSString alloc]
+            initWithBytes:(const void *)(uintptr_t)bytes_address
+                   length:length
+                 encoding:NSUTF8StringEncoding] autorelease];
+        if (!string) {
+            string = [[[NSString alloc]
                 initWithBytes:(const void *)(uintptr_t)bytes_address
                        length:length
-                     encoding:NSUTF8StringEncoding] autorelease];
-            if (!string) {
-                string = [[[NSString alloc]
-                    initWithBytes:(const void *)(uintptr_t)bytes_address
-                           length:length
-                         encoding:NSISOLatin1StringEncoding] autorelease];
-            }
-            return string;
+                     encoding:NSISOLatin1StringEncoding] autorelease];
         }
+        return string;
     }
 
     /* Legacy class references contain the class name rather than a Class. */
-    if (receiver >= bridge_image->cstring_start &&
-        receiver < bridge_image->cstring_end) {
-        const char *class_name = (const char *)(uintptr_t)receiver;
-        return (id)objc_getClass(class_name);
+    for (int which = 0; which < 2; ++which) {
+        const struct macho_image32 *image =
+            which == 0 ? bridge_image : compat_runtime32_companion_image();
+        if (image && receiver >= image->cstring_start &&
+            receiver < image->cstring_end) {
+            return (id)objc_getClass((const char *)(uintptr_t)receiver);
+        }
     }
     return nil;
 }
@@ -1003,8 +1138,15 @@ static NSScreen *preferred_game_screen(void)
 
 static CGDirectDisplayID preferred_game_display_id(void)
 {
+    /* The display selection is resolved once per process.  This function sits
+       on the legacy Carbon/GL import path and is called many times per frame;
+       asking AppKit/CoreGraphics to rediscover the same display on every
+       call was measurable during the effect-heavy frames. */
+    static CGDirectDisplayID cached_display;
+    if (cached_display) return cached_display;
     CGDirectDisplayID display = display_id_for_screen(preferred_game_screen());
-    return display ? display : CGMainDisplayID();
+    cached_display = display ? display : CGMainDisplayID();
+    return cached_display;
 }
 
 /*
@@ -1020,6 +1162,9 @@ static CGDirectDisplayID preferred_game_display_id(void)
  * dimension the guest sees agrees.  Zero width means no switch is in effect.
  */
 static NSSize guest_display_mode;
+/* Carbon/AGL titles keep their context in peggle_window.inc; that path needs
+   the same backing-surface update as OpenGLView when the guest switches mode. */
+static void pg_apply_guest_display_mode(void);
 
 static NSSize preferred_display_native_size(void)
 {
@@ -1068,6 +1213,7 @@ static void set_guest_display_mode(NSSize requested)
                 "compat32: guest display mode %.0fx%.0f on a %.0fx%.0f display -> %s\n",
                 requested.width, requested.height, native.width, native.height,
                 guest_display_mode_active() ? "scaled backing surface" : "native");
+        pg_apply_guest_display_mode();
     }
 }
 
@@ -1503,6 +1649,12 @@ static bool background_test_mode(void)
     (void)event;
     (void)reply;
     fprintf(stderr, "compat32: quit Apple event received; exiting\n");
+    /* This path leaves through _Exit without going near the guest's own exit
+       import or its Carbon event loop, so it is the one a Dock quit, Cmd-Q or
+       a quit Apple event takes.  Persist the registry here too, or every
+       setting and the selected profile are lost exactly where a player is
+       most likely to quit. */
+    compat_runtime32_flush_guest_registry("quit apple event");
     compat_runtime32_heap_report("quit-apple-event");
     fflush(NULL);
     _Exit(EXIT_SUCCESS);
@@ -1532,6 +1684,9 @@ static void install_termination_handler(void)
         (void)note;
         fprintf(stderr, "compat32: AppKit termination requested (Dock quit "
                 "or quit Apple event); exiting\n");
+        /* Same reasoning as the Apple event handler above: _Exit runs no
+           teardown, so this is the last moment the registry can reach disk. */
+        compat_runtime32_flush_guest_registry("AppKit terminate");
         compat_runtime32_heap_report("AppKit-will-terminate");
         fflush(NULL);
         _Exit(EXIT_SUCCESS);
@@ -4903,7 +5058,13 @@ FAST_GL(glGetFloatv)  { (void)return_address; glGetFloatv(arguments[0], (GLfloat
    Kept on the fast path so the thousands of calls per frame skip the name
    chains -- these were choppy going through the slow dispatcher. */
 FAST_GL(glDrawElements) { (void)return_address; glDrawElements(arguments[0], (GLsizei)arguments[1], arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
-FAST_GL(glVertexPointer) { (void)return_address; glVertexPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
+FAST_GL(glVertexPointer)
+{
+    (void)return_address;
+    glVertexPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2],
+                    (const void *)(uintptr_t)arguments[3]);
+    return 0;
+}
 FAST_GL(glColorPointer) { (void)return_address; glColorPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
 FAST_GL(glTexCoordPointer) { (void)return_address; glTexCoordPointer((GLint)arguments[0], arguments[1], (GLsizei)arguments[2], (const void *)(uintptr_t)arguments[3]); return 0; }
 FAST_GL(glNormalPointer) { (void)return_address; glNormalPointer(arguments[0], (GLsizei)arguments[1], (const void *)(uintptr_t)arguments[2]); return 0; }
@@ -4919,8 +5080,85 @@ FAST_GL(glEnableClientState) { (void)return_address; glEnableClientState(argumen
 FAST_GL(glBegin)      { (void)return_address; glBegin(arguments[0]); return 0; }
 FAST_GL(glEnd)        { (void)return_address; (void)arguments; glEnd(); return 0; }
 FAST_GL(glVertex2i)   { (void)return_address; glVertex2i((GLint)arguments[0], (GLint)arguments[1]); return 0; }
-FAST_GL(glVertex2f)   { (void)return_address; glVertex2f(guest_float_argument(arguments[0]), guest_float_argument(arguments[1])); return 0; }
+FAST_GL(glVertex2f)
+{
+    (void)return_address;
+    GLfloat vx = guest_float_argument(arguments[0]);
+    GLfloat vy = guest_float_argument(arguments[1]);
+    glVertex2f(vx, vy);
+    return 0;
+}
 FAST_GL(glTexCoord2f) { (void)return_address; glTexCoord2f(guest_float_argument(arguments[0]), guest_float_argument(arguments[1])); return 0; }
+FAST_GL(glColor4f)    { (void)return_address; glColor4f(guest_float_argument(arguments[0]), guest_float_argument(arguments[1]), guest_float_argument(arguments[2]), guest_float_argument(arguments[3])); return 0; }
+FAST_GL(glVertex3f)   { (void)return_address; glVertex3f(guest_float_argument(arguments[0]), guest_float_argument(arguments[1]), guest_float_argument(arguments[2])); return 0; }
+FAST_GL(glTexCoord2fv) { (void)return_address; glTexCoord2fv((const GLfloat *)(uintptr_t)arguments[0]); return 0; }
+/* Which matrix stack the guest is loading into.  Load-bearing, not
+   diagnostic: glLoadIdentity below applies the widescreen projection
+   correction only when the PROJECTION stack is current, so the fullscreen
+   crop fix depends on this being tracked. */
+static GLenum pg_gl_matrix_mode = GL_MODELVIEW;
+/* Zuma's Revenge lays its widgets out over a 1920-wide space in its own
+   fullscreen (+0x580) while the modelview it draws through still maps only
+   x 0..1600 onto NDC -- measured as m0=0.00125 in BOTH windowed and
+   fullscreen, unchanged across the switch.  Everything past x=1600 therefore
+   crosses the +1 clip plane and is discarded before rasterisation, which is
+   the crop, and why the missing region holds undefined buffer rather than
+   scene.  Scaling the projection by screen/layout brings the whole layout
+   inside NDC.  The guest loads identity into PROJECTION, so re-applying the
+   scale there keeps it in force without fighting it for the matrix. */
+static double pg_projection_x_scale = 1.0;
+static double pg_projection_x_translate;  /* NDC UNITS, not layout pixels */
+static double pg_projection_y_scale = 1.0;
+static double pg_projection_y_translate;
+FAST_GL(glLoadIdentity)
+{
+    (void)return_address; (void)arguments;
+    glLoadIdentity();
+    if (pg_gl_matrix_mode == GL_PROJECTION &&
+        (pg_projection_x_scale != 1.0 || pg_projection_x_translate != 0.0)) {
+        glTranslated(pg_projection_x_translate, pg_projection_y_translate, 0.0);
+        glScaled(pg_projection_x_scale, pg_projection_y_scale, 1.0);
+    }
+    else if (pg_gl_matrix_mode == GL_PROJECTION &&
+             (pg_projection_y_scale != 1.0 || pg_projection_y_translate != 0.0)) {
+        glTranslated(0.0, pg_projection_y_translate, 0.0);
+        glScaled(1.0, pg_projection_y_scale, 1.0);
+    }
+    return 0;
+}
+FAST_GL(glMatrixMode) { (void)return_address; pg_gl_matrix_mode = arguments[0]; glMatrixMode(arguments[0]); return 0; }
+FAST_GL(glPushMatrix) { (void)return_address; (void)arguments; glPushMatrix(); return 0; }
+FAST_GL(glPopMatrix) { (void)return_address; (void)arguments; glPopMatrix(); return 0; }
+FAST_GL(glTranslatef) { (void)return_address; glTranslatef(guest_float_argument(arguments[0]), guest_float_argument(arguments[1]), guest_float_argument(arguments[2])); return 0; }
+FAST_GL(glRotatef) { (void)return_address; glRotatef(guest_float_argument(arguments[0]), guest_float_argument(arguments[1]), guest_float_argument(arguments[2]), guest_float_argument(arguments[3])); return 0; }
+FAST_GL(glScalef) { (void)return_address; glScalef(guest_float_argument(arguments[0]), guest_float_argument(arguments[1]), guest_float_argument(arguments[2])); return 0; }
+FAST_GL(glScaled) {
+    (void)return_address;
+    double x, y, z;
+    memcpy(&x, arguments + 0, sizeof(x));
+    memcpy(&y, arguments + 2, sizeof(y));
+    memcpy(&z, arguments + 4, sizeof(z));
+    glScaled(x, y, z);
+    return 0;
+}
+FAST_GL(glRasterPos2d) {
+    (void)return_address;
+    double x, y;
+    memcpy(&x, arguments + 0, sizeof(x));
+    memcpy(&y, arguments + 2, sizeof(y));
+    glRasterPos2d(x, y);
+    return 0;
+}
+FAST_GL(glViewport) {
+    (void)return_address;
+    GLint x = (GLint)arguments[0], y = (GLint)arguments[1];
+    GLsizei width = (GLsizei)arguments[2], height = (GLsizei)arguments[3];
+    pg_adjust_fullscreen_viewport(&x, &y, &width, &height);
+    glViewport(x, y, width, height);
+    return 0;
+}
+FAST_GL(glClear) { (void)return_address; ++gl_frame_diagnostics.clear_calls; glClear(arguments[0]); return 0; }
+FAST_GL(glClearColor) { (void)return_address; glClearColor(guest_float_argument(arguments[0]), guest_float_argument(arguments[1]), guest_float_argument(arguments[2]), guest_float_argument(arguments[3])); return 0; }
 FAST_GL(glColor4ub)   { (void)return_address; glColor4ub((GLubyte)arguments[0], (GLubyte)arguments[1], (GLubyte)arguments[2], (GLubyte)arguments[3]); return 0; }
 FAST_GL(glColor4ubv)  { (void)return_address; glColor4ubv((const GLubyte *)(uintptr_t)arguments[0]); return 0; }
 /* Bejeweled 2 checks glGetError once per quad, so it is as hot as the vertex
@@ -4938,7 +5176,13 @@ FAST_GL(glGetError)
     return error;
 }
 FAST_GL(glDisableClientState) { (void)return_address; glDisableClientState(arguments[0]); return 0; }
-FAST_GL(glLoadMatrixf) { (void)return_address; glLoadMatrixf((const GLfloat *)(uintptr_t)arguments[0]); return 0; }
+FAST_GL(glLoadMatrixf)
+{
+    (void)return_address;
+    const GLfloat *matrix = (const GLfloat *)(uintptr_t)arguments[0];
+    glLoadMatrixf(matrix);
+    return 0;
+}
 /* Shader uniforms are updated every frame by Bejeweled 3's flame/ripple GLSL
    effects; keep them on the fast path too. */
 FAST_GL(glUseProgram) { (void)return_address; glUseProgram(arguments[0]); return 0; }
@@ -5017,6 +5261,21 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
         {"_glTexCoord2f", fast_glTexCoord2f},
         {"_glColor4ub", fast_glColor4ub},
         {"_glColor4ubv", fast_glColor4ubv},
+        {"_glColor4f", fast_glColor4f},
+        {"_glVertex3f", fast_glVertex3f},
+        {"_glTexCoord2fv", fast_glTexCoord2fv},
+        {"_glLoadIdentity", fast_glLoadIdentity},
+        {"_glMatrixMode", fast_glMatrixMode},
+        {"_glPushMatrix", fast_glPushMatrix},
+        {"_glPopMatrix", fast_glPopMatrix},
+        {"_glTranslatef", fast_glTranslatef},
+        {"_glRotatef", fast_glRotatef},
+        {"_glScalef", fast_glScalef},
+        {"_glScaled", fast_glScaled},
+        {"_glRasterPos2d", fast_glRasterPos2d},
+        {"_glViewport", fast_glViewport},
+        {"_glClear", fast_glClear},
+        {"_glClearColor", fast_glClearColor},
         {"_glGetError", fast_glGetError},
         {"_glDisableClientState", fast_glDisableClientState},
         {"_glLoadMatrixf", fast_glLoadMatrixf},
@@ -5029,6 +5288,13 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
     for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
         if (strcmp(import_name, table[index].name) == 0) {
             return table[index].handler;
+        }
+    }
+    if (import_name[0] == '_' && import_name[1] == 'g' && import_name[2] == 'l') {
+        for (size_t index = 0; index < sizeof(table) / sizeof(table[0]); ++index) {
+            if (strcmp(import_name + 1, table[index].name) == 0) {
+                return table[index].handler;
+            }
         }
     }
     return NULL;
@@ -5059,15 +5325,26 @@ int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
      * thousand calls) and never create Objective-C temporaries, so they skip
      * the pool push/pop entirely.
      */
-    @autoreleasepool { if (peggle_mac_dispatch(import_name, arguments, result)) return 1; }
     const size_t import_length = strlen(import_name);
     bool is_gl = (import_name[0] == 'g' && import_name[1] == 'l') ||
                  (import_name[0] == '_' && import_name[1] == 'g' &&
                   import_name[2] == 'l');
     if (is_gl) {
-        return objc_bridge32_dispatch_body(import_name, import_length,
-                                           arguments, result);
+        /* The Carbon GL path is all plain C calls.  Creating and draining an
+           autorelease pool for every vertex, colour, and texture call adds a
+           measurable per-quad cost to Zuma's explosion sprites, which can
+           issue tens of thousands of calls in one frame. */
+        if (peggle_mac_dispatch(import_name, arguments, result)) return 1;
+        if (objc_bridge32_dispatch_body(import_name, import_length,
+                                        arguments, result)) return 1;
+        if (import_name[0] == '_') {
+            return objc_bridge32_dispatch_body(import_name + 1,
+                                               import_length - 1,
+                                               arguments, result);
+        }
+        return 0;
     }
+    @autoreleasepool { if (peggle_mac_dispatch(import_name, arguments, result)) return 1; }
     @autoreleasepool {
         return objc_bridge32_dispatch_body(import_name, import_length,
                                            arguments, result);
@@ -5128,8 +5405,14 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CGDisplayIOServicePort")) {
-        /* Removed by Apple; callers use zero as "no registry service". */
-        *result = 0;
+        /* Apple removed the real call, but zero reads as "no registry service"
+           and a caller that cannot reach the display's registry entry gets no
+           IOFBMemorySize from it.  Zuma's Revenge sizes its art from that
+           number and falls back to 32 MB without it, which is under the 92 MB
+           it demands before loading the high-resolution set it ships.  Hand
+           back a sentinel entry that _IORegistryEntryCreateCFProperty below
+           recognises. */
+        *result = kGuestDisplayServicePort;
         return 1;
     }
     /*
@@ -6482,7 +6765,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     (GLint)arguments[0], (GLint)arguments[1],
                     (GLsizei)arguments[2], (GLsizei)arguments[3]);
         }
-        glViewport(arguments[0], arguments[1], arguments[2], arguments[3]);
+        GLint x = (GLint)arguments[0], y = (GLint)arguments[1];
+        GLsizei width = (GLsizei)arguments[2], height = (GLsizei)arguments[3];
+        pg_adjust_fullscreen_viewport(&x, &y, &width, &height);
+        glViewport(x, y, width, height);
         *result = 0; return 1;
     }
     /* Fixed-function immediate mode used by the legacy display path for
@@ -6518,6 +6804,264 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         glMatrixMode(arguments[0]);
         *result = 0; return 1;
     }
+    /* The rest of the fixed-function matrix stack, which Feeding Frenzy uses
+       to place every sprite it draws. */
+    if (LP32_NAME_IS(import_name, import_length, "_glPushMatrix")) {
+        glPushMatrix();
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glPopMatrix")) {
+        glPopMatrix();
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTranslatef")) {
+        glTranslatef(guest_float_argument(arguments[0]),
+                     guest_float_argument(arguments[1]),
+                     guest_float_argument(arguments[2]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glRotatef")) {
+        glRotatef(guest_float_argument(arguments[0]),
+                  guest_float_argument(arguments[1]),
+                  guest_float_argument(arguments[2]),
+                  guest_float_argument(arguments[3]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glActiveTextureARB")) {
+        glActiveTexture(arguments[0]);
+        *result = 0; return 1;
+    }
+    /*
+     * The shader and compressed-texture entry points SmartDX uses to put
+     * Direct3D on top of OpenGL.  The ARB-suffixed names are the same
+     * functions as the core ones on this driver, so they forward straight
+     * through; the array forms take a guest pointer, which is mapped in this
+     * process and so can be passed along as-is.
+     */
+    /*
+     * The fixed-function GL SmartDX still leans on -- display lists, fog,
+     * lighting and materials, the matrix helpers and the array forms of the
+     * immediate-mode calls -- plus the handful of queries it makes while
+     * deciding what Direct3D capabilities to advertise.  All of these exist
+     * unchanged in the host GL, so they forward directly; guest pointers are
+     * mapped in this process and pass through as they are.
+     */
+    if (LP32_NAME_IS(import_name, import_length, "_glCallList")) {
+        glCallList(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCallLists")) {
+        glCallLists((GLsizei)arguments[0], arguments[1],
+                    (const void *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glListBase")) {
+        glListBase(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGenLists")) {
+        *result = glGenLists((GLsizei)arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glClipPlane")) {
+        glClipPlane(arguments[0], (const GLdouble *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glColor3f")) {
+        glColor3f(guest_float_argument(arguments[0]),
+                  guest_float_argument(arguments[1]),
+                  guest_float_argument(arguments[2]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCompressedTexImage3D")) {
+        glCompressedTexImage3D(arguments[0], (GLint)arguments[1], arguments[2],
+                               (GLsizei)arguments[3], (GLsizei)arguments[4],
+                               (GLsizei)arguments[5], (GLint)arguments[6],
+                               (GLsizei)arguments[7],
+                               (const void *)(uintptr_t)arguments[8]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glFogf")) {
+        glFogf(arguments[0], guest_float_argument(arguments[1]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glFogfv")) {
+        glFogfv(arguments[0], (const GLfloat *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glFogi")) {
+        glFogi(arguments[0], (GLint)arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLightf")) {
+        glLightf(arguments[0], arguments[1], guest_float_argument(arguments[2]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLightfv")) {
+        glLightfv(arguments[0], arguments[1],
+                  (const GLfloat *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLightModelfv")) {
+        glLightModelfv(arguments[0], (const GLfloat *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLightModeli")) {
+        glLightModeli(arguments[0], (GLint)arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glMaterialf")) {
+        glMaterialf(arguments[0], arguments[1],
+                    guest_float_argument(arguments[2]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glMaterialfv")) {
+        glMaterialfv(arguments[0], arguments[1],
+                     (const GLfloat *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glLoadMatrixd")) {
+        glLoadMatrixd((const GLdouble *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glMultMatrixf")) {
+        glMultMatrixf((const GLfloat *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glScalef")) {
+        glScalef(guest_float_argument(arguments[0]),
+                 guest_float_argument(arguments[1]),
+                 guest_float_argument(arguments[2]));
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glScaled")) {
+        double x, y, z;
+        memcpy(&x, arguments + 0, sizeof(x));
+        memcpy(&y, arguments + 2, sizeof(y));
+        memcpy(&z, arguments + 4, sizeof(z));
+        glScaled(x, y, z); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glRasterPos2d")) {
+        double x, y;
+        memcpy(&x, arguments + 0, sizeof(x));
+        memcpy(&y, arguments + 2, sizeof(y));
+        glRasterPos2d(x, y); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glWindowPos2i")) {
+        glWindowPos2i((GLint)arguments[0], (GLint)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glNormal3fv")) {
+        glNormal3fv((const GLfloat *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glVertex3fv")) {
+        glVertex3fv((const GLfloat *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glVertex4fv")) {
+        glVertex4fv((const GLfloat *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTexCoord3fv")) {
+        glTexCoord3fv((const GLfloat *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTexCoord4fv")) {
+        glTexCoord4fv((const GLfloat *)(uintptr_t)arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTexGenfv")) {
+        glTexGenfv(arguments[0], arguments[1],
+                   (const GLfloat *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glTexGeni")) {
+        glTexGeni(arguments[0], arguments[1], (GLint)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glPolygonMode")) {
+        glPolygonMode(arguments[0], arguments[1]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glPushAttrib")) {
+        glPushAttrib(arguments[0]); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glPopAttrib")) {
+        glPopAttrib(); *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glPrioritizeTextures")) {
+        glPrioritizeTextures((GLsizei)arguments[0],
+                             (const GLuint *)(uintptr_t)arguments[1],
+                             (const GLclampf *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetBooleanv")) {
+        glGetBooleanv(arguments[0], (GLboolean *)(uintptr_t)arguments[1]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glIsEnabled")) {
+        *result = glIsEnabled(arguments[0]); return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetAttribLocation")) {
+        *result = (uint32_t)glGetAttribLocation(arguments[0],
+                      (const GLchar *)(uintptr_t)arguments[1]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetProgramInfoLog")) {
+        glGetProgramInfoLog(arguments[0], (GLsizei)arguments[1],
+                            (GLsizei *)(uintptr_t)arguments[2],
+                            (GLchar *)(uintptr_t)arguments[3]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glGetConvolutionParameteriv")) {
+        /* ARB_imaging convolution is not present on this renderer, and the
+           caller only uses the answer to size a filter it then declines to
+           use.  Report zero rather than leaving the value unwritten. */
+        GLint *values = (GLint *)(uintptr_t)arguments[2];
+        if (values) values[0] = 0;
+        *result = 0; return 1;
+    }
+    /* gluPerspective without pulling in GLU: it is defined as the frustum
+       whose half-height at the near plane is zNear * tan(fovy / 2). */
+    if (LP32_NAME_IS(import_name, import_length, "_gluPerspective")) {
+        double fovy, aspect, near_plane, far_plane;
+        memcpy(&fovy, arguments + 0, sizeof(fovy));
+        memcpy(&aspect, arguments + 2, sizeof(aspect));
+        memcpy(&near_plane, arguments + 4, sizeof(near_plane));
+        memcpy(&far_plane, arguments + 6, sizeof(far_plane));
+        double top = near_plane * tan(fovy * (M_PI / 360.0));
+        double right = top * aspect;
+        glFrustum(-right, right, -top, top, near_plane, far_plane);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glCompressedTexSubImage3DARB")) {
+        glCompressedTexSubImage3D(arguments[0], (GLint)arguments[1],
+                                  (GLint)arguments[2], (GLint)arguments[3],
+                                  (GLint)arguments[4], (GLsizei)arguments[5],
+                                  (GLsizei)arguments[6], (GLsizei)arguments[7],
+                                  arguments[8], (GLsizei)arguments[9],
+                                  (const void *)(uintptr_t)arguments[10]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glDeleteProgram")) {
+        glDeleteProgram(arguments[0]);
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glUniform1fvARB") ||
+        LP32_NAME_IS(import_name, import_length, "_glUniform2fvARB") ||
+        LP32_NAME_IS(import_name, import_length, "_glUniform3fvARB") ||
+        LP32_NAME_IS(import_name, import_length, "_glUniform4fvARB")) {
+        GLint location = (GLint)arguments[0];
+        GLsizei count = (GLsizei)arguments[1];
+        const GLfloat *values = (const void *)(uintptr_t)arguments[2];
+        switch (import_name[10]) {
+        case '1': glUniform1fv(location, count, values); break;
+        case '2': glUniform2fv(location, count, values); break;
+        case '3': glUniform3fv(location, count, values); break;
+        default:  glUniform4fv(location, count, values); break;
+        }
+        *result = 0; return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_glUniform1ivARB")) {
+        glUniform1iv((GLint)arguments[0], (GLsizei)arguments[1],
+                     (const GLint *)(uintptr_t)arguments[2]);
+        *result = 0; return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_glCopyTexSubImage2D")) {
         glCopyTexSubImage2D(arguments[0], (GLint)arguments[1],
                             (GLint)arguments[2], (GLint)arguments[3],
@@ -6532,10 +7076,36 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntrySearchCFProperty")) {
         NSString *key = object_for_argument(arguments[2]);
         uint32_t identifier = 0;
-        if ([key isEqualToString:@"vendor-id"]) identifier = UINT32_C(0x106b);
-        else if ([key isEqualToString:@"device-id"]) identifier = 1;
+        /* Zuma's compat.cfg enables its 1200-pixel art set only for an
+           NVIDIA/ATI-class adapter.  Apple Silicon's registry reports the
+           Apple vendor id, which makes the unmodified game deliberately load
+           the 600-pixel assets even though the translated OpenGL renderer has
+           ample memory.  Advertise a modern ATI-compatible identity for this
+           title so its existing high-resolution and 3D paths are selected. */
+        bool zuma_gpu_profile = lp32_profile()->title == LP32_TITLE_ZUMAS_REVENGE;
+        if ([key isEqualToString:@"vendor-id"])
+            identifier = zuma_gpu_profile ? UINT32_C(0x1002) : UINT32_C(0x106b);
+        else if ([key isEqualToString:@"device-id"])
+            identifier = zuma_gpu_profile ? UINT32_C(0x73bf) : 1;
         NSData *data = [NSData dataWithBytes:&identifier length:sizeof(identifier)];
         *result = proxy_for_object(data);
+        return 1;
+    }
+    /* The framebuffer's memory size, which is how a title of this age asks how
+       much VRAM it has: CGDisplayIOServicePort above hands out the sentinel
+       entry and the answer comes back here.  The caller reads it as a signed
+       32-bit byte count and converts with (bytes + 0xfffff) >> 20.  Report a
+       full 1 GiB so Zuma's 3D compatibility script and high-resolution art
+       checks both take their accelerated branch. */
+    if (LP32_NAME_IS(import_name, import_length, "_IORegistryEntryCreateCFProperty")) {
+        NSString *key = object_for_argument(arguments[1]);
+        if (arguments[0] == kGuestDisplayServicePort &&
+            ([key isEqualToString:@"IOFBMemorySize"] ||
+             [key isEqualToString:@"VRAM,totalsize"])) {
+            *result = proxy_for_object([NSNumber numberWithInt:1024 * 1024 * 1024]);
+        } else {
+            *result = 0;
+        }
         return 1;
     }
 
@@ -6605,10 +7175,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRelease")) {
+        proxy_release_handle(arguments[0]);
         *result = 0;
         return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRetain")) {
+        int32_t retained = proxy_index_for_handle(arguments[0]);
+        if (retained >= 0) ++proxies[retained].references;
         *result = arguments[0];
         return 1;
     }
@@ -6630,6 +7203,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         NSString *string = object_for_argument(arguments[0]);
         char *buffer = (void *)(uintptr_t)arguments[1];
         CFIndex capacity = (int32_t)arguments[2];
+        /* Same null hazard as CFStringCompare below: report failure (and leave
+           an empty C string behind) instead of dereferencing nothing. */
+        if (!string) {
+            if (buffer && capacity > 0) buffer[0] = '\0';
+            *result = 0;
+            return 1;
+        }
         *result = CFStringGetCString((CFStringRef)string, buffer, capacity,
                                      arguments[3]);
         return 1;
@@ -6637,6 +7217,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     if (LP32_NAME_IS(import_name, import_length, "_CFStringCompare")) {
         NSString *left = object_for_argument(arguments[0]);
         NSString *right = object_for_argument(arguments[1]);
+        /* CFStringCompare dereferences both arguments, so a handle that did
+           not resolve -- a stale one, or any handle at all once the proxy pool
+           is exhausted and proxy_for_object starts returning 0 -- took the
+           process down here with a null read.  Order a missing operand rather
+           than crash: degrading is survivable, a SIGSEGV mid-session is not. */
+        if (!left || !right) {
+            *result = (uint32_t)(left ? kCFCompareGreaterThan :
+                                 right ? kCFCompareLessThan : kCFCompareEqualTo);
+            return 1;
+        }
         *result = (uint32_t)CFStringCompare((CFStringRef)left,
                                             (CFStringRef)right, arguments[2]);
         return 1;
@@ -6705,6 +7295,79 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         id key = object_for_argument(arguments[1]);
         id value = object_for_argument(arguments[2]);
         if (key && value) [dictionary setObject:value forKey:key];
+        *result = 0;
+        return 1;
+    }
+    /* The mutable collections Bookworm builds its resource tables with.  The
+       allocator and the key/value callback structs only describe the
+       CoreFoundation types a proxy already carries, so they are ignored. */
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutable")) {
+        *result = proxy_for_object([NSMutableDictionary dictionary]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryCreateMutableCopy")) {
+        NSDictionary *source = object_for_argument(arguments[2]);
+        *result = proxy_for_object(source ? [[source mutableCopy] autorelease]
+                                          : [NSMutableDictionary dictionary]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryGetCount")) {
+        NSDictionary *dictionary = object_for_argument(arguments[0]);
+        *result = (uint32_t)[dictionary count];
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryRemoveValue")) {
+        NSMutableDictionary *dictionary = object_for_argument(arguments[0]);
+        id key = object_for_argument(arguments[1]);
+        if (key) [dictionary removeObjectForKey:key];
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryReplaceValue")) {
+        NSMutableDictionary *dictionary = object_for_argument(arguments[0]);
+        id key = object_for_argument(arguments[1]);
+        id value = object_for_argument(arguments[2]);
+        /* Replace, unlike set, leaves a key that is not already there alone. */
+        if (key && value && [dictionary objectForKey:key]) {
+            [dictionary setObject:value forKey:key];
+        }
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFDictionaryApplyFunction")) {
+        NSDictionary *dictionary = object_for_argument(arguments[0]);
+        uint32_t applier = arguments[1];
+        if (applier) {
+            /* The applier is guest code, so walk a copy: the guest is free to
+               mutate the dictionary from inside it. */
+            for (id key in [[dictionary copy] autorelease]) {
+                uint32_t call[3] = {proxy_for_object(key),
+                                    proxy_for_object([dictionary objectForKey:key]),
+                                    arguments[2]};
+                compat_runtime32_call(applier, call, 3);
+            }
+        }
+        *result = 0;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArrayCreateMutable")) {
+        *result = proxy_for_object([NSMutableArray array]);
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_CFArraySetValueAtIndex")) {
+        NSMutableArray *array = object_for_argument(arguments[0]);
+        NSUInteger index = arguments[1];
+        id value = object_for_argument(arguments[2]);
+        if (value) {
+            /* CFArraySetValueAtIndex also appends at count; pad if the guest
+               skips ahead, which NSMutableArray would otherwise reject. */
+            while ([array count] < index) [array addObject:[NSNull null]];
+            if (index < [array count]) {
+                [array replaceObjectAtIndex:index withObject:value];
+            } else {
+                [array addObject:value];
+            }
+        }
         *result = 0;
         return 1;
     }
@@ -6786,6 +7449,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         CFNumberType requested_type = (CFNumberType)arguments[1];
         void *guest_output = (void *)(uintptr_t)arguments[2];
         Boolean converted = false;
+        /* CFNumberGetValue dereferences the number it is given.  A guest that
+           looked one up and missed passes null, and reporting the conversion
+           as failed is what the real call does rather than faulting. */
+        if (!number) { *result = 0; return 1; }
 
         if (requested_type == kCFNumberLongType ||
             requested_type == kCFNumberCFIndexType ||
@@ -7420,6 +8087,20 @@ uint32_t objc_bridge32_pointer_import(const char *import_name)
     if (!strcmp(import_name,"_kCFPreferencesAnyHost")) return proxy_for_object((id)kCFPreferencesAnyHost);
     if (!strcmp(import_name,"_kCFPreferencesCurrentUser")) return proxy_for_object((id)kCFPreferencesCurrentUser);
     if (!strcmp(import_name,"_kCFPreferencesAnyApplication")) return proxy_for_object((id)kCFPreferencesAnyApplication);
+    /* Allocator and collection-callback globals: the bridge's collections are
+       Foundation objects, so these are only ever handed straight back to calls
+       that ignore them.  A sentinel proxy keeps them distinguishable from an
+       import the bridge does not know. */
+    /* SmartDX imports this one and compares dictionary values against it, so
+       it has to be the real CFBoolean rather than an opaque sentinel. */
+    if (!strcmp(import_name,"_kCFBooleanTrue")) return proxy_for_object((id)kCFBooleanTrue);
+    if (!strcmp(import_name,"_kCFBooleanFalse")) return proxy_for_object((id)kCFBooleanFalse);
+    if (!strcmp(import_name,"_kCFAllocatorDefault") ||
+        !strcmp(import_name,"_kCFTypeArrayCallBacks") ||
+        !strcmp(import_name,"_kCFTypeDictionaryKeyCallBacks") ||
+        !strcmp(import_name,"_kCFTypeDictionaryValueCallBacks")) {
+        return proxy_for_object([NSNull null]);
+    }
     const size_t import_length = strlen(import_name);
     if (LP32_NAME_IS(import_name, import_length, "_NSApp")) {
         return proxy_for_object([NSApplication sharedApplication]);
@@ -8072,6 +8753,59 @@ cleanup_3d:
     if (texture) glDeleteTextures(1, &texture);
     compat_runtime32_deallocate(guest_bytes);
     return status;
+}
+
+int objc_bridge32_run_window_geometry_self_test(void)
+{
+    static const struct {
+        const char *what;
+        NSSize requested;
+        NSSize previous;
+        NSSize expected;
+    } cases[] = {
+        {"fullscreen caption drift", {1080, 832}, {1080, 810}, {1080, 810}},
+        /* The game's real surface still round-trips untouched. */
+        {"legitimate 4:3 request",   {1080, 810}, {1080, 810}, {1080, 810}},
+        {"other 4:3 titles",         {800, 600},  {800, 600},  {800, 600}},
+        /* With nothing established yet, a non-4:3 request is snapped rather
+           than teaching the guest a stretched surface. */
+        {"first request, 16:9",      {1920, 1080}, {0, 0},     {1440, 1080}},
+        {"first request, caption",   {1080, 832},  {0, 0},     {1080, 810}},
+    };
+    const char *failure = NULL;
+    char detail[192] = "";
+
+    if (lp32_profile()->title == LP32_TITLE_CHUZZLE) {
+        fputs("Window geometry self-test: SKIP (Chuzzle keeps its own 5:4"
+              " surface)\n", stderr);
+        return 0;
+    }
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+        NSSize got = pg_logical_size_for_request(cases[i].requested,
+                                                 cases[i].previous);
+        if (got.width == cases[i].expected.width &&
+            got.height == cases[i].expected.height) continue;
+        snprintf(detail, sizeof detail,
+                 "%s: %.0fx%.0f with previous %.0fx%.0f gave %.0fx%.0f,"
+                 " expected %.0fx%.0f", cases[i].what,
+                 cases[i].requested.width, cases[i].requested.height,
+                 cases[i].previous.width, cases[i].previous.height,
+                 got.width, got.height,
+                 cases[i].expected.width, cases[i].expected.height);
+        /* The caller appends `detail`; pointing failure at it printed twice. */
+        failure = cases[i].what;
+        break;
+    }
+
+    if (failure) {
+        fprintf(stderr, "Window geometry self-test: FAIL (%s%s%s)\n", failure,
+                detail[0] ? ": " : "", detail);
+        return -1;
+    }
+    fputs("Window geometry self-test: PASS (caption drift rejected, 4:3"
+          " requests kept, first non-4:3 request snapped)\n", stderr);
+    return 0;
 }
 
 int objc_bridge32_run_gl_texture_self_test(void)

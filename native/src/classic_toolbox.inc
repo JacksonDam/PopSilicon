@@ -56,6 +56,16 @@ static bool ct_mp_region_live[kCtMPCapacity];
 static pthread_mutex_t ct_mp_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local uint32_t ct_mp_current_task;
 
+/* An MP event is a set of flags a waiter consumes: MPSetEvent ORs bits in and
+   wakes a waiter, MPWaitForEvent returns the bits and clears them (it is
+   auto-reset, unlike a semaphore's count). */
+static struct ct_mp_event {
+    pthread_mutex_t mutex;
+    pthread_cond_t condition;
+    uint32_t flags;
+    bool live;
+} ct_mp_events[kCtMPCapacity];
+
 struct ct_mp_start { uint32_t entry, parameter, identifier; };
 
 static void *ct_mp_run(void *opaque)
@@ -453,7 +463,10 @@ static int classic_toolbox_dispatch(const char *n, const uint32_t *a, uint64_t *
 #define OUT(i, v) do { if (a[i]) *(uint32_t *)P(i) = (uint32_t)(v); } while (0)
 #define RET(x) do { *r = (uint64_t)(x); return 1; } while (0)
     enum lp32_title title = lp32_profile()->title;
-    if (title != LP32_TITLE_BEJEWELED2 && title != LP32_TITLE_ZUMA) return 0;
+    if (title != LP32_TITLE_BEJEWELED2 && title != LP32_TITLE_ZUMA &&
+        title != LP32_TITLE_BOOKWORM && title != LP32_TITLE_ZUMAS_REVENGE) {
+        return 0;
+    }
 
     /* --- Memory Manager --- */
     if (IS("_NewPtr")) RET(ct_new_ptr(a[0], false));
@@ -586,6 +599,84 @@ static int classic_toolbox_dispatch(const char *n, const uint32_t *a, uint64_t *
         }
         RET(0);
     }
+    if (IS("_MPCreateEvent")) {
+        pthread_mutex_lock(&ct_mp_lock);
+        uint32_t identifier = 0;
+        for (uint32_t i = 1; i < kCtMPCapacity; ++i) {
+            if (!ct_mp_events[i].live) { identifier = i; break; }
+        }
+        if (identifier) {
+            pthread_mutex_init(&ct_mp_events[identifier].mutex, NULL);
+            pthread_cond_init(&ct_mp_events[identifier].condition, NULL);
+            ct_mp_events[identifier].flags = 0;
+            ct_mp_events[identifier].live = true;
+        }
+        pthread_mutex_unlock(&ct_mp_lock);
+        if (!identifier) RET((uint32_t)(int32_t)-1);
+        OUT(0, identifier);
+        RET(0);
+    }
+    if (IS("_MPDeleteEvent")) {
+        if (a[0] && a[0] < kCtMPCapacity && ct_mp_events[a[0]].live) {
+            struct ct_mp_event *event = &ct_mp_events[a[0]];
+            pthread_mutex_lock(&event->mutex);
+            event->live = false;
+            /* Release anyone still parked on it rather than leaving the
+               thread wedged on a condition nothing will ever signal. */
+            pthread_cond_broadcast(&event->condition);
+            pthread_mutex_unlock(&event->mutex);
+        }
+        RET(0);
+    }
+    if (IS("_MPSetEvent")) {
+        if (!a[0] || a[0] >= kCtMPCapacity || !ct_mp_events[a[0]].live) {
+            RET((uint32_t)(int32_t)-1);
+        }
+        struct ct_mp_event *event = &ct_mp_events[a[0]];
+        pthread_mutex_lock(&event->mutex);
+        event->flags |= a[1];
+        pthread_cond_signal(&event->condition);
+        pthread_mutex_unlock(&event->mutex);
+        RET(0);
+    }
+    if (IS("_MPWaitForEvent")) {
+        if (!a[0] || a[0] >= kCtMPCapacity || !ct_mp_events[a[0]].live) {
+            RET((uint32_t)(int32_t)-1);
+        }
+        struct ct_mp_event *event = &ct_mp_events[a[0]];
+        /* Duration: 0 polls, 0x7fffffff waits forever, a positive value is
+           milliseconds and a negative one microseconds. */
+        int32_t duration = (int32_t)a[2];
+        pthread_mutex_lock(&event->mutex);
+        if (!event->flags && duration != 0) {
+            if (duration == 0x7fffffff) {
+                while (event->live && !event->flags) {
+                    pthread_cond_wait(&event->condition, &event->mutex);
+                }
+            } else {
+                int64_t nanoseconds = duration > 0
+                    ? (int64_t)duration * 1000000 : -(int64_t)duration * 1000;
+                struct timespec slice = {
+                    (time_t)(nanoseconds / 1000000000),
+                    (long)(nanoseconds % 1000000000),
+                };
+                while (event->live && !event->flags) {
+                    if (pthread_cond_timedwait_relative_np(
+                            &event->condition, &event->mutex, &slice) == ETIMEDOUT) {
+                        break;
+                    }
+                }
+            }
+        }
+        uint32_t flags = event->flags;
+        bool live = event->live;
+        event->flags = 0;
+        pthread_mutex_unlock(&event->mutex);
+        if (!live) RET((uint32_t)(int32_t)-1);
+        if (!flags) RET((uint32_t)(int32_t)-3);
+        OUT(1, flags);
+        RET(0);
+    }
     if (IS("_MPAllocateAligned")) RET(ct_new_ptr(a[0], false));
     if (IS("_MPFree")) { ct_dispose_ptr(a[0]); RET(0); }
     if (IS("_MPGetAllocatedBlockSize")) RET(ct_ptr_size(a[0]));
@@ -639,11 +730,156 @@ static int classic_toolbox_dispatch(const char *n, const uint32_t *a, uint64_t *
         [NSApp activateIgnoringOtherApps:YES];
         RET(0);
     }
+    /* A ProcessSerialNumber is two words, and the games only ever pass it
+       back to SetFrontProcess or compare it with SameProcess, so any stable
+       non-zero pair identifies "this process" (kCurrentProcess is 0,2). */
+    if (IS("_GetCurrentProcess")) {
+        uint32_t *psn = P(0);
+        if (psn) { psn[0] = 0; psn[1] = 2; }
+        RET(0);
+    }
 
     /* --- File Manager pieces beyond the ones Peggle needs --- */
-    if (IS("_FSGetCatalogInfo")) RET((uint32_t)FSGetCatalogInfo(P(0), a[1], P(2), P(3), P(4), P(5)));
+    if (IS("_FSGetCatalogInfo")) {
+        /* The stat-equivalent: a failure here is how the game concludes a
+           settings file is absent. */
+        OSStatus status = FSGetCatalogInfo(P(0), a[1], P(2), P(3), P(4), P(5));
+        if (getenv("LP32_TRACE_FILES") && status != noErr) {
+            char path[PATH_MAX] = "(unresolved)";
+            if (P(0)) FSRefMakePath(P(0), (UInt8 *)path, sizeof(path));
+            fprintf(stderr, "compat32: FSGetCatalogInfo %s -> %d\n", path, (int)status);
+        }
+        RET((uint32_t)status);
+    }
     if (IS("_FSSetCatalogInfo")) RET((uint32_t)FSSetCatalogInfo(P(0), a[1], P(2)));
     if (IS("_FSDeleteObject")) RET((uint32_t)FSDeleteObject(P(0)));
+    /*
+     * Fork I/O.  The game keeps the FSIORefNum as a signed 16-bit field and
+     * sign-extends it at every call, and fork positions and sizes are 64-bit,
+     * arriving as a pair of words (low first).  Truncating either would
+     * silently read or write at the wrong offset rather than fail.
+     */
+    /*
+     * Colour tables, named cursors and the resource-fork odds and ends this
+     * title reaches for while it builds its cursors.  Nothing here has a
+     * modern equivalent: the bridge draws cursors from the game's own pixel
+     * data (see the overlay window), so the named-cursor registry only has to
+     * accept and forget, and an empty resource map is the honest answer for a
+     * bundle that carries no resource fork.
+     */
+    if (IS("_GetCTable")) {
+        /* CTabHandle: a handle to { ctSeed, ctFlags, ctSize, ctTable[] }.
+           ctSize is the last index, so a table of n entries reports n-1. */
+        uint32_t count = a[0] ? a[0] : 1;
+        if (count > 256) count = 256;
+        uint32_t bytes = 8 + count * 8;
+        uint32_t table = ct_new_ptr(bytes, true);
+        if (!table) RET(0);
+        uint8_t *fields = (void *)(uintptr_t)table;
+        uint32_t seed = a[0];
+        memcpy(fields, &seed, 4);
+        fields[4] = 0; fields[5] = 0;
+        uint16_t last = (uint16_t)(count - 1);
+        fields[6] = (uint8_t)(last >> 8); fields[7] = (uint8_t)last;
+        uint32_t handle = ct_new_ptr(4, false);
+        if (!handle) RET(0);
+        *(uint32_t *)(uintptr_t)handle = table;
+        RET(handle);
+    }
+    if (IS("_GetColor")) {
+        /* The colour picker: report that the user cancelled and leave the
+           caller's colour untouched. */
+        RET(0);
+    }
+    if (IS("_QDRegisterNamedPixMapCursor") || IS("_QDSetNamedPixMapCursor") ||
+        IS("_QDUnregisterNamedPixMapCursor")) RET(0);
+    if (IS("_ReleaseResource") || IS("_DetachResource")) RET(0);
+    if (IS("_GetResInfo")) {
+        /* id, type and name out-parameters for a resource that is not here. */
+        if (a[1]) *(uint16_t *)P(1) = 0;
+        if (a[2]) *(uint32_t *)P(2) = 0;
+        if (a[3]) ((uint8_t *)P(3))[0] = 0;
+        RET(0);
+    }
+    if (IS("_GetIndString")) {
+        /* A Pascal string out of a STR# resource: return an empty one. */
+        if (a[0]) ((uint8_t *)P(0))[0] = 0;
+        RET(0);
+    }
+    if (IS("_UppercaseText")) {
+        uint8_t *text = a[0] ? P(0) : NULL;
+        int32_t length = (int32_t)a[1];
+        for (int32_t i = 0; text && i < length; ++i) {
+            text[i] = (uint8_t)toupper(text[i]);
+        }
+        RET(0);
+    }
+    if (IS("_FSGetDataForkName")) RET((uint32_t)FSGetDataForkName(P(0)));
+    if (IS("_FSOpenFork")) {
+        /* LP32_TRACE_FILES never covered the Carbon fork path, only fopen (and
+           now open).  Zuma's Revenge resolves its Preferences folder through
+           FSFindFolder/FSRefMakePath and then opens GamePreferences.xml here,
+           which is why no file trace has ever shown that store being touched. */
+        OSStatus status = FSOpenFork(P(0), a[1], P(2), (SInt8)a[3], P(4));
+        if (getenv("LP32_TRACE_FILES")) {
+            char path[PATH_MAX] = "(unresolved)";
+            if (P(0)) FSRefMakePath(P(0), (UInt8 *)path, sizeof(path));
+            fprintf(stderr, "compat32: FSOpenFork %s perm=%d -> %d\n",
+                    path, (int)(SInt8)a[3], (int)status);
+        }
+        RET((uint32_t)status);
+    }
+    if (IS("_FSCloseFork")) RET((uint32_t)FSCloseFork((FSIORefNum)(int16_t)a[0]));
+    if (IS("_FSFlushFork")) RET((uint32_t)FSFlushFork((FSIORefNum)(int16_t)a[0]));
+    if (IS("_FSReadFork") || IS("_FSWriteFork")) {
+        SInt64 position = (SInt64)((uint64_t)a[2] | ((uint64_t)a[3] << 32));
+        ByteCount actual = 0;
+        OSErr error = IS("_FSReadFork")
+            ? FSReadFork((FSIORefNum)(int16_t)a[0], (SInt16)a[1], position,
+                         a[4], P(5), &actual)
+            : FSWriteFork((FSIORefNum)(int16_t)a[0], (SInt16)a[1], position,
+                          a[4], P(5), &actual);
+        if (a[6]) *(uint32_t *)P(6) = (uint32_t)actual;
+        RET((uint32_t)error);
+    }
+    if (IS("_FSGetForkSize")) {
+        SInt64 size = 0;
+        OSErr error = FSGetForkSize((FSIORefNum)(int16_t)a[0], &size);
+        if (a[1]) {
+            uint32_t *out = P(1);
+            out[0] = (uint32_t)(uint64_t)size;
+            out[1] = (uint32_t)((uint64_t)size >> 32);
+        }
+        RET((uint32_t)error);
+    }
+    if (IS("_FSSetForkSize")) {
+        SInt64 size = (SInt64)((uint64_t)a[2] | ((uint64_t)a[3] << 32));
+        RET((uint32_t)FSSetForkSize((FSIORefNum)(int16_t)a[0], (SInt16)a[1], size));
+    }
+    if (IS("_FSGetForkPosition")) {
+        SInt64 position = 0;
+        OSErr error = FSGetForkPosition((FSIORefNum)(int16_t)a[0], &position);
+        if (a[1]) {
+            uint32_t *out = P(1);
+            out[0] = (uint32_t)(uint64_t)position;
+            out[1] = (uint32_t)((uint64_t)position >> 32);
+        }
+        RET((uint32_t)error);
+    }
+    if (IS("_FSSetForkPosition")) {
+        SInt64 position = (SInt64)((uint64_t)a[2] | ((uint64_t)a[3] << 32));
+        RET((uint32_t)FSSetForkPosition((FSIORefNum)(int16_t)a[0], (SInt16)a[1],
+                                        position));
+    }
+    if (IS("_FSGetVolumeInfo"))
+        RET((uint32_t)FSGetVolumeInfo((FSVolumeRefNum)(int16_t)a[0], a[1],
+                                      P(2), a[3], P(4), P(5), P(6)));
+    if (IS("_FSCopyObjectSync"))
+        RET((uint32_t)FSCopyObjectSync(P(0), P(1), (CFStringRef)pg_cf_object(a[2]),
+                                       P(3), a[4]));
+    if (IS("_FSMoveObjectSync"))
+        RET((uint32_t)FSMoveObjectSync(P(0), P(1), (CFStringRef)pg_cf_object(a[2]),
+                                       P(3), a[4]));
     if (IS("_FSRenameUnicode")) RET((uint32_t)FSRenameUnicode(P(0), a[1], P(2), a[3], P(4)));
     if (IS("_FSOpenIterator")) {
         FSIterator iterator = NULL;

@@ -147,8 +147,13 @@ static int inspect_commands(const struct source_file *source,
     if (source->size < sizeof(*header) || header->magic != MH_MAGIC) {
         return fail_message("recovered image is not a native-endian 32-bit Mach-O");
     }
-    if (header->cputype != CPU_TYPE_I386 || header->filetype != MH_EXECUTE) {
-        return fail_message("recovered image is not an i386 executable");
+    /* A slid image is a dylib the game ships beside itself; it has no
+       LC_UNIXTHREAD, so it carries no entry point of its own. */
+    bool beside = image->slide != 0;
+    if (header->cputype != CPU_TYPE_I386 ||
+        header->filetype != (beside ? MH_DYLIB : MH_EXECUTE)) {
+        return fail_message(beside ? "companion image is not an i386 dylib"
+                                   : "recovered image is not an i386 executable");
     }
     if (!range_inside(sizeof(*header), header->sizeofcmds, source->size)) {
         return fail_message("Mach-O load-command region is truncated");
@@ -192,14 +197,15 @@ static int inspect_commands(const struct source_file *source,
                 if (segment->filesize > segment->vmsize) {
                     return fail_message("Mach-O segment filesize exceeds vmsize");
                 }
-                if (segment->vmaddr < min_address) min_address = segment->vmaddr;
-                if (segment->vmaddr + segment->vmsize > max_address) {
-                    max_address = segment->vmaddr + segment->vmsize;
+                uint32_t vmaddr = segment->vmaddr + image->slide;
+                if (vmaddr < min_address) min_address = vmaddr;
+                if (vmaddr + segment->vmsize > max_address) {
+                    max_address = vmaddr + segment->vmsize;
                 }
                 ++segment_count;
                 if (strncmp(segment->segname, "__STEAM", 16) == 0) {
-                    image->steam_stub_start = segment->vmaddr;
-                    image->steam_stub_end = segment->vmaddr + segment->vmsize;
+                    image->steam_stub_start = vmaddr;
+                    image->steam_stub_end = vmaddr + segment->vmsize;
                 }
             }
 
@@ -209,17 +215,17 @@ static int inspect_commands(const struct source_file *source,
                 if ((section[section_index].flags & SECTION_TYPE) ==
                     S_MOD_INIT_FUNC_POINTERS) {
                     initializer_count += section[section_index].size / sizeof(uint32_t);
-                    initializer_address = section[section_index].addr;
+                    initializer_address = section[section_index].addr + image->slide;
                 }
                 if (strncmp(section[section_index].sectname, "__cstring", 16) == 0 &&
                     strncmp(segment->segname, SEG_TEXT, 16) == 0) {
-                    image->cstring_start = section[section_index].addr;
-                    image->cstring_end = section[section_index].addr +
+                    image->cstring_start = section[section_index].addr + image->slide;
+                    image->cstring_end = image->cstring_start +
                                          section[section_index].size;
                 }
                 if (strncmp(section[section_index].sectname, "__cfstring", 16) == 0) {
-                    image->cfstring_start = section[section_index].addr;
-                    image->cfstring_end = section[section_index].addr +
+                    image->cfstring_start = section[section_index].addr + image->slide;
+                    image->cfstring_end = image->cfstring_start +
                                           section[section_index].size;
                 }
             }
@@ -236,7 +242,8 @@ static int inspect_commands(const struct source_file *source,
         cursor += command->cmdsize;
     }
 
-    if (cursor != commands_end || min_address == UINT32_MAX || !entry_eip) {
+    if (cursor != commands_end || min_address == UINT32_MAX ||
+        (!entry_eip && !beside)) {
         return fail_message("Mach-O has incomplete segment or entry-point metadata");
     }
 
@@ -271,7 +278,7 @@ static int collect_imports(struct macho_image32 *image)
         return fail_message("Mach-O import metadata is incomplete");
     }
 
-    uintptr_t linkedit_base = linkedit->vmaddr - linkedit->fileoff;
+    uintptr_t linkedit_base = linkedit->vmaddr + image->slide - linkedit->fileoff;
     const struct nlist *symbols = (const void *)(linkedit_base + symtab->symoff);
     const char *strings = (const void *)(linkedit_base + symtab->stroff);
     const uint32_t *indirect = (const void *)(linkedit_base + dysymtab->indirectsymoff);
@@ -305,14 +312,33 @@ static int collect_imports(struct macho_image32 *image)
                 }
                 for (uint32_t item = 0; item < count; ++item) {
                     uint32_t symbol_index = indirect[sections[section_index].reserved1 + item];
-                    if (symbol_index & (INDIRECT_SYMBOL_LOCAL | INDIRECT_SYMBOL_ABS)) continue;
+                    /* An absolute entry names a fixed address and is never
+                       adjusted, whatever the image's slide. */
+                    if (symbol_index & INDIRECT_SYMBOL_ABS) continue;
+                    if (symbol_index & INDIRECT_SYMBOL_LOCAL) {
+                        /* A local entry points at this image's own code or
+                           data, and the linker stored its unslid address, so
+                           dyld binds it by adding the slide.  Only pointer
+                           cells hold an address: a local stub is a relative
+                           jump and is already correct wherever it lands.
+                           (The mapped executables have no slide, and their
+                           cells are already absolute; leave those alone.) */
+                        if (image->slide && kind == MACHO_IMPORT32_POINTER) {
+                            uint32_t address = sections[section_index].addr +
+                                               item * stride + image->slide;
+                            uint32_t *slot = (void *)(uintptr_t)address;
+                            *slot += image->slide;
+                        }
+                        continue;
+                    }
                     if (symbol_index >= symtab->nsyms ||
                         symbols[symbol_index].n_un.n_strx >= symtab->strsize) {
                         return fail_message("Mach-O indirect symbol index is invalid");
                     }
                     if ((symbols[symbol_index].n_type & N_TYPE) == N_SECT) {
-                        uint32_t address = sections[section_index].addr + item * stride;
-                        uint32_t target = symbols[symbol_index].n_value;
+                        uint32_t address = sections[section_index].addr +
+                                           item * stride + image->slide;
+                        uint32_t target = symbols[symbol_index].n_value + image->slide;
                         if (kind == MACHO_IMPORT32_POINTER) {
                             memcpy((void *)(uintptr_t)address, &target, 4);
                         } else {
@@ -333,7 +359,8 @@ static int collect_imports(struct macho_image32 *image)
                     }
                     struct macho_import32 *import = &image->imports[image->import_count++];
                     import->name = name;
-                    import->address = sections[section_index].addr + item * stride;
+                    import->address = sections[section_index].addr + item * stride +
+                                      image->slide;
                     import->kind = kind;
                 }
             }
@@ -353,7 +380,7 @@ static int collect_imports(struct macho_image32 *image)
             reloc->r_type != GENERIC_RELOC_VANILLA) {
             return fail_message("Mach-O external relocation kind is unsupported");
         }
-        uint32_t address = (uint32_t)reloc->r_address;
+        uint32_t address = (uint32_t)reloc->r_address + image->slide;
         if (address < image->min_address || address + 4 > image->max_address ||
             reloc->r_symbolnum >= symtab->nsyms) {
             return fail_message("Mach-O external relocation is out of range");
@@ -361,7 +388,7 @@ static int collect_imports(struct macho_image32 *image)
         const struct nlist *symbol = &symbols[reloc->r_symbolnum];
         uint32_t *slot = (void *)(uintptr_t)address;
         if ((symbol->n_type & N_TYPE) == N_SECT) {
-            *slot += symbol->n_value;
+            *slot += symbol->n_value + image->slide;
             continue;
         }
         if ((symbol->n_type & N_TYPE) != N_UNDF) continue;
@@ -371,6 +398,29 @@ static int collect_imports(struct macho_image32 *image)
         struct macho_reloc32 *record = &image->relocations[image->relocation_count++];
         record->name = strings + symbol->n_un.n_strx;
         record->address = address;
+    }
+
+    /* Local relocations only exist in a position-independent image -- a dylib
+       linked at zero, which every address in has to be moved by the slide.
+       The executables the loader maps are non-PIE and have none. */
+    if (image->slide) {
+        const struct relocation_info *locals =
+            (const void *)(linkedit_base + dysymtab->locreloff);
+        for (uint32_t index = 0; index < dysymtab->nlocrel; ++index) {
+            const struct relocation_info *reloc = &locals[index];
+            if (reloc->r_address & R_SCATTERED) {
+                return fail_message("Mach-O scattered relocation is unsupported");
+            }
+            if (reloc->r_extern || reloc->r_pcrel || reloc->r_length != 2 ||
+                reloc->r_type != GENERIC_RELOC_VANILLA) {
+                return fail_message("Mach-O local relocation kind is unsupported");
+            }
+            uint32_t address = (uint32_t)reloc->r_address + image->slide;
+            if (address < image->min_address || address + 4 > image->max_address) {
+                return fail_message("Mach-O local relocation is out of range");
+            }
+            *(uint32_t *)(uintptr_t)address += image->slide;
+        }
     }
     return 0;
 }
@@ -386,7 +436,7 @@ static int map_segments(const struct source_file *source,
         if (command->cmd == LC_SEGMENT) {
             const struct segment_command *segment = (const void *)cursor;
             if (segment->vmsize && strncmp(segment->segname, SEG_PAGEZERO, 16) != 0) {
-                void *target = (void *)(uintptr_t)segment->vmaddr;
+                void *target = (void *)(uintptr_t)(segment->vmaddr + image->slide);
                 void *mapping = mmap(target, segment->vmsize,
                                      PROT_READ | PROT_WRITE,
                                      MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0);
@@ -396,8 +446,10 @@ static int map_segments(const struct source_file *source,
 
                 char segment_name[17];
                 printf("segment: %-10s 0x%08x-0x%08x file=%u prot=%c%c%c\n",
-                       fixed_name(segment->segname, segment_name), segment->vmaddr,
-                       segment->vmaddr + segment->vmsize, segment->filesize,
+                       fixed_name(segment->segname, segment_name),
+                       segment->vmaddr + image->slide,
+                       segment->vmaddr + image->slide + segment->vmsize,
+                       segment->filesize,
                        segment->initprot & VM_PROT_READ ? 'r' : '-',
                        segment->initprot & VM_PROT_WRITE ? 'w' : '-',
                        segment->initprot & VM_PROT_EXECUTE ? 'x' : '-');
@@ -419,7 +471,6 @@ static int map_segments(const struct source_file *source,
 static int protect_segments(const struct source_file *source,
                             struct macho_image32 *image)
 {
-    (void)image;
     const struct mach_header *header = (const void *)source->bytes;
     const uint8_t *cursor = source->bytes + sizeof(*header);
     for (uint32_t index = 0; index < header->ncmds; ++index) {
@@ -427,7 +478,8 @@ static int protect_segments(const struct source_file *source,
         if (command->cmd == LC_SEGMENT) {
             const struct segment_command *segment = (const void *)cursor;
             if (segment->vmsize && strncmp(segment->segname, SEG_PAGEZERO, 16) != 0 &&
-                mprotect((void *)(uintptr_t)segment->vmaddr, segment->vmsize,
+                mprotect((void *)(uintptr_t)(segment->vmaddr + image->slide),
+                         segment->vmsize,
                          mmap_protection(segment->initprot)) != 0) {
                 return fail_errno("mprotect legacy segment");
             }
@@ -451,6 +503,44 @@ int macho_image32_load(const char *path, struct macho_image32 *image)
     if (result == 0) result = map_segments(&source, image);
     /* Relocations (incl. text relocations) are applied while every segment is
        still writable; only then is each segment set to its final protection. */
+    if (result == 0) result = collect_imports(image);
+    if (result == 0) result = protect_segments(&source, image);
+
+    int saved_errno = errno;
+    munmap((void *)source.bytes, source.size);
+    errno = saved_errno;
+    return result;
+}
+
+/* Release just this window of the legacy reservation.  The game's own load
+   frees everything from the reservation's start to the end of its image, so a
+   companion mapped above that is still pinned by the __LEGACY zerofill. */
+static int release_reservation_window(uint32_t start, uint32_t end)
+{
+    uint32_t aligned_end = (end + kLegacyPageSize - 1) & ~(uint32_t)(kLegacyPageSize - 1);
+    if (start < kLegacyReservationStart || aligned_end > kLegacyReservationEnd) {
+        return fail_message("companion image falls outside the legacy reservation");
+    }
+    if (munmap((void *)(uintptr_t)start, aligned_end - start) != 0) {
+        return fail_errno("munmap companion reservation window");
+    }
+    return 0;
+}
+
+int macho_image32_load_beside(const char *path, uint32_t slide,
+                              struct macho_image32 *image)
+{
+    memset(image, 0, sizeof(*image));
+    image->slide = slide;
+    struct source_file source = {0};
+    if (open_source(path, &source) != 0) return -1;
+
+    int result = inspect_commands(&source, image);
+    if (result == 0) {
+        result = release_reservation_window(image->min_address, image->max_address);
+    }
+    if (result == 0) result = verify_address_hole(image->min_address, image->max_address);
+    if (result == 0) result = map_segments(&source, image);
     if (result == 0) result = collect_imports(image);
     if (result == 0) result = protect_segments(&source, image);
 

@@ -132,8 +132,11 @@ static int peggle_cxx_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         }
         char reason[512];
         snprintf(reason, sizeof(reason),
-                 "guest threw C++ exception %s at 0x%08x (%08x %08x %08x %08x) \"%.200s\"",
-                 type ? type : "?", a[0], object ? object[0] : 0, object ? object[1] : 0,
+                 "guest threw C++ exception %s (typeinfo 0x%08x kind %d) at 0x%08x "
+                 "(%08x %08x %08x %08x) \"%.200s\"",
+                 type ? type : "?", a[1],
+                 a[1] >= 0x1000 ? pg_ti_kind(a[1]) : -1, a[0],
+                 object ? object[0] : 0, object ? object[1] : 0,
                  object ? object[2] : 0, object ? object[3] : 0, text);
         pg_escape_guest(reason);
         RET(0);

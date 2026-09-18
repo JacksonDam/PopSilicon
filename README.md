@@ -3,7 +3,7 @@
 PopSilicon runs the original 32-bit Intel PopCap Mac games on Apple silicon by
 loading their i386 Mach-O image through Rosetta and translating the legacy
 Carbon, CoreFoundation, OpenGL, audio, libc, pthread, and C++ ABI calls to
-current macOS APIs. It ships as five products built from the same runtime:
+current macOS APIs. It ships as seven products built from the same runtime:
 
 - **PeggleSilicon** for Peggle Deluxe 1.0.5 and Peggle Nights 1.0.4. Peggle Deluxe has been playtested through all of Adventure Mode stages and works well. Peggle Nights has been tested up to Stage 3-5 and seems to work well.
 - **BejeweledSilicon** for Bejeweled 3 1.1.12 and Bejeweled 2 Deluxe 1.0.0.
@@ -14,8 +14,13 @@ seems to work well.
 start of Adventure mode and seems to work well.
 - **ZumaSilicon** for Zuma Deluxe 1.0.0. Passed basic testing and seems to 
 work well.
+- **BookwormSilicon** for Bookworm Deluxe 1.0.5. Boots to the main menu, with a
+new player profile created in the game's own name dialog; the Classic and Action
+modes have not been played through yet.
+- **FeedingFrenzySilicon** for Feeding Frenzy Deluxe 1.0. Boots to its animated
+main menu; the modes themselves have not been played through yet.
 
-A single loader serves all seven titles; it detects which game an image is and
+A single loader serves all nine titles; it detects which game an image is and
 applies the right profile.
 
 The export step builds the native loader on the Mac where it runs. It therefore
@@ -56,14 +61,15 @@ Keep the helper app inside this repository so it can find the native runtime
 and build script.
 
 The installer first asks which product to install: **PeggleSilicon**,
-**BejeweledSilicon**, **ChuzzleSilicon**, **PvZSilicon** or **ZumaSilicon**. Then choose the game
+**BejeweledSilicon**, **ChuzzleSilicon**, **PvZSilicon**, **ZumaSilicon** or
+**BookwormSilicon**. Then choose the game
 from the **Game** menu at the top (only that product's games are listed), drag
 that game's original `.app` into the window, choose an export folder, and click
 **Install** for that product. The helper invokes `tools/build.py` and creates
 the app in the selected folder (`PeggleSilicon.app` for Deluxe,
 `PeggleNights.app` for Nights, `Bejeweled3.app` for Bejeweled 3, `Bejeweled2.app`
 for Bejeweled 2, `Chuzzle.app` for Chuzzle, `PlantsVsZombies.app` for Plants vs.
-Zombies, `Zuma.app` for Zuma). Dropping a recognised game app selects it, and
+Zombies, `Zuma.app` for Zuma, `Bookworm.app` for Bookworm). Dropping a recognised game app selects it, and
 its product, automatically, so the whole window follows whichever title you
 drop.
 

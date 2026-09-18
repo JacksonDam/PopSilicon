@@ -1,4 +1,6 @@
 #include <wctype.h>
+#include <wchar.h>
+#include <glob.h>
 #include <fnmatch.h>
 #include <libkern/OSAtomic.h>
 static pthread_t pg_threads[256];
@@ -12,17 +14,191 @@ static uint32_t pg_thread_count=2;
 static _Thread_local uint32_t pg_thread_id;
 struct pg_thread_start {uint32_t function,argument,identifier;};
 static void *pg_run_thread(void *opaque){struct pg_thread_start t=*(struct pg_thread_start *)opaque;free(opaque);pg_thread_id=t.identifier;return (void *)(uintptr_t)compat_runtime32_call(t.function,&t.argument,1);}
+/* A 32-bit guest reads hw.memsize and then funnels it through Win32's
+   MEMORYSTATUS, whose dwTotalPhys is a 32-bit DWORD.  The guest's own shim
+   copies the low word and, unlike Windows, does not saturate: 16 GiB
+   (0x4_0000_0000) therefore arrives as exactly zero and the game concludes the
+   machine has no memory at all -- which is how Zuma's Revenge comes to pick its
+   600-wide art layout while only the 1200-wide art ships, halving every
+   coordinate against art that stays full size.  Hand back the largest size that
+   survives both that truncation and the signed comparisons the caller makes on
+   it; Windows' own 0xffffffff would read as negative and fail them instead.
+   The MIB names are spelled numerically (CTL_HW, HW_MEMSIZE, HW_PHYSMEM) so
+   this does not depend on <sys/sysctl.h> reaching the including file. */
+static void pg_clamp_guest_memory(const uint32_t *mib,uint32_t namelen,void *value,uint32_t length)
+{
+    enum { kHardware=6, kMemorySize=24, kPhysicalMemory=5, kGuestCeiling=0x7fffffff };
+    if(!mib||!value||namelen<2||mib[0]!=kHardware)return;
+    if(mib[1]!=kMemorySize&&mib[1]!=kPhysicalMemory)return;
+    if(length==8){
+        uint64_t *slot=value;
+        if(*slot>(uint64_t)kGuestCeiling)*slot=(uint64_t)kGuestCeiling;
+    }else if(length==4){
+        uint32_t *slot=value;
+        if(*slot>(uint32_t)kGuestCeiling)*slot=(uint32_t)kGuestCeiling;
+    }
+}
 static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
 {
 #define IS(s) (strcmp(n,s)==0)
 #define RET(x) do{*r=(uint64_t)(x);return 1;}while(0)
     if(!lp32_title_is_peggle_engine(lp32_profile()->title))return 0;
+    /* Plain libc the other titles never reached for.  wmemcmp is the hottest
+       of these by far: the game compares wide strings everywhere. */
+    if(IS("_wmemcmp"))RET((uint32_t)wmemcmp((const wchar_t *)(uintptr_t)a[0],(const wchar_t *)(uintptr_t)a[1],a[2]));
+    if(IS("_towupper"))RET((uint32_t)towupper(a[0]));
+    if(IS("_towlower"))RET((uint32_t)towlower(a[0]));
+    if(IS("_iswdigit"))RET((uint32_t)iswdigit(a[0]));
+    if(IS("_putchar"))RET((uint32_t)putchar((int)a[0]));
+    if(IS("_rewind")){FILE *f=lock_host_file_for_guest(a[0]);if(f){rewind(f);unlock_host_file();}RET(0);}
+    if(IS("_ctime")){const int32_t *when=(const void *)(uintptr_t)a[0];time_t t=when?(time_t)*when:0;char *text=ctime(&t);RET(text?compat_runtime32_copy_cstring(text):0);}
+    /* tmpnam(3) itself is refused by the SDK, and mkstemp is not a
+       substitute: the caller wants a name it will open later, not an already
+       open file.  Build the same thing tmpnam would -- a unique path in the
+       temporary directory -- without the deprecated call. */
+    if(IS("_tmpnam")){
+        static uint32_t serial;
+        const char *directory=getenv("TMPDIR");
+        char path[PATH_MAX];
+        snprintf(path,sizeof(path),"%s%slp32-%d-%u",
+                 directory&&*directory?directory:"/tmp",
+                 directory&&*directory&&directory[strlen(directory)-1]=='/'?"":"/",
+                 (int)getpid(),__atomic_fetch_add(&serial,1,__ATOMIC_RELAXED));
+        if(a[0]){strcpy((char *)(uintptr_t)a[0],path);RET(a[0]);}
+        RET(compat_runtime32_copy_cstring(path));
+    }
+    if(IS("_getwd")){char buffer[PATH_MAX];if(!getcwd(buffer,sizeof(buffer)))RET(0);if(a[0])strcpy((char *)(uintptr_t)a[0],buffer);RET(a[0]);}
+    if(IS("_getpriority"))RET((uint32_t)getpriority((int)a[0],(id_t)a[1]));
+    if(IS("_msync"))RET((uint32_t)msync((void *)(uintptr_t)a[0],a[1],(int)a[2]));
+    if(IS("_gcvt")){char *out=(char *)(uintptr_t)a[3];if(!out)RET(0);gcvt(guest_double(a),(int)a[2],out);RET(a[3]);}
+    /* An i386 va_list is just a pointer to the caller's argument words (the
+       guest passes &argument at 0x10(%ebp)), which cannot be handed to the
+       host's vsscanf: the x86_64 va_list is a register-save structure, not a
+       word pointer.  Every conversion writes through a guest address, so read
+       the destinations out of the word list and pass them positionally.  The
+       count is bounded by the conversions the format actually names. */
+    if(IS("_vsscanf")){
+        const char *input=(const char *)(uintptr_t)a[0];
+        const char *format=(const char *)(uintptr_t)a[1];
+        const uint32_t *words=(const uint32_t *)(uintptr_t)a[2];
+        if(!input||!format||!words)RET(0);
+        unsigned wanted=0;
+        for(const char *c=format;*c;++c){
+            if(*c!='%')continue;
+            if(*++c=='%')continue;
+            while(*c&&!strchr("diouxXeEfgGaAcsp[n",*c))++c;
+            if(*c=='[') { while(*c&&*c!=']')++c; }
+            if(*c)++wanted;
+            if(wanted>=8)break;
+        }
+        void *out[8]={0};
+        for(unsigned i=0;i<wanted&&i<8;++i)out[i]=(void *)(uintptr_t)words[i];
+        RET((uint32_t)sscanf(input,format,out[0],out[1],out[2],out[3],
+                             out[4],out[5],out[6],out[7]));
+    }
+
+    /* Mach: the process really does have a host port and real threads, so
+       these forward rather than being emulated. */
+    if(IS("_mach_host_self"))RET(mach_host_self());
+    if(IS("_host_page_size")){vm_size_t size=0;kern_return_t k=host_page_size((host_t)a[0],&size);if(a[1])*(uint32_t *)(uintptr_t)a[1]=(uint32_t)size;RET((uint32_t)k);}
+    if(IS("_host_statistics")){mach_msg_type_number_t count=a[3]?*(uint32_t *)(uintptr_t)a[3]:0;kern_return_t k=host_statistics((host_t)a[0],(host_flavor_t)a[1],(host_info_t)(uintptr_t)a[2],&count);if(a[3])*(uint32_t *)(uintptr_t)a[3]=count;RET((uint32_t)k);}
+    /* The guest's pthread_t is the small index this bridge hands out (see
+       _pthread_self/_pthread_create), not a host pthread_t, so resolve it
+       through the table rather than reinterpreting the word as a pointer. */
+    /* Thread attributes: the guest's pthread_attr_t is an opaque blob it only
+       passes back to us, so report the stack size the bridge actually gives a
+       guest thread rather than reading its copy. */
+    /* The guest's pthread_t is the small token this bridge hands out, so two
+       threads are the same thread exactly when their tokens match. */
+    if(IS("_pthread_equal"))RET(a[0]==a[1]);
+    if(IS("_pthread_attr_getstacksize")){
+        if(a[1])*(uint32_t *)(uintptr_t)a[1]=kGuestStackPerThread;
+        RET(0);
+    }
+    if(IS("_pthread_attr_setstacksize")||IS("_pthread_attr_setdetachstate$UNIX2003"))RET(0);
+    if(IS("_pthread_mach_thread_np")){
+        if(a[0]>=256||!pg_threads[a[0]])RET(0);
+        RET(pthread_mach_thread_np(pg_threads[a[0]]));
+    }
+    if(IS("_thread_suspend"))RET((uint32_t)thread_suspend((thread_act_t)a[0]));
+    if(IS("_thread_resume"))RET((uint32_t)thread_resume((thread_act_t)a[0]));
+    if(IS("_thread_terminate"))RET((uint32_t)thread_terminate((thread_act_t)a[0]));
+    if(IS("_thread_info")){mach_msg_type_number_t count=a[3]?*(uint32_t *)(uintptr_t)a[3]:0;kern_return_t k=thread_info((thread_act_t)a[0],(thread_flavor_t)a[1],(thread_info_t)(uintptr_t)a[2],&count);if(a[3])*(uint32_t *)(uintptr_t)a[3]=count;RET((uint32_t)k);}
+    if(IS("_thread_policy_set"))RET((uint32_t)thread_policy_set((thread_act_t)a[0],(thread_policy_flavor_t)a[1],(thread_policy_t)(uintptr_t)a[2],(mach_msg_type_number_t)a[3]));
+    if(IS("_semaphore_create")){semaphore_t sem=0;kern_return_t k=semaphore_create((task_t)a[0],&sem,(int)a[2],(int)a[3]);if(a[1])*(uint32_t *)(uintptr_t)a[1]=sem;RET((uint32_t)k);}
+    if(IS("_semaphore_destroy"))RET((uint32_t)semaphore_destroy((task_t)a[0],(semaphore_t)a[1]));
+    if(IS("_semaphore_signal"))RET((uint32_t)semaphore_signal((semaphore_t)a[0]));
+    if(IS("_semaphore_timedwait")){/* mach_timespec_t is two 32-bit words. */
+        mach_timespec_t wait={a[1],(clock_res_t)a[2]};RET((uint32_t)semaphore_timedwait((semaphore_t)a[0],wait));}
+    /* Memory sizes are clamped to what a 32-bit caller can carry; see
+       pg_clamp_guest_memory above. */
+    if(IS("_sysctl")){
+        int status=sysctl((int *)(uintptr_t)a[0],a[1],(void *)(uintptr_t)a[2],(size_t *)(uintptr_t)a[3],(void *)(uintptr_t)a[4],a[5]);
+        if(status==0)pg_clamp_guest_memory(a[0]?(const uint32_t *)(uintptr_t)a[0]:NULL,a[1],a[2]?(void *)(uintptr_t)a[2]:NULL,a[3]?*(const uint32_t *)(uintptr_t)a[3]:0);
+        RET((uint32_t)status);
+    }
+
+    /* glob_t cannot be shared with the host: on i386 its size_t and pointers
+       are four bytes against the host's eight, so the results are copied into
+       the guest's own layout -- gl_pathc@0, gl_matchc@4, gl_offs@8,
+       gl_flags@12, gl_pathv@16 -- with the paths themselves in the guest
+       heap.  globfree then releases what this allocated, not the host's. */
+    if(IS("_glob")){
+        glob_t found;
+        memset(&found,0,sizeof(found));
+        const char *pattern=a[0]?(const char *)(uintptr_t)a[0]:NULL;
+        int status=pattern?glob(pattern,(int)a[1],NULL,&found):-1;
+        if(a[3]){
+            uint32_t *fields=(void *)(uintptr_t)a[3];
+            uint32_t count=(uint32_t)found.gl_pathc;
+            uint32_t vector=count?compat_runtime32_allocate((count+1)*4,1):0;
+            if(vector){
+                uint32_t *paths=(void *)(uintptr_t)vector;
+                for(uint32_t i=0;i<count;++i)
+                    paths[i]=compat_runtime32_copy_cstring(found.gl_pathv[i]);
+                paths[count]=0;
+            }
+            fields[0]=vector?count:0;
+            fields[1]=fields[0];
+            fields[2]=0;
+            fields[3]=a[1];
+            fields[4]=vector;
+        }
+        globfree(&found);
+        RET((uint32_t)status);
+    }
+    if(IS("_globfree")){
+        if(a[0]){
+            uint32_t *fields=(void *)(uintptr_t)a[0];
+            if(fields[4]){
+                uint32_t *paths=(void *)(uintptr_t)fields[4];
+                for(uint32_t i=0;i<fields[0];++i)
+                    if(paths[i])compat_runtime32_deallocate(paths[i]);
+                compat_runtime32_deallocate(fields[4]);
+            }
+            memset(fields,0,20);
+        }
+        RET(0);
+    }
     if(IS("_shm_open"))RET((uint32_t)shm_open((void *)(uintptr_t)a[0],a[1],0600));
     if(IS("_shm_unlink"))RET((uint32_t)shm_unlink((void *)(uintptr_t)a[0]));
     if(IS("_ftruncate"))RET((uint32_t)ftruncate(a[0],(uint64_t)a[1]|((uint64_t)a[2]<<32)));
     if(IS("_fcntl"))RET((uint32_t)fcntl(a[0],a[1],a[2]));
     if(IS("_close"))RET((uint32_t)close(a[0]));
-    if(IS("_open")||IS("_open$UNIX2003"))RET((uint32_t)open((const char *)(uintptr_t)a[0],(int)a[1],(mode_t)a[2]));
+    if(IS("_open")||IS("_open$UNIX2003")){
+        /* LP32_TRACE_FILES only ever instrumented fopen, so a settings file
+           opened through open() was invisible: every "never opened" conclusion
+           about GamePreferences.xml / RegistryData.xml came from a trace that
+           could not see this path. */
+        const char *open_path=(const char *)(uintptr_t)a[0];
+        int open_fd=open(open_path,(int)a[1],(mode_t)a[2]);
+        if(getenv("LP32_TRACE_FILES")){
+            fprintf(stderr,"compat32: open %s flags=0x%x -> %d%s\n",
+                    open_path?open_path:"(null)",(unsigned)a[1],open_fd,
+                    open_fd<0?" (FAILED)":"");
+        }
+        RET((uint32_t)open_fd);
+    }
     if(IS("_read")||IS("_read$UNIX2003"))RET((uint32_t)read((int)a[0],(void *)(uintptr_t)a[1],a[2]));
     if(IS("_write")||IS("_write$UNIX2003"))RET((uint32_t)write((int)a[0],(const void *)(uintptr_t)a[1],a[2]));
     if(IS("_lseek")){off_t off=(off_t)((uint64_t)a[1]|((uint64_t)a[2]<<32));RET((uint64_t)lseek((int)a[0],off,(int)a[3]));}
@@ -167,6 +343,7 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_tolower"))RET(tolower(a[0]));
     if(IS("_isspace"))RET(isspace(a[0]));
     if(IS("_isalnum"))RET(isalnum(a[0]));
+    if(IS("_isalpha"))RET(isalpha(a[0]));
     if(IS("_isxdigit"))RET(isxdigit(a[0]));
     if(IS("_isprint"))RET(isprint(a[0]));
     if(IS("_ispunct"))RET(ispunct(a[0]));
@@ -181,6 +358,11 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_srandom")){srandom(a[0]);RET(0);}
     if(IS("_random"))RET(random());
     if(IS("_rand"))RET(rand());
+    if(IS("_acos"))RET(return_guest_double(acos(guest_double(a))));
+    if(IS("_tan"))RET(return_guest_double(tan(guest_double(a))));
+    if(IS("_hypot"))RET(return_guest_double(hypot(guest_double(a),guest_double(a+2))));
+    if(IS("_fmin"))RET(return_guest_double(fmin(guest_double(a),guest_double(a+2))));
+    if(IS("_finite"))RET((uint32_t)isfinite(guest_double(a)));
     if(IS("_atan"))RET(return_guest_double(atan(guest_double(a))));
     if(IS("_atan2"))RET(return_guest_double(atan2(guest_double(a),guest_double(a+2))));
     if(IS("_cbrt"))RET(return_guest_double(cbrt(guest_double(a))));
@@ -207,6 +389,7 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("___divdi3")){int64_t x=(uint64_t)a[0]|((uint64_t)a[1]<<32),y=(uint64_t)a[2]|((uint64_t)a[3]<<32);RET(x/y);}
     if(IS("_IncrementAtomic"))RET(__atomic_fetch_add((int32_t *)(uintptr_t)a[0],1,__ATOMIC_SEQ_CST));
     if(IS("_DecrementAtomic"))RET(__atomic_fetch_sub((int32_t *)(uintptr_t)a[0],1,__ATOMIC_SEQ_CST));
+    if(IS("_CompareAndSwap")){int32_t expected=a[0];RET(__atomic_compare_exchange_n((int32_t *)(uintptr_t)a[2],&expected,a[1],false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST));}
     if(IS("_OSAtomicCompareAndSwap32Barrier")){int32_t expected=a[0];RET(__atomic_compare_exchange_n((int32_t *)(uintptr_t)a[2],&expected,a[1],false,__ATOMIC_SEQ_CST,__ATOMIC_SEQ_CST));}
     if(IS("_OSAtomicOr32Barrier"))RET(__atomic_or_fetch((uint32_t *)(uintptr_t)a[1],a[0],__ATOMIC_SEQ_CST));
     if(IS("_OSAtomicTestAndClearBarrier")){uint8_t *p=(void *)(uintptr_t)(a[1]+a[0]/8);uint8_t mask=0x80>>(a[0]%8);RET((__atomic_fetch_and(p,(uint8_t)~mask,__ATOMIC_SEQ_CST)&mask)!=0);}

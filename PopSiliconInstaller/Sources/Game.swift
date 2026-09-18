@@ -108,8 +108,42 @@ struct Game: Identifiable, Hashable {
         resourceMarker: "properties/resources.xml"
     )
 
+    static let bookworm = Game(
+        id: "com.popcap.bookworm",
+        displayName: "Bookworm Deluxe",
+        steamFolder: "Bookworm Deluxe",
+        steamAppName: "Bookworm Deluxe.app",
+        executableName: "Bookworm",
+        outputAppName: "Bookworm.app",
+        imageFileName: "Bookworm.image",
+        resourceMarker: "properties/resources.xml"
+    )
+
+    static let feedingFrenzy = Game(
+        id: "com.sproutgames.feedingfrenzy",
+        displayName: "Feeding Frenzy Deluxe",
+        steamFolder: "Feeding Frenzy Deluxe",
+        steamAppName: "Feeding Frenzy Deluxe.app",
+        executableName: "Feeding Frenzy",
+        outputAppName: "FeedingFrenzy.app",
+        imageFileName: "FeedingFrenzy.image",
+        resourceMarker: "properties/partner.xml"
+    )
+
+    static let zumasRevenge = Game(
+        id: "com.PopCap.Zuma's Revenge!",
+        displayName: "Zuma's Revenge!",
+        steamFolder: "Zuma's Revenge",
+        steamAppName: "Zuma's Revenge!.app",
+        executableName: "Zuma's Revenge!",
+        outputAppName: "ZumaRevenge.app",
+        imageFileName: "ZumaRevenge.image",
+        resourceMarker: "properties/partner.xml"
+    )
+
     static let all: [Game] = [.deluxe, .nights, .bejeweled3, .bejeweled2, .chuzzle,
-                              .plantsVsZombies, .zuma]
+                              .plantsVsZombies, .zuma, .zumasRevenge, .bookworm,
+                              .feedingFrenzy]
 
     /// The game whose original bundle identifier matches this dropped app.
     static func matching(bundleIdentifier: String?) -> Game? {

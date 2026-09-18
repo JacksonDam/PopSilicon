@@ -1,3 +1,4 @@
+#include "audio_bridge.h"
 #include "compat_runtime.h"
 #include "game_profile.h"
 #include "macho_loader.h"
@@ -29,6 +30,7 @@ static volatile sig_atomic_t guest_breakpoint_count;
 static unsigned guest_breakpoint_limit;
 static unsigned guest_breakpoint_skip;
 static int guest_diagnostic_fd = -1;
+static volatile sig_atomic_t guest_null_deref_recoveries;
 
 /* Finder launches do not retain stderr.  Mirror crash and breakpoint output
    into a persistent per-run file without changing normal console logging. */
@@ -41,6 +43,29 @@ static int guest_diagnostic_fd = -1;
     } while (0)
 
 static void flush_guest_instruction(uintptr_t address);
+
+/* True when the run is one of the self-tests below.  They all return before the
+   game starts, so they need nothing from the persistent session log -- and must
+   not truncate it, since it is shared with whatever game is running. */
+static int selftest_requested(void)
+{
+    static const char *const variables[] = {
+        "LP32_AUDIO_SELFTEST",        "LP32_HEAP_SELFTEST",
+        "LP32_FILE_SELFTEST",         "LP32_CG_SELFTEST",
+        "LP32_SYNC_SELFTEST",         "LP32_STRING_SELFTEST",
+        "LP32_SCORE_SELFTEST",        "LP32_GL_PARAMETER_SELFTEST",
+        "LP32_GL_BUFFER_SELFTEST",    "LP32_GL_TEXTURE_SELFTEST",
+        "LP32_WINDOW_SELFTEST",       "LP32_OBJC_PROXY_SELFTEST",
+        "LP32_CRASH_DIAGNOSTIC_SELFTEST",
+    };
+    /* Every LP32_*_SELFTEST above must appear here.  LP32_WINDOW_SELFTEST was
+       added to main() without being listed, so each geometry run counted as a
+       real launch and truncated the session log of the game running beside it. */
+    for (size_t i = 0; i < sizeof variables / sizeof variables[0]; ++i) {
+        if (getenv(variables[i])) return 1;
+    }
+    return 0;
+}
 
 static void open_guest_diagnostic_log(const char *executable_path)
 {
@@ -375,6 +400,100 @@ static int install_texture_bind_guard(void)
     return 0;
 }
 
+static int install_profile_selection_guard(void)
+{
+    const struct lp32_profile_selection_guard *layout =
+        lp32_profile()->profile_selection_guard;
+    if (!layout) return 0;
+
+    const struct lp32_code_signature *hook_signature = &layout->hook;
+    if (hook_signature->length != 6 ||
+        memcmp((void *)(uintptr_t)hook_signature->address,
+               hook_signature->expected, hook_signature->length) != 0) {
+        fprintf(stderr, "compat32: profile selection guard signature mismatch\n");
+        return -1;
+    }
+
+    enum { kStubAddress = 0x7f013000 };
+    unsigned char code[128];
+    size_t offset = 0;
+
+    /* Preserve the original load and fast-path an already selected profile. */
+    emit_u8(code, &offset, 0x8b); emit_u8(code, &offset, 0x87);
+    emit_u32(code, &offset, 0x000007e8);       /* mov eax, [edi+7e8h] */
+    emit_u8(code, &offset, 0x85); emit_u8(code, &offset, 0xc0); /* test eax,eax */
+    emit_u8(code, &offset, 0x0f); emit_u8(code, &offset, 0x85); /* jnz selected */
+    size_t selected_relative = offset; emit_u32(code, &offset, 0);
+
+    emit_u8(code, &offset, 0x8b); emit_u8(code, &offset, 0x8f);
+    emit_u32(code, &offset, 0x000007ec);       /* mov ecx, [edi+7ech] */
+    emit_u8(code, &offset, 0x85); emit_u8(code, &offset, 0xc9); /* test ecx,ecx */
+    emit_u8(code, &offset, 0x0f); emit_u8(code, &offset, 0x84); /* jz no_profile */
+    size_t no_manager_relative = offset; emit_u32(code, &offset, 0);
+
+    /* ProfileMgr::Load(this), using the caller's existing argument slot. */
+    emit_u8(code, &offset, 0x89); emit_u8(code, &offset, 0x0c); emit_u8(code, &offset, 0x24);
+    emit_u8(code, &offset, 0xe8);
+    size_t load_call_relative = offset; emit_u32(code, &offset, 0);
+
+    /* ProfileMgr::GetAnyProfile(this). */
+    emit_u8(code, &offset, 0x8b); emit_u8(code, &offset, 0x8f);
+    emit_u32(code, &offset, 0x000007ec);
+    emit_u8(code, &offset, 0x89); emit_u8(code, &offset, 0x0c); emit_u8(code, &offset, 0x24);
+    emit_u8(code, &offset, 0xe8);
+    size_t any_call_relative = offset; emit_u32(code, &offset, 0);
+    emit_u8(code, &offset, 0x89); emit_u8(code, &offset, 0x87);
+    emit_u32(code, &offset, 0x000007e8);       /* mCurrentProfile = eax */
+    emit_u8(code, &offset, 0x85); emit_u8(code, &offset, 0xc0);
+    emit_u8(code, &offset, 0x0f); emit_u8(code, &offset, 0x85); /* jnz selected */
+    size_t selected_after_load_relative = offset; emit_u32(code, &offset, 0);
+
+    size_t no_profile = offset;
+    emit_u8(code, &offset, 0xe9);
+    size_t safe_return_relative = offset; emit_u32(code, &offset, 0);
+    size_t selected = offset;
+    emit_u8(code, &offset, 0xe9);
+    size_t resume_relative = offset; emit_u32(code, &offset, 0);
+
+    int32_t relative = (int32_t)((intptr_t)(kStubAddress + selected) -
+                                 (intptr_t)(kStubAddress + selected_relative + 4));
+    memcpy(code + selected_relative, &relative, sizeof(relative));
+    relative = (int32_t)((intptr_t)(kStubAddress + no_profile) -
+                         (intptr_t)(kStubAddress + no_manager_relative + 4));
+    memcpy(code + no_manager_relative, &relative, sizeof(relative));
+    relative = (int32_t)((intptr_t)layout->profile_manager_load -
+                         (intptr_t)(kStubAddress + load_call_relative + 4));
+    memcpy(code + load_call_relative, &relative, sizeof(relative));
+    relative = (int32_t)((intptr_t)layout->profile_manager_any -
+                         (intptr_t)(kStubAddress + any_call_relative + 4));
+    memcpy(code + any_call_relative, &relative, sizeof(relative));
+    relative = (int32_t)((intptr_t)(kStubAddress + selected) -
+                         (intptr_t)(kStubAddress + selected_after_load_relative + 4));
+    memcpy(code + selected_after_load_relative, &relative, sizeof(relative));
+    relative = (int32_t)((intptr_t)layout->safe_return -
+                         (intptr_t)(kStubAddress + safe_return_relative + 4));
+    memcpy(code + safe_return_relative, &relative, sizeof(relative));
+    relative = (int32_t)((intptr_t)layout->resume -
+                         (intptr_t)(kStubAddress + resume_relative + 4));
+    memcpy(code + resume_relative, &relative, sizeof(relative));
+
+    if (write_guest_code(kStubAddress, code, offset,
+                         "profile selection guard stub") != 0) {
+        return -1;
+    }
+    unsigned char hook[6] = {0xe9};
+    relative = (int32_t)((intptr_t)kStubAddress -
+                         (intptr_t)(hook_signature->address + 5));
+    memcpy(hook + 1, &relative, sizeof(relative));
+    hook[5] = 0x90;
+    if (write_guest_code(hook_signature->address, hook, sizeof(hook),
+                         "profile selection guard hook") != 0) {
+        return -1;
+    }
+    fprintf(stderr, "compat32: installed profile selection guard\n");
+    return 0;
+}
+
 static void flush_guest_instruction(uintptr_t address)
 {
     __builtin___clear_cache((char *)address, (char *)(address + 1));
@@ -386,6 +505,23 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
     ucontext_t *context = opaque_context;
     uint64_t rip = context->uc_mcontext->__ss.__rip;
     uint64_t rsp = context->uc_mcontext->__ss.__rsp;
+    const struct lp32_game_profile *profile = lp32_profile();
+    bool menu_null_deref = profile && signal_number == SIGSEGV &&
+        ((profile->null_deref_fault && profile->null_deref_resume &&
+          rip == profile->null_deref_fault) ||
+         (profile->null_deref_fault2 && profile->null_deref_resume2 &&
+          rip == profile->null_deref_fault2)) &&
+        (context->uc_mcontext->__ss.__rax & UINT64_C(0xffffffff)) == 0;
+    if (menu_null_deref) {
+        /* MainMenu::ButtonDepress tests the loaded widget immediately after
+           this dereference.  Resume at that existing test with eax still
+           zero, which makes the loop skip the empty slot and continue. */
+        ++guest_null_deref_recoveries;
+        context->uc_mcontext->__ss.__rip =
+            rip == profile->null_deref_fault ? profile->null_deref_resume :
+            profile->null_deref_resume2;
+        return;
+    }
     if (signal_number == SIGTRAP && guest_breakpoint_address) {
         if (guest_breakpoint_stepping) {
             *(volatile unsigned char *)guest_breakpoint_address = 0xcc;
@@ -498,6 +634,10 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
             "compat32: crash cs=0x%llx mode-recoveries to64=%u to32=%u\n",
             (unsigned long long)context->uc_mcontext->__ss.__cs,
             mode_to64, mode_to32);
+    /* Counted rather than printed per event, so they have to be reported here:
+       a mouse event dispatched while a guest frame callback is still on the
+       stack is how a widget can be handed a click before it is initialised. */
+    pg_report_pump_counters();
     GUEST_DIAGNOSTIC(
             "compat32: crash rax=%016llx rbx=%016llx rcx=%016llx "
             "rdx=%016llx rsi=%016llx rdi=%016llx rbp=%016llx r14=%016llx\n",
@@ -555,6 +695,49 @@ static void guest_crash_diagnostic(int signal_number, siginfo_t *info,
                              index, words[index]);
         }
     }
+    /* Which heap block each faulting pointer register lands in.  A crash that
+       calls through an object's vtable cannot say, from the registers alone,
+       whether the object was freed underneath the caller or was never the
+       object the caller thought: the heap's own block tags settle it. */
+    {
+        static const char *const names[] = {"rcx", "rsi", "rdx", "rax"};
+        const uint64_t values[4] = {
+            context->uc_mcontext->__ss.__rcx, context->uc_mcontext->__ss.__rsi,
+            context->uc_mcontext->__ss.__rdx, context->uc_mcontext->__ss.__rax,
+        };
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            uint32_t header[4], data[4];
+            const char *state = NULL;
+            if (!compat_runtime32_guest_block_info((uint32_t)values[slot],
+                                                   header, data, &state)) {
+                continue;
+            }
+            GUEST_DIAGNOSTIC(
+                    "compat32: crash %s=0x%08x block %s header=%08x,%08x,%08x,%08x"
+                    " data=%08x,%08x,%08x,%08x\n",
+                    names[slot], (uint32_t)values[slot], state,
+                    header[0], header[1], header[2], header[3],
+                    data[0], data[1], data[2], data[3]);
+            /* LP32_CRASH_DUMP_OBJECT=<dwords>: dump the start of whichever
+               object the faulting register points at.  LP32_CRASH_DUMP only
+               takes a fixed address, which is useless when the object is heap
+               allocated and lands somewhere new every run -- and a member that
+               is null only intermittently cannot be caught with a breakpoint,
+               because arming one changes the timing enough to hide the bug.
+               This runs after the fault, so it perturbs nothing. */
+            const char *object_text = getenv("LP32_CRASH_DUMP_OBJECT");
+            if (object_text && object_text[0]) {
+                unsigned count = (unsigned)strtoul(object_text, NULL, 0);
+                if (count == 0 || count > 128) count = 64;
+                const uint32_t *object =
+                    (const void *)(uintptr_t)(uint32_t)values[slot];
+                for (unsigned index = 0; index < count; ++index) {
+                    GUEST_DIAGNOSTIC("compat32: crash %s+0x%02x=0x%08x\n",
+                                     names[slot], index * 4, object[index]);
+                }
+            }
+        }
+    }
     /* LP32_CRASH_DUMP=0xaddr:dwords[,...] appends guest cells to the report. */
     const char *dump = getenv("LP32_CRASH_DUMP");
     if (dump && dump[0]) {
@@ -582,7 +765,7 @@ static void install_guest_crash_diagnostics(void)
     struct sigaction action;
     memset(&action, 0, sizeof(action));
     action.sa_sigaction = guest_crash_diagnostic;
-    action.sa_flags = SA_SIGINFO | SA_RESETHAND;
+    action.sa_flags = SA_SIGINFO;
     sigemptyset(&action.sa_mask);
     sigaction(SIGSEGV, &action, NULL);
     sigaction(SIGBUS, &action, NULL);
@@ -596,8 +779,16 @@ static int configure_guest_breakpoint(const struct macho_image32 *image)
     if (!address_text || !address_text[0]) return 0;
     char *end = NULL;
     unsigned long long parsed = strtoull(address_text, &end, 0);
-    if (!end || *end || parsed < image->min_address ||
-        parsed >= image->max_address) {
+    /* A title with a companion image (Zuma's Revenge and its SmartDX shim)
+       runs guest code in both, and the interesting calls are often the shim's,
+       so accept an address in either.  The range check stays: this writes an
+       0xcc into whatever it is given. */
+    const struct macho_image32 *companion = compat_runtime32_companion_image();
+    int in_game = parsed >= image->min_address && parsed < image->max_address;
+    int in_companion = companion != NULL &&
+                       parsed >= companion->min_address &&
+                       parsed < companion->max_address;
+    if (!end || *end || (!in_game && !in_companion)) {
         fprintf(stderr, "game_loader: invalid LP32_TRACE_GUEST_ADDRESS: %s\n",
                 address_text);
         return -1;
@@ -722,8 +913,15 @@ int main(int argc, char **argv)
     if (getenv("LP32_PAUSE_FOR_VMMAP")) sleep(30);
 
     /* Open the session log before the image is examined: a Steam or Finder
-       launch has no other way to report an image the loader rejects. */
-    open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+       launch has no other way to report an image the loader rejects.  Skipped
+       for a self-test, which opens the same path with O_TRUNC and would throw
+       away the diagnostics of a game running beside it. */
+    /* LP32_NO_SESSION_LOG additionally suppresses it for a real launch, so a
+       test instance run beside the player's game cannot truncate the log their
+       session is still writing. */
+    if (!selftest_requested() && !getenv("LP32_NO_SESSION_LOG")) {
+        open_guest_diagnostic_log(argc > 0 ? argv[0] : NULL);
+    }
 
     /* Steam DRM unwrap: recover a clean image from a DRM-wrapped executable by
        running Valve's own i386 decryptor under the runtime.  This does not run
@@ -733,11 +931,6 @@ int main(int argc, char **argv)
     struct macho_image32 image;
     if (macho_image32_load(image_path, &image) != 0) return EXIT_FAILURE;
     if (!unwrap_output && lp32_profile_select(&image) != 0) {
-        macho_image32_unload(&image);
-        return EXIT_FAILURE;
-    }
-
-    if (!unwrap_output && configure_guest_breakpoint(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
@@ -764,6 +957,11 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_AUDIO_SELFTEST")) {
+        int result = audio_bridge32_run_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_HEAP_SELFTEST")) {
         int result = compat_runtime32_run_heap_self_test();
         macho_image32_unload(&image);
@@ -784,6 +982,16 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_STRING_SELFTEST")) {
+        int result = compat_runtime32_run_string_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_SCORE_SELFTEST")) {
+        int result = compat_runtime32_run_score_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (getenv("LP32_GL_PARAMETER_SELFTEST")) {
         int result = objc_bridge32_run_gl_parameter_self_test();
         macho_image32_unload(&image);
@@ -799,6 +1007,11 @@ int main(int argc, char **argv)
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
+    if (getenv("LP32_WINDOW_SELFTEST")) {
+        int result = objc_bridge32_run_window_geometry_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
     if (!getenv("LP32_DISABLE_STARTUP_INPUT_LATCH") &&
         install_startup_input_latch_patch() != 0) {
         macho_image32_unload(&image);
@@ -811,6 +1024,44 @@ int main(int argc, char **argv)
     }
     if (!getenv("LP32_DISABLE_TEXTURE_BIND_GUARD") &&
         install_texture_bind_guard() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
+    if (!getenv("LP32_DISABLE_PROFILE_SELECTION_GUARD") &&
+        install_profile_selection_guard() != 0) {
+        macho_image32_unload(&image);
+        return EXIT_FAILURE;
+    }
+
+    /*
+     * Zuma's Revenge keeps its DirectX shim in a separate i386 dylib and calls
+     * C++ virtual methods on the interfaces it hands back, so the library has
+     * to run as guest code rather than be stubbed at the three entry points
+     * the game imports.  Map it just above the game image (which ends at
+     * 0x00af8000) and well below the guest heap, bind it through this bridge,
+     * and let its own initializers build its globals first: the game reaches
+     * into it as soon as its initializers run.
+     */
+    if (lp32_profile()->title == LP32_TITLE_ZUMAS_REVENGE) {
+        char shared_support[PATH_MAX];
+        snprintf(shared_support, sizeof(shared_support), "%s", image_path);
+        /* .../SharedSupport/<image_file> -> .../SharedSupport */
+        char *separator = strrchr(shared_support, '/');
+        if (separator) *separator = '\0';
+        char companion_path[PATH_MAX];
+        snprintf(companion_path, sizeof(companion_path), "%s/SmartDX",
+                 shared_support);
+        if (compat_runtime32_load_companion(companion_path, 0x00b00000) != 0) {
+            fprintf(stderr, "game_loader: SmartDX companion failed to load\n");
+            macho_image32_unload(&image);
+            return EXIT_FAILURE;
+        }
+    }
+
+    /* Armed only now, so a breakpoint may name an address in the companion
+       image mapped just above.  Guest code proper begins with the
+       initializers below, so nothing a caller would want has run yet. */
+    if (!unwrap_output && configure_guest_breakpoint(&image) != 0) {
         macho_image32_unload(&image);
         return EXIT_FAILURE;
     }
@@ -880,6 +1131,22 @@ int main(int argc, char **argv)
         uint32_t *guest_argv = (void *)(uintptr_t)argv_address;
         guest_argv[0] = executable_path;
         if (extra_argument) guest_argv[1] = extra_argument;
+
+        /* Start the guest beside its own executable.  A game may locate data
+           relative to the working directory -- Feeding Frenzy chdirs
+           "../../../" from Contents/MacOS to the bundle root, where its
+           archive and resources sit -- and a Finder, Steam or launchd start
+           would otherwise hand it "/" and send that hop outside the bundle. */
+        char working_directory[PATH_MAX];
+        snprintf(working_directory, sizeof(working_directory), "%s",
+                 host_executable_path);
+        char *executable_name = strrchr(working_directory, '/');
+        if (executable_name) {
+            *executable_name = '\0';
+            if (chdir(working_directory) != 0) {
+                perror("compat32: could not enter the executable's directory");
+            }
+        }
 
         const uint32_t main_arguments[] = {
             guest_argc, argv_address, empty_vector, empty_vector,

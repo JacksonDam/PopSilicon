@@ -20,6 +20,9 @@ enum lp32_title {
     LP32_TITLE_CHUZZLE,
     LP32_TITLE_PLANTSVSZOMBIES,
     LP32_TITLE_ZUMA,
+    LP32_TITLE_BOOKWORM,
+    LP32_TITLE_FEEDING_FRENZY,
+    LP32_TITLE_ZUMAS_REVENGE,
 };
 
 /* All shipping titles are the same PopCap "Sexy" engine, so the compatibility
@@ -33,7 +36,10 @@ static inline int lp32_title_is_peggle_engine(enum lp32_title title)
            title == LP32_TITLE_BEJEWELED2 ||
            title == LP32_TITLE_CHUZZLE ||
            title == LP32_TITLE_PLANTSVSZOMBIES ||
-           title == LP32_TITLE_ZUMA;
+           title == LP32_TITLE_ZUMA ||
+           title == LP32_TITLE_BOOKWORM ||
+           title == LP32_TITLE_FEEDING_FRENZY ||
+           title == LP32_TITLE_ZUMAS_REVENGE;
 }
 
 /* Splash-dismiss repeat latch (see game_loader.c). */
@@ -67,6 +73,15 @@ struct lp32_save_worker_patch {
 struct lp32_texture_bind_guard {
     struct lp32_code_signature load; /* mov ecx, [eax+14h]; test ecx, ecx */
     uint32_t resume;                 /* the jnz that follows the test */
+};
+
+/* Ensure a loaded UserProfile is selected before a screen reads it. */
+struct lp32_profile_selection_guard {
+    struct lp32_code_signature hook; /* mov eax, [GameApp+7e8h] */
+    uint32_t resume;                  /* instruction after the hook */
+    uint32_t safe_return;             /* function epilogue if no profile exists */
+    uint32_t profile_manager_load;    /* ProfileMgr::Load() */
+    uint32_t profile_manager_any;     /* ProfileMgr::GetAnyProfile() */
 };
 
 /* Display/frontend globals consulted by objc_bridge.m. */
@@ -115,12 +130,21 @@ struct lp32_game_profile {
     const struct lp32_startup_latch_patch *startup_latch;
     const struct lp32_save_worker_patch *save_worker;  /* NULL = single init */
     const struct lp32_texture_bind_guard *texture_bind_guard; /* NULL = none */
+    const struct lp32_profile_selection_guard *profile_selection_guard;
     const struct lp32_display_layout *display;
     const struct lp32_render_pool *render_pool;
     const struct lp32_activator_layout *activator;
     /* NuSound streamer render callback (diagnostics only: lets the audio
        bridge read the stream's refill-request ring). 0 = unknown. */
     uint32_t stream_input_callback;
+    /* Legacy menu code can dereference an empty button slot while a profile
+       dialog is being dismissed.  These optional instruction addresses let
+       the loader resume at the function's existing null-test when that exact
+       fault occurs. */
+    uint32_t null_deref_fault;
+    uint32_t null_deref_resume;
+    uint32_t null_deref_fault2;
+    uint32_t null_deref_resume2;
 };
 
 /* Chooses the profile for a loaded image (LP32_GAME overrides detection).

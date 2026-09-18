@@ -20,6 +20,7 @@
 #include <mach/mach_vm.h>
 #include <mach/vm_region.h>
 #include <mach-o/dyld.h>
+#include <mach-o/nlist.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -345,6 +346,10 @@ static uint32_t guest_cond_capacity;
 static uint64_t guest_sync_released_count;
 static pthread_mutex_t guest_sync_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static char dynamic_symbol_names[kDynamicThunkCapacity][96];
+
+/* Defined below; the import table needs it to make an address-taken function
+   callable (see the pointer-import loop). */
+static uint32_t guest_thunk_for_dynamic_symbol(const char *name);
 static uint32_t dynamic_symbol_count;
 
 /*
@@ -584,6 +589,95 @@ static uint32_t guest_standard_file_import(const char *name)
     if (strcmp(name, "___stdoutp") == 0) return kGuestStdoutHandle;
     if (strcmp(name, "___stderrp") == 0) return kGuestStderrHandle;
     return 0;
+}
+
+/*
+ * libstdc++'s shared empty string representation.  Most titles keep the COW
+ * std::string internals inlined, so the bridge models a string opaquely and
+ * these never appear; Zuma's Revenge links against the real _Rep machinery
+ * and imports them as data.  Left to the loop below they would be handed a
+ * dynamic thunk, and every default-constructed string would then carry a
+ * data pointer into the bridge's code region -- which is what
+ * guest_string_representation_valid rejects as a "foreign representation".
+ *
+ * _S_empty_rep_storage is the _Rep itself (length, capacity, reference
+ * count), with the characters starting twelve bytes in, matching
+ * guest_string_make.  Its reference count is pinned high rather than left at
+ * zero: guest code releases a string by decrementing through
+ * __exchange_and_add and destroying the rep when the old value drops to zero,
+ * and the shared empty rep must never reach that point.
+ */
+enum { kGuestEmptyRepReferences = 0x40000000 };
+
+static uint32_t guest_string_make(const char *bytes, size_t length,
+                                  uint32_t site);
+
+static uint32_t guest_string_rep_import(const char *name)
+{
+    static uint32_t empty_rep, terminal;
+    if (strcmp(name, "__ZNSs4_Rep20_S_empty_rep_storageE") == 0) {
+        if (!empty_rep) {
+            uint32_t data = guest_string_make("", 0, kGuestHeapStringSite);
+            if (data) {
+                empty_rep = data - 12;
+                ((uint32_t *)(uintptr_t)empty_rep)[2] = kGuestEmptyRepReferences;
+            }
+        }
+        return empty_rep;
+    }
+    if (strcmp(name, "__ZNSs4_Rep11_S_terminalE") == 0) {
+        if (!terminal) terminal = compat_runtime32_allocate(1, 1);
+        return terminal;
+    }
+    /* The same two statics for std::wstring, which this title uses far more
+       heavily than the narrow string.  A wide rep carries the identical
+       twelve-byte header; only the terminator is four bytes rather than one. */
+    static uint32_t wide_empty_rep, wide_terminal;
+    if (strcmp(name, "__ZNSbIwSt11char_traitsIwESaIwEE4_Rep20_S_empty_rep_storageE") == 0) {
+        if (!wide_empty_rep) {
+            uint32_t rep = compat_runtime32_allocate(12 + 4, 1);
+            if (rep) {
+                uint32_t *fields = (void *)(uintptr_t)rep;
+                fields[0] = 0;
+                fields[1] = 0;
+                fields[2] = kGuestEmptyRepReferences;
+                wide_empty_rep = rep;
+            }
+        }
+        return wide_empty_rep;
+    }
+    if (strcmp(name, "__ZNSbIwSt11char_traitsIwESaIwEE4_Rep11_S_terminalE") == 0) {
+        if (!wide_terminal) wide_terminal = compat_runtime32_allocate(4, 1);
+        return wide_terminal;
+    }
+    return 0;
+}
+
+/*
+ * The C++ runtime objects the guest imports as data rather than calls: RTTI
+ * type_info records, libstdc++ vtables, and the std::nothrow tag.  Left to
+ * the loop below they would each be handed a code thunk, and the guest would
+ * fault the moment it read a field out of one -- the same way an empty
+ * std::string did before its representation was made real.  Give each its own
+ * guest memory instead.  None of these has to behave like the genuine object:
+ * the guest only stores the pointer, compares it, or reads a name from it.
+ */
+static uint32_t guest_cxx_data_import(const char *name)
+{
+    /*
+     * Only the std::nothrow tag, which the guest passes by reference and
+     * never looks inside.  The RTTI symbols deliberately do not come through
+     * here: peggle_cxx.inc already allocates the cxxabi type_info vtables and
+     * remembers them in pg_ti_vtable, and pg_ti_kind identifies a type_info
+     * by matching its vtable against that set.  Handing the same names a
+     * second, separate allocation left the guest's records pointing at blocks
+     * that code had never seen, so the match failed, catch stopped selecting
+     * a handler, and an exception the game handles escaped the guest instead.
+     */
+    static uint32_t nothrow_tag;
+    if (strcmp(name, "__ZSt7nothrow") != 0) return 0;
+    if (!nothrow_tag) nothrow_tag = compat_runtime32_allocate(1, 1);
+    return nothrow_tag;
 }
 
 /* Released host objects are recycled rather than freed so that a guest
@@ -1216,6 +1310,43 @@ static bool path_is_game_config(const char *path)
            strcasecmp(path + length - (sizeof(suffix) - 1), suffix) == 0;
 }
 
+static const char *guest_redirect_path(const char *path, char *buffer,
+                                       size_t size)
+{
+    static const char *override;
+    static char real_prefix[PATH_MAX];
+    static size_t prefix_length;
+    static bool resolved;
+    if (!resolved) {
+        resolved = true;
+        const char *home = getenv("HOME");
+        const char *requested = getenv("LP32_APPLICATION_SUPPORT_DIR");
+        if (requested && requested[0] && home && home[0]) {
+            int written = snprintf(real_prefix, sizeof(real_prefix),
+                                   "%s/Library/Application Support", home);
+            if (written > 0 && (size_t)written < sizeof(real_prefix)) {
+                override = requested;
+                prefix_length = (size_t)written;
+            }
+        }
+    }
+    if (!override || !path) return path;
+    if (strncmp(path, real_prefix, prefix_length) != 0) return path;
+    /* Only a whole path component may match, so a sibling directory whose name
+       merely starts the same way is left alone. */
+    if (path[prefix_length] != '\0' && path[prefix_length] != '/') return path;
+    snprintf(buffer, size, "%s%s", override, path + prefix_length);
+    return buffer;
+}
+
+/* The Carbon bridge reaches the filesystem from another translation unit, so
+   it needs the same rewrite through an exported entry point. */
+const char *compat_runtime32_redirect_path(const char *path, char *buffer,
+                                           size_t size)
+{
+    return guest_redirect_path(path, buffer, size);
+}
+
 /* Called once per presented frame: report newly recovered wrong-mode
    landings so the persistent run log shows how often Rosetta did this. */
 void compat_runtime32_check_mode_guards(uint64_t swap_count)
@@ -1524,6 +1655,28 @@ static int build_transition_bridge(void)
                 break;
             }
         }
+        /* A function whose address the game takes but never calls through a
+           stub has no thunk to borrow: Feeding Frenzy hands &tolower to
+           std::transform, which calls it directly.  The cell's own address is
+           not code, so that call lands in the reserved low 2 GB and dies with
+           SIGBUS at 0x80000000.  Give the name a dynamic thunk instead, which
+           the gateway dispatches by name like any other import.  Symbols the
+           game reads rather than calls keep the cell: the ones filled in just
+           below, and the C++ vtables and personality routine. */
+        const char *import = current_image->imports[index].name;
+        if (*slot == cell_address &&
+            strcmp(import, "_errno") != 0 &&
+            strcmp(import, "__DefaultRuneLocale") != 0 &&
+            strcmp(import, "_mach_task_self_") != 0 &&
+            strncmp(import, "__ZTV", 5) != 0 &&
+            strncmp(import, "___gxx_personality", 18) != 0 &&
+            !objc_bridge32_pointer_import(import) &&
+            !guest_standard_file_import(import) &&
+            !guest_string_rep_import(import) &&
+            !guest_cxx_data_import(import)) {
+            uint32_t callable = guest_thunk_for_dynamic_symbol(import);
+            if (callable) *slot = callable;
+        }
         if (strcmp(current_image->imports[index].name, "_errno") == 0) {
             guest_errno_address = cell_address;
         }
@@ -1536,6 +1689,17 @@ static int build_transition_bridge(void)
         uint32_t standard_file =
             guest_standard_file_import(current_image->imports[index].name);
         if (standard_file) data_cell[data_cells] = standard_file;
+        /* Unlike ___stdinp, which really is a pointer the guest dereferences
+           through its cell, these name the object itself: libstdc++ reaches
+           the characters as &_S_empty_rep_storage + 12, computed straight off
+           the symbol's address.  So the slot has to *be* the rep, the way the
+           vtable and personality imports are left holding their object. */
+        uint32_t string_rep =
+            guest_string_rep_import(current_image->imports[index].name);
+        if (string_rep) *slot = string_rep;
+        uint32_t cxx_data =
+            guest_cxx_data_import(current_image->imports[index].name);
+        if (cxx_data) *slot = cxx_data;
         if (!strcmp(current_image->imports[index].name, "__DefaultRuneLocale")) {
             /* The Sexy XMLParser classifies characters by reading
                _DefaultRuneLocale.__runetype[c] inline (i386 layout: the
@@ -1900,6 +2064,41 @@ static bool guest_heap_validate_header_locked(uint32_t pointer,
     }
     if (metadata_out) *metadata_out = metadata;
     return true;
+}
+
+/* Describe the heap block a faulting pointer lands in, for the crash report.
+   guest_heap_validate_header_locked refuses a freed block, which is exactly
+   the case worth naming here, so this reads the tags directly instead.  The
+   block tags ("LP32" live, "FREE" freed) separate a stale pointer from a
+   merely wrong one without depending on the poison fill surviving a reuse.
+   Bounds match the validator: this runs in the crash handler, where a second
+   fault would cost the whole report. */
+int compat_runtime32_guest_block_info(uint32_t pointer, uint32_t *header,
+                                      uint32_t *data, const char **state)
+{
+    if (pointer < kGuestHeapBase + kGuestHeapHeaderSize ||
+        (pointer & 3) != 0 || pointer > guest_heap_cursor) {
+        return 0;
+    }
+    uintptr_t header_address = (uintptr_t)pointer - kGuestHeapHeaderSize;
+    if (header_address < kGuestHeapBase ||
+        header_address + kGuestHeapHeaderSize > guest_heap_cursor) {
+        return 0;
+    }
+    const uint32_t *metadata = (const void *)header_address;
+    for (unsigned index = 0; index < 4; ++index) header[index] = metadata[index];
+    *state = metadata[1] == kGuestHeapLiveMagic ? "live" :
+             metadata[1] == kGuestHeapFreeMagic ? "FREED" : "not-a-block";
+    /* Only read payload words the block actually covers. */
+    uint32_t capacity = metadata[2];
+    if ((uintptr_t)pointer + capacity > guest_heap_cursor) capacity = 0;
+    unsigned words = capacity / 4;
+    if (words > 4) words = 4;
+    const uint32_t *object = (const void *)(uintptr_t)pointer;
+    for (unsigned index = 0; index < 4; ++index) {
+        data[index] = index < words ? object[index] : 0;
+    }
+    return 1;
 }
 
 static void guest_heap_insert_free_locked(uint32_t header_address)
@@ -2408,21 +2607,49 @@ static bool guest_string_representation_valid(uint32_t data)
     return data >= kGuestHeapBase + 12 && data < kGuestHeapEnd;
 }
 
+/* The bridged C++ operation currently running, mirrored here from
+   peggle_cpp.inc so a foreign representation can name the handler that was
+   holding the object.  Diagnostic only. */
+const char *lp32_string_op = "?";
+
+/* Set while a _Rep is being disposed.  The reps handed to _M_destroy are not
+   string objects -- word 0 is the length, not a data pointer -- so reading one
+   as an object reports a "foreign representation" for a perfectly healthy
+   teardown.  Suppress the report for the duration rather than letting a
+   correct path fill the log with false alarms. */
+static _Thread_local bool guest_string_disposing;
+
 static void report_foreign_string(uint32_t object, uint32_t data)
 {
-    static bool reported;
-    if (reported) return;
-    reported = true;
+    /* Reporting only the first one hid how often this happens: a parser whose
+       every tag name degrades to "" looks exactly like a parser rejecting a
+       valid document.  Say it a bounded number of times instead of once.
+       The default bound is reached during startup, though, which then hides
+       every later occurrence -- including whichever one is being hunted -- so
+       a diagnostic run can raise it with LP32_STRING_REPORT_LIMIT. */
+    static unsigned reported;
+    static long report_limit = -1;
+    if (report_limit < 0) {
+        const char *text = getenv("LP32_STRING_REPORT_LIMIT");
+        report_limit = (text && text[0]) ? strtol(text, NULL, 0) : 24;
+        if (report_limit < 0) report_limit = 0;
+    }
+    if (guest_string_disposing || (long)reported >= report_limit) return;
+    ++reported;
     fprintf(stderr, "compat32: std::string at 0x%08" PRIx32 " has a foreign "
-            "representation (data=0x%08" PRIx32 "); treating it as empty\n",
-            object, data);
+            "representation (data=0x%08" PRIx32 ") in %s; treating it as empty\n",
+            object, data, lp32_string_op);
 }
 
 static const char *guest_string_data(uint32_t object)
 {
     if (!object) return "";
     uint32_t data = *(const uint32_t *)(uintptr_t)object;
-    if (!data) return "";
+    /* A null data pointer used to be treated as an empty string in silence,
+       so a string that never received a representation was indistinguishable
+       from one that is legitimately empty and left no trace anywhere.  Report
+       it under the same bound as a foreign representation. */
+    if (!data) { report_foreign_string(object, data); return ""; }
     if (!guest_string_representation_valid(data)) {
         report_foreign_string(object, data);
         return "";
@@ -2434,7 +2661,8 @@ static size_t guest_string_length(uint32_t object)
 {
     if (!object) return 0;
     uint32_t data = *(const uint32_t *)(uintptr_t)object;
-    if (!data) return 0;
+    /* Same silent case as guest_string_data above. */
+    if (!data) { report_foreign_string(object, data); return 0; }
     if (!guest_string_representation_valid(data)) {
         report_foreign_string(object, data);
         return 0;
@@ -3264,9 +3492,376 @@ int compat_runtime32_initialize(struct macho_image32 *image)
     return 0;
 }
 
+/*
+ * A companion image: an i386 dylib the game loads beside itself, mapped above
+ * the game and bound through this same bridge.  Zuma's Revenge needs one --
+ * it imports only Direct3DCreate9, DirectSoundCreate8 and _beginthread from
+ * SmartDX.framework and then calls C++ virtual methods on the interfaces those
+ * return, so the library has to run as guest code rather than be stubbed.
+ *
+ * Its own imports are bound by name to dynamic thunks, exactly as a callback
+ * function pointer is, so every call it makes into Carbon, AGL, OpenGL or
+ * AudioToolbox arrives at the bridges the games already use.
+ */
+static struct macho_image32 companion_image;
+static bool companion_loaded;
+
+const struct macho_image32 *compat_runtime32_companion_image(void)
+{
+    return companion_loaded ? &companion_image : NULL;
+}
+
+struct companion_export {
+    char name[96];
+    uint32_t address;
+};
+static struct companion_export companion_exports[8];
+static uint32_t companion_export_count;
+
+static uint32_t companion_export_address(const char *name)
+{
+    for (uint32_t index = 0; index < companion_export_count; ++index) {
+        if (strcmp(companion_exports[index].name, name) == 0) {
+            return companion_exports[index].address;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Bind the companion's imports.  Its stubs become jumps into a dispatching
+ * thunk, but its pointer cells are data the library reads rather than calls,
+ * and thunking those was wrong: SmartDX reads _mach_task_self_ to make its
+ * sync objects and ___stderrp to report a failure, so both came back as code
+ * addresses -- semaphore_create was handed 0x6168 for a task port, failed,
+ * and the assertion that followed printed through a stream that did not
+ * exist.  Give a data cell its real value, the way the main image's loop
+ * does; the difference is that the companion's cells are its own __IMPORT
+ * words, so the value goes straight into the cell rather than into a bridge
+ * data cell the slot points at.
+ */
+/* A guest word holding `value`, for the globals the library reads through
+   two levels: it loads the import cell to get the symbol's address and then
+   loads again to get the value, exactly as ___stderrp is a FILE** and
+   _mach_task_self_ the address of the port rather than the port.  Storing the
+   value straight into the cell collapsed that second load onto the value
+   itself -- SmartDX dereferenced mach_task_self()'s 0x203 and faulted. */
+static uint32_t companion_data_indirect(uint32_t value)
+{
+    uint32_t cell = compat_runtime32_allocate(4, 1);
+    if (cell) *(uint32_t *)(uintptr_t)cell = value;
+    return cell;
+}
+
+static uint32_t companion_data_value(const char *name)
+{
+    /* Pointer-to-value globals: the cell holds the address of the word. */
+    if (strcmp(name, "_mach_task_self_") == 0) {
+        return companion_data_indirect(mach_task_self());
+    }
+    uint32_t standard_file = guest_standard_file_import(name);
+    if (standard_file) return companion_data_indirect(standard_file);
+    /* The rest name the object itself, so the cell holds it directly. */
+    uint32_t value = objc_bridge32_pointer_import(name);
+    if (!value) value = guest_string_rep_import(name);
+    if (!value) value = guest_cxx_data_import(name);
+    return value;
+}
+
+static int bind_companion_imports(struct macho_image32 *image)
+{
+    struct guest_write_window window = {.page_size = (size_t)getpagesize()};
+    for (uint32_t index = 0; index < image->import_count; ++index) {
+        const struct macho_import32 *import = &image->imports[index];
+        if (import->kind == MACHO_IMPORT32_POINTER) {
+            /* A vtable or type_info cell holds an object the library only
+               ever stores or compares, and the personality routine is named
+               by the unwinder rather than called from here; leave those as
+               the linker left them rather than pointing them at code. */
+            uint32_t value = companion_data_value(import->name);
+            if (!value && (strncmp(import->name, "__ZTV", 5) == 0 ||
+                           strncmp(import->name, "__ZTI", 5) == 0 ||
+                           strncmp(import->name, "___gxx_personality", 18) == 0 ||
+                           strcmp(import->name, "_errno") == 0 ||
+                           strcmp(import->name, "__DefaultRuneLocale") == 0)) {
+                continue;
+            }
+            if (!value) {
+                /* A function whose address the library takes rather than
+                   calls still needs something callable. */
+                value = guest_thunk_for_dynamic_symbol(import->name);
+                if (!value) {
+                    guest_write_window_close(&window);
+                    errno = ENOSPC;
+                    return runtime_error("companion import thunk table is full");
+                }
+            }
+            if (guest_write_window_open(&window, import->address, 4) != 0) {
+                return runtime_error("mprotect companion import pointer");
+            }
+            memcpy((void *)(uintptr_t)import->address, &value, 4);
+            continue;
+        }
+        uint32_t thunk = guest_thunk_for_dynamic_symbol(import->name);
+        if (!thunk) {
+            guest_write_window_close(&window);
+            errno = ENOSPC;
+            return runtime_error("companion import thunk table is full");
+        }
+        if (guest_write_window_open(&window, import->address, 5) != 0) {
+            return runtime_error("mprotect companion import stub");
+        }
+        uint8_t *stub = (void *)(uintptr_t)import->address;
+        uint32_t relative = thunk - (import->address + 5);
+        stub[0] = 0xe9;
+        memcpy(stub + 1, &relative, 4);
+    }
+    guest_write_window_close(&window);
+    return 0;
+}
+
+/* Record the exports the game imports from the companion, so the dispatcher
+   can call into it.  Its symbol table is still mapped as part of __LINKEDIT. */
+static void collect_companion_exports(const struct macho_image32 *image)
+{
+    const struct mach_header *header = image->header;
+    const struct symtab_command *symtab = NULL;
+    const struct segment_command *linkedit = NULL;
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    for (uint32_t index = 0; index < header->ncmds; ++index) {
+        const struct load_command *command = (const void *)cursor;
+        if (command->cmd == LC_SYMTAB) symtab = (const void *)cursor;
+        if (command->cmd == LC_SEGMENT) {
+            const struct segment_command *segment = (const void *)cursor;
+            if (strncmp(segment->segname, SEG_LINKEDIT, 16) == 0) linkedit = segment;
+        }
+        cursor += command->cmdsize;
+    }
+    if (!symtab || !linkedit) return;
+    uintptr_t linkedit_base = linkedit->vmaddr + image->slide - linkedit->fileoff;
+    const struct nlist *symbols = (const void *)(linkedit_base + symtab->symoff);
+    const char *strings = (const void *)(linkedit_base + symtab->stroff);
+    static const char *const wanted[] = {
+        "__Z15Direct3DCreate9j", "_DirectSoundCreate8", "__beginthread",
+    };
+    for (uint32_t index = 0; index < symtab->nsyms; ++index) {
+        const struct nlist *symbol = &symbols[index];
+        if ((symbol->n_type & N_TYPE) != N_SECT || !(symbol->n_type & N_EXT)) continue;
+        const char *name = strings + symbol->n_un.n_strx;
+        for (size_t which = 0; which < sizeof(wanted) / sizeof(wanted[0]); ++which) {
+            if (strcmp(name, wanted[which]) != 0) continue;
+            if (companion_export_count >= 8 || strlen(name) >= 96) break;
+            struct companion_export *entry =
+                &companion_exports[companion_export_count++];
+            strcpy(entry->name, name);
+            entry->address = symbol->n_value + image->slide;
+            fprintf(stderr, "compat32: companion export %s at 0x%08x\n",
+                    entry->name, entry->address);
+            break;
+        }
+    }
+}
+
+/* The game's own symbol table, walked the same way as the companion's above.
+   __LINKEDIT is still mapped, so this needs no extra bookkeeping at load. */
+uint32_t compat_runtime32_guest_symbol(const char *name)
+{
+    const struct macho_image32 *image = compat_runtime32_image();
+    if (!image || !image->header || !name) return 0;
+    const struct mach_header *header = image->header;
+    const struct symtab_command *symtab = NULL;
+    const struct segment_command *linkedit = NULL;
+    const uint8_t *cursor = (const uint8_t *)(header + 1);
+    for (uint32_t index = 0; index < header->ncmds; ++index) {
+        const struct load_command *command = (const void *)cursor;
+        if (command->cmd == LC_SYMTAB) symtab = (const void *)cursor;
+        if (command->cmd == LC_SEGMENT) {
+            const struct segment_command *segment = (const void *)cursor;
+            if (strncmp(segment->segname, SEG_LINKEDIT, 16) == 0) linkedit = segment;
+        }
+        cursor += command->cmdsize;
+    }
+    if (!symtab || !linkedit) return 0;
+    uintptr_t linkedit_base = linkedit->vmaddr + image->slide - linkedit->fileoff;
+    const struct nlist *symbols = (const void *)(linkedit_base + symtab->symoff);
+    const char *strings = (const void *)(linkedit_base + symtab->stroff);
+    for (uint32_t index = 0; index < symtab->nsyms; ++index) {
+        const struct nlist *symbol = &symbols[index];
+        if ((symbol->n_type & N_TYPE) != N_SECT) continue;
+        if (strcmp(strings + symbol->n_un.n_strx, name) != 0) continue;
+        return symbol->n_value + image->slide;
+    }
+    return 0;
+}
+
+/*
+ * Put the guest's registry on disk.
+ *
+ * Every registry write in this engine (SexyAppBase::RegistryWrite, reached
+ * through the in-image _RegSetValueExW) lands in an in-memory tree, and the
+ * only thing that serialises that tree is SystemX::CloseRegistry(), which
+ * calls CRegistry::WriteRegistryData() -> WriteToDisk().  Nothing in the
+ * shipped Mac binary ever calls it: _RegCloseKey is an empty stub, _RegFlushKey
+ * has no call sites, and CloseRegistry itself is referenced nowhere in the
+ * image.  So RegistryData.xml keeps its empty "registry = """ forever and
+ * Is3D, HiRes, LastUser, the volumes and the screen mode are all thrown away
+ * on exit -- which is why the game asks for a profile name at every launch
+ * even though users.dat still holds the profiles.
+ *
+ * CloseRegistry takes no arguments and only writes; it frees nothing and owns
+ * no teardown, so it is safe at any shutdown boundary and safe to call twice.
+ */
+static char guest_registry_path[PATH_MAX];
+static long guest_registry_loaded_bytes = -1;
+
+void compat_runtime32_note_registry_loaded(const char *path, long bytes)
+{
+    if (!path || !path[0]) return;
+    snprintf(guest_registry_path, sizeof(guest_registry_path), "%s", path);
+    guest_registry_loaded_bytes = bytes;
+}
+
+/* Read the whole file, or NULL.  Used to snapshot the registry either side of
+   a flush so a flush can never be the thing that loses the settings. */
+static void *guest_registry_read_file(const char *path, long *length_out)
+{
+    if (!path || !path[0]) return NULL;
+    FILE *file = fopen(path, "rb");
+    if (!file) return NULL;
+    if (fseek(file, 0, SEEK_END) != 0) { fclose(file); return NULL; }
+    long length = ftell(file);
+    if (length < 0 || fseek(file, 0, SEEK_SET) != 0) { fclose(file); return NULL; }
+    void *bytes = malloc((size_t)length ? (size_t)length : 1);
+    if (bytes && length && fread(bytes, 1, (size_t)length, file) != (size_t)length) {
+        free(bytes); bytes = NULL;
+    }
+    fclose(file);
+    if (bytes && length_out) *length_out = length;
+    return bytes;
+}
+
+void compat_runtime32_flush_guest_registry(const char *reason)
+{
+    static int disabled = -1;
+    if (disabled < 0) disabled = getenv("LP32_NO_REGISTRY_FLUSH") != NULL;
+    if (disabled) return;
+    static uint32_t close_registry;
+    static int resolved;
+    if (!resolved) {
+        resolved = 1;
+        close_registry =
+            compat_runtime32_guest_symbol("__ZN7SystemX13CloseRegistryEv");
+        fprintf(stderr, "compat32: registry flush %s (CloseRegistry=0x%08x)\n",
+                close_registry ? "armed" : "UNAVAILABLE: symbol not found",
+                close_registry);
+    }
+    if (!close_registry) return; /* a title without SystemX's registry */
+    /*
+     * Never flush a tree the guest has not filled in yet.  The periodic caller
+     * runs from the first presented frame, which is long before ReadRegistry;
+     * serialising then wrote "<key>registry</key><dict/>" straight over a
+     * populated file and destroyed the player's settings.  The read path tells
+     * us when the tree is real.
+     */
+    if (guest_registry_loaded_bytes < 0) return;
+
+    /*
+     * LP32_TRACE_REGISTRY_TREE: count what the root node actually holds before
+     * serialising it.  Every explanation for the empty output so far has been
+     * reasoning about disassembly; this asks the guest directly and separates
+     * "the tree is empty" from "the serialiser is walking a different root".
+     */
+    if (getenv("LP32_TRACE_REGISTRY_TREE")) {
+        static uint32_t instance_fn, subkeys_fn, values_fn;
+        static int census_resolved;
+        if (!census_resolved) {
+            census_resolved = 1;
+            instance_fn = compat_runtime32_guest_symbol(
+                "__ZN7SystemX9CRegistry8InstanceEv");
+            subkeys_fn = compat_runtime32_guest_symbol(
+                "__ZN7SystemX13CRegistryNode21GetTheNumberOfSubKeysEv");
+            values_fn = compat_runtime32_guest_symbol(
+                "__ZN7SystemX13CRegistryNode20GetTheNumberOfValuesEv");
+        }
+        if (instance_fn && subkeys_fn && values_fn) {
+            uint32_t registry = compat_runtime32_call(instance_fn, NULL, 0);
+            uint32_t root = registry ?
+                *(const uint32_t *)(uintptr_t)registry : 0;
+            uint32_t subkeys = 0, values = 0;
+            if (root) {
+                subkeys = compat_runtime32_call(subkeys_fn, &root, 1);
+                values = compat_runtime32_call(values_fn, &root, 1);
+            }
+            fprintf(stderr, "compat32: registry tree registry=0x%08x root=0x%08x "
+                    "subkeys=%u values=%u\n", registry, root, subkeys, values);
+        }
+    }
+
+    long before_length = 0;
+    void *before = guest_registry_read_file(guest_registry_path, &before_length);
+
+    compat_runtime32_call(close_registry, NULL, 0);
+    int trapped = compat_runtime32_last_call_trapped();
+
+    /*
+     * Second, independent guard: a flush must never shrink the file.  If the
+     * tree somehow serialises to less than it held, put the previous bytes
+     * back.  Losing a setting is recoverable; losing the whole registry is the
+     * failure this feature was supposed to prevent.
+     */
+    long after_length = 0;
+    void *after = guest_registry_read_file(guest_registry_path, &after_length);
+    bool restored = false;
+    if (before && after && before_length > 0 && after_length * 2 < before_length) {
+        FILE *file = fopen(guest_registry_path, "wb");
+        if (file) {
+            fwrite(before, 1, (size_t)before_length, file);
+            fclose(file);
+            restored = true;
+        }
+    }
+    free(before);
+    free(after);
+
+    static unsigned flushes;
+    ++flushes;
+    if (flushes == 1 || trapped || restored || getenv("LP32_TRACE_OBJC_PROXIES")) {
+        fprintf(stderr, "compat32: flushed the guest registry (%s) #%u%s%s\n",
+                reason, flushes, trapped ? " [trapped]" : "",
+                restored ? " [shrank -- previous contents restored]" : "");
+    }
+}
+
+int compat_runtime32_load_companion(const char *path, uint32_t slide)
+{
+    if (companion_loaded) return 0;
+    if (macho_image32_load_beside(path, slide, &companion_image) != 0) return -1;
+    if (bind_companion_imports(&companion_image) != 0) return -1;
+    peggle_apply_relocations(&companion_image);
+    collect_companion_exports(&companion_image);
+    companion_loaded = true;
+    fprintf(stderr, "compat32: companion image 0x%08x-0x%08x imports=%u "
+            "initializers=%u\n", companion_image.min_address,
+            companion_image.max_address, companion_image.import_count,
+            companion_image.initializer_count);
+    /* Its C++ globals do not exist until these have run, and the game calls
+       into it as soon as it starts up. */
+    const uint32_t *initializers =
+        (const void *)(uintptr_t)companion_image.initializer_address;
+    for (uint32_t index = 0; index < companion_image.initializer_count; ++index) {
+        compat_runtime32_call(initializers[index], NULL, 0);
+        if (compat_runtime32_last_call_trapped()) {
+            fprintf(stderr, "compat32: companion initializer[%u] trapped\n", index);
+            break;
+        }
+    }
+    return 0;
+}
+
 #include "peggle_cpp.inc"
 #include "peggle_libc.inc"
 #include "peggle_bass.inc"
+#include "feeding_frenzy.inc"
 
 static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                       const uint32_t *arguments,
@@ -3783,6 +4378,16 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                       uint32_t return_address)
 {
     uint64_t peggle_result;
+    /* LP32_TRACE_IMPORTS=1 names every bridged call as it is entered, which is
+       the only way to see which import was in flight when the guest, or a
+       framework the bridge called into, dies before the call returns. */
+    static int trace_imports = -1;
+    if (trace_imports < 0) trace_imports = getenv("LP32_TRACE_IMPORTS") != NULL;
+    if (trace_imports) {
+        fprintf(stderr, "compat32: import %s(%08x,%08x,%08x,%08x)\n", name,
+                arguments[0], arguments[1], arguments[2], arguments[3]);
+        fflush(stderr);
+    }
     /* Darwin exports ABI-variant aliases such as "_open$UNIX2003" and
        "_readdir$INODE64" that are behaviourally identical to the base symbol.
        Bejeweled 3 imports 15 "$UNIX2003" variants Peggle never used.  C
@@ -3802,9 +4407,20 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         g_named_import_override(name, arguments, &peggle_result)) {
         return peggle_result;
     }
+    /* Zuma's Revenge reaches Direct3D, DirectSound and _beginthread through
+       the SmartDX dylib mapped beside it.  Those three are real guest code,
+       not bridges: call into the companion rather than stubbing them, so the
+       game gets back interfaces whose virtual methods actually exist. */
+    if (companion_export_count) {
+        uint32_t entry = companion_export_address(name);
+        /* cdecl: the caller cleans the stack, so passing the full argument
+           window is safe whatever the callee's real arity is. */
+        if (entry) return compat_runtime32_call(entry, arguments, 4);
+    }
     if (peggle_cpp_dispatch(name, arguments, &peggle_result) ||
         peggle_libc_dispatch(name, arguments, &peggle_result) ||
-        peggle_bass_dispatch(name, arguments, &peggle_result)) return peggle_result;
+        peggle_bass_dispatch(name, arguments, &peggle_result) ||
+        feeding_frenzy_dispatch(name, arguments, &peggle_result)) return peggle_result;
     dispatch_name_length = strlen(name);
     dispatch_name_matched = false;
     const uint8_t *stage = import_stage_slot(import_id);
@@ -3835,6 +4451,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
      * host/guest teardown callbacks.
      */
     if (import_is(name, "_exit") || import_is(name, "__exit")) {
+        /* The last point at which the guest is still mapped: _Exit below runs
+           no teardown, and the game never persists its registry itself. */
+        compat_runtime32_flush_guest_registry("guest exit");
         fprintf(stderr, "compat32: guest requested process exit status=%d\n",
                 (int)arguments[0]);
         compat_runtime32_heap_report("guest-exit");
@@ -4010,7 +4629,12 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_malloc")) {
         return guest_allocate_at(arguments[0], false, return_address);
     }
-    if (import_is(name, "__Znwm") || import_is(name, "__Znam")) {
+    /* The nothrow forms allocate exactly as the throwing ones do here: this
+       allocator reports failure by returning null, which is what the nothrow
+       contract asks for anyway.  The trailing nothrow_t reference is ignored. */
+    if (import_is(name, "__Znwm") || import_is(name, "__Znam") ||
+        import_is(name, "__ZnwmRKSt9nothrow_t") ||
+        import_is(name, "__ZnamRKSt9nothrow_t")) {
         return guest_allocate_at(arguments[0], false, return_address);
     }
     if (import_is(name, "_calloc")) {
@@ -4022,7 +4646,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return guest_reallocate(arguments[0], arguments[1], return_address);
     }
     if (import_is(name, "_free") || import_is(name, "__ZdlPv") ||
-        import_is(name, "__ZdaPv")) {
+        import_is(name, "__ZdaPv") ||
+        import_is(name, "__ZdlPvRKSt9nothrow_t") ||
+        import_is(name, "__ZdaPvRKSt9nothrow_t")) {
         guest_deallocate(arguments[0]);
         return 0;
     }
@@ -4032,7 +4658,9 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         import_is(name, "__ZNSaIcED2Ev")) {
         return 0;
     }
-    if (import_is(name, "__ZNSsC2Ev")) {
+    /* C1/C2 and D1/D2 are the complete-object and base-object variants; for
+       std::string, which has no virtual bases, they are the same function. */
+    if (import_is(name, "__ZNSsC1Ev") || import_is(name, "__ZNSsC2Ev")) {
         guest_string_construct(arguments[0], "", 0, return_address);
         return arguments[0];
     }
@@ -4049,13 +4677,40 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
                                return_address);
         return arguments[0];
     }
-    if (import_is(name, "__ZNSsD2Ev")) {
+    if (import_is(name, "__ZNSsD1Ev") || import_is(name, "__ZNSsD2Ev")) {
         guest_string_dispose_object(arguments[0]);
         return 0;
     }
-    if (import_is(name, "__ZNSs4_Rep10_M_disposeERKSaIcE")) {
+    /* Every one of these is handed a _Rep, not a string object: its first
+       word is the length, so anything that reads it as an object sees a small
+       integer where a data pointer belongs and reports a healthy teardown as
+       a foreign representation.  Mark the disposal so that report stays quiet
+       for its duration. */
+    if (import_is(name, "__ZNSs4_Rep10_M_disposeERKSaIcE") ||
+        import_is(name, "__ZNSbIwSt11char_traitsIwESaIwEE4_Rep10_M_disposeERKS1_") ||
+        /* _M_destroy is reached only after __exchange_and_add has already
+           driven the reference count below zero, so the count no longer
+           guards the block and disposal frees it outright.  The shared empty
+           rep never arrives here: its count is pinned far above zero. */
+        import_is(name, "__ZNSs4_Rep10_M_destroyERKSaIcE") ||
+        import_is(name, "__ZNSbIwSt11char_traitsIwESaIwEE4_Rep10_M_destroyERKS1_")) {
+        guest_string_disposing = true;
         guest_string_dispose_rep(arguments[0]);
+        guest_string_disposing = false;
         return 0;
+    }
+    /* libgcc's atomic refcount primitive.  Zuma's Revenge is the only title
+       that links against the out-of-line _Rep machinery, so it reaches this
+       rather than keeping the operation inlined: it adds the addend to the
+       guest word and yields the value from before the add, which the caller
+       tests to decide whether it held the last reference. */
+    if (import_is(name, "__ZN9__gnu_cxx18__exchange_and_addEPVii")) {
+        if (arguments[0] < kGuestHeapBase || arguments[0] >= kGuestHeapEnd) {
+            return 0;
+        }
+        int32_t *counter = (void *)(uintptr_t)arguments[0];
+        return (uint32_t)__atomic_fetch_add(counter, (int32_t)arguments[1],
+                                            __ATOMIC_SEQ_CST);
     }
     if (import_is(name, "__ZNSs6assignEPKc")) {
         const char *source = (const char *)(uintptr_t)arguments[1];
@@ -4175,6 +4830,10 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_stat") || import_is(name, "_fstat")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
+        char redirected[PATH_MAX];
+        if (strcmp(name, "_fstat") != 0) {
+            path = guest_redirect_path(path, redirected, sizeof(redirected));
+        }
         struct guest_stat32 *guest = (void *)(uintptr_t)arguments[1];
         struct stat host;
         int status = !strcmp(name,"_fstat") ? fstat((int)arguments[0], &host) : stat(path, &host);
@@ -4257,6 +4916,15 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         int status = sysctlbyname(sysctl_name, old_value,
                                   guest_old_size ? &old_size : NULL,
                                   new_value, new_size);
+        /* Same 32-bit ceiling as the MIB form above: a memory size that does
+           not fit a 32-bit word reaches the guest truncated, and 16 GiB
+           truncates to zero. */
+        if (status == 0 && sysctl_name && old_value && old_size == 8 &&
+            (strcmp(sysctl_name, "hw.memsize") == 0 ||
+             strcmp(sysctl_name, "hw.physmem") == 0)) {
+            uint64_t *slot = old_value;
+            if (*slot > UINT64_C(0x7fffffff)) *slot = UINT64_C(0x7fffffff);
+        }
         if (guest_old_size) *guest_old_size = (uint32_t)old_size;
         return (uint32_t)status;
     }
@@ -4388,6 +5056,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_fopen")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
         const char *mode = (const char *)(uintptr_t)arguments[1];
+        char redirected[PATH_MAX];
+        path = guest_redirect_path(path, redirected, sizeof(redirected));
         FILE *file = fopen(path, mode);
         if (!file && getenv("LP32_TRACE_FILES")) {
             fprintf(stderr, "compat32: fopen failed: %s (%s) from 0x%08" PRIx32 "\n",
@@ -4508,6 +5178,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_opendir")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
+        char redirected[PATH_MAX];
+        path = guest_redirect_path(path, redirected, sizeof(redirected));
         DIR *directory = path ? opendir(path) : NULL;
         return guest_handle_for_directory(directory);
     }
@@ -4550,21 +5222,37 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         return (uint32_t)status;
     }
     if (import_is(name, "_mkdir")) {
-        return (uint32_t)mkdir((const char *)(uintptr_t)arguments[0],
+        char redirected[PATH_MAX];
+        return (uint32_t)mkdir(guest_redirect_path(
+                                   (const char *)(uintptr_t)arguments[0],
+                                   redirected, sizeof(redirected)),
                                (mode_t)arguments[1]);
     }
     if (import_is(name, "_remove")) {
-        return (uint32_t)remove((const char *)(uintptr_t)arguments[0]);
+        char redirected[PATH_MAX];
+        return (uint32_t)remove(guest_redirect_path(
+                                    (const char *)(uintptr_t)arguments[0],
+                                    redirected, sizeof(redirected)));
     }
     if (import_is(name, "_rename")) {
-        return (uint32_t)rename((const char *)(uintptr_t)arguments[0],
-                                (const char *)(uintptr_t)arguments[1]);
+        char from[PATH_MAX], to[PATH_MAX];
+        const char *old_path = guest_redirect_path(
+            (const char *)(uintptr_t)arguments[0], from, sizeof(from));
+        const char *new_path = guest_redirect_path(
+            (const char *)(uintptr_t)arguments[1], to, sizeof(to));
+        return (uint32_t)rename(old_path, new_path);
     }
     if (import_is(name, "_rmdir")) {
-        return (uint32_t)rmdir((const char *)(uintptr_t)arguments[0]);
+        char redirected[PATH_MAX];
+        return (uint32_t)rmdir(guest_redirect_path(
+                                   (const char *)(uintptr_t)arguments[0],
+                                   redirected, sizeof(redirected)));
     }
     if (import_is(name, "_unlink")) {
-        return (uint32_t)unlink((const char *)(uintptr_t)arguments[0]);
+        char redirected[PATH_MAX];
+        return (uint32_t)unlink(guest_redirect_path(
+                                    (const char *)(uintptr_t)arguments[0],
+                                    redirected, sizeof(redirected)));
     }
     if (import_is(name, "_tmpfile")) {
         return guest_handle_for_file(tmpfile());
@@ -4675,6 +5363,8 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     }
     if (import_is(name, "_chdir")) {
         const char *path = (const char *)(uintptr_t)arguments[0];
+        char redirected[PATH_MAX];
+        path = guest_redirect_path(path, redirected, sizeof(redirected));
         return path ? (uint32_t)chdir(path) : (uint32_t)-1;
     }
     if (import_is(name, "_fcntl")) {
@@ -4932,6 +5622,12 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
             case UINT32_C(0x73797331): value = 10; break; /* sys1: major */
             case UINT32_C(0x73797332): value = 7; break;  /* sys2: minor */
             case UINT32_C(0x73797333): value = 5; break;  /* sys3: bugfix */
+            /* sysv: the whole version packed as BCD nibbles.  Zuma's Revenge
+               asks for this one and refuses to start ("Mac OS X v10.4
+               (minimum) is required for this application") when the selector
+               fails, since an undefined selector leaves the response zero.
+               Report the same 10.7.5 the split selectors above do. */
+            case UINT32_C(0x73797376): value = 0x1075; break;
             default: return (uint32_t)-5551;              /* gestaltUndefSelectorErr */
         }
         if (response) *response = value;
@@ -4949,6 +5645,25 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
         if (port) *port = 0;
         return 0;
     }
+    /* _IORegistryEntryCreateCFProperty is answered by the ObjC bridge, which
+       has the CFString and CFNumber machinery this one needs: the VRAM probe
+       asks the display's registry entry for IOFBMemorySize, and reporting no
+       property makes the caller fall back to 32 MB -- which is below the 92 MB
+       the game requires before it will load its high-resolution art. */
+    if (import_is(name, "_IOServiceGetMatchingServices")) {
+        uint32_t *iterator = (void *)(uintptr_t)arguments[2];
+        if (iterator) *iterator = 0;
+        return UINT32_C(0xe00002c7); /* kIOReturnNoDevice */
+    }
+    if (import_is(name, "_IOHIDGetAccelerationWithKey")) {
+        /* The pointer acceleration the guest would read back; leave it zero
+           and report failure so it keeps its own default. */
+        uint32_t *acceleration = (void *)(uintptr_t)arguments[2];
+        if (acceleration) { acceleration[0] = 0; acceleration[1] = 0; }
+        return UINT32_C(0xe00002c7);
+    }
+    if (import_is(name, "_NXOpenEventStatus")) return 0;
+    if (import_is(name, "_NXGetLocalArchInfo")) return 0;
     if (import_is(name, "_IORegistryEntryCreateCFProperties")) {
         uint32_t *properties = (void *)(uintptr_t)arguments[1];
         if (properties) *properties = 0;
@@ -6236,5 +6951,244 @@ int compat_runtime32_run_sync_self_test(void)
             " stale-rejections=%" PRIu32 " released=%" PRIu64 ")\n",
             object_total, object_total, semaphore_total, stale_rejections,
             guest_sync_released_count);
+    return 0;
+}
+
+static int string_self_test_expect(uint32_t object, size_t width,
+                                   const uint32_t *expected,
+                                   size_t expected_length, char *detail,
+                                   size_t detail_size)
+{
+    const char *data = guest_string_data(object);
+    size_t length = guest_string_length(object);
+    if (length != expected_length) {
+        snprintf(detail, detail_size, "length %zu, expected %zu", length,
+                 expected_length);
+        return 0;
+    }
+    for (size_t i = 0; i < length; ++i) {
+        uint32_t unit = (width == 4) ? ((const uint32_t *)data)[i]
+                                     : (uint32_t)(unsigned char)data[i];
+        if (unit == expected[i]) continue;
+        snprintf(detail, detail_size,
+                 "unit %zu is U+%04" PRIX32 ", expected U+%04" PRIX32, i, unit,
+                 expected[i]);
+        return 0;
+    }
+    return 1;
+}
+
+/* basic_string::append(size_type, CharT) at both widths.  Locale::CommaSeparate
+   builds a score by prepending one digit at a time through the guest's own
+   operator+(wchar_t, const wstring&), which reserves and then calls
+   append(1, digit).  The wide mangling ("Emw") went unmatched, so the call fell
+   through to the single-character branch -- which takes the character from a[1],
+   the COUNT for this overload.  Every digit became U+0001, so "Points This
+   Level", "Total Points" and "Perfect Level Bonus" drew as nothing on the
+   end-of-level tally; a zero Bonus survived only because CommaSeparate returns a
+   literal "0" without appending.  Checked here rather than in the game because
+   the tally screen is several minutes of play from a cold start. */
+int compat_runtime32_run_string_self_test(void)
+{
+    static const char wide_append[] =
+        "__ZNSbIwSt11char_traitsIwESaIwEE6appendEmw";
+    static const char narrow_append[] = "__ZNSs6appendEmc";
+    static const char wide_resize[] =
+        "__ZNSbIwSt11char_traitsIwESaIwEE6resizeEmw";
+    static const char narrow_resize[] = "__ZNSs6resizeEmc";
+    static const uint32_t expect_seven[] = {L'7'};
+    static const uint32_t expect_seventy_four[] = {L'7', L'4'};
+    static const uint32_t expect_wide_run[] = {0x3042, 0x3042, 0x3042};
+    static const uint32_t expect_narrow_run[] = {'z', 'z', 'z'};
+    static const uint32_t expect_wide_grown[] = {0x3042, 0x3042};
+    static const uint32_t expect_narrow_grown[] = {'q', 'q', 'q'};
+    const char *failure = NULL;
+    char detail[160] = "";
+
+    uint32_t object = compat_runtime32_allocate(4, 1);
+    if (!object) {
+        fputs("String bridge self-test: FAIL (allocation)\n", stderr);
+        return -1;
+    }
+
+    do {
+        uint32_t arguments[8] = {0};
+        uint64_t result = 0;
+
+        /* One digit, exactly as operator+(wchar_t, const wstring&) appends it:
+           the '7' has to arrive as U+0037 and not as the count. */
+        pg_string_set(object, NULL, 0, 4, false);
+        arguments[0] = object; arguments[1] = 1; arguments[2] = L'7';
+        if (!peggle_cpp_dispatch(wide_append, arguments, &result)) {
+            failure = "wide append(1, ch) went unhandled";
+            break;
+        }
+        if (!string_self_test_expect(object, 4, expect_seven, 1, detail,
+                                     sizeof detail)) {
+            failure = "wide append(1, ch)";
+            break;
+        }
+
+        /* Again onto existing content, which also pins down the order. */
+        arguments[0] = object; arguments[1] = 1; arguments[2] = L'4';
+        if (!peggle_cpp_dispatch(wide_append, arguments, &result)) {
+            failure = "second wide append(1, ch) went unhandled";
+            break;
+        }
+        if (!string_self_test_expect(object, 4, expect_seventy_four, 2, detail,
+                                     sizeof detail)) {
+            failure = "wide append onto existing content";
+            break;
+        }
+
+        /* count > 1 at width 4: the fill has to write one character per element,
+           which is the part a memset cannot do. */
+        pg_string_set(object, NULL, 0, 4, false);
+        arguments[0] = object; arguments[1] = 3; arguments[2] = 0x3042;
+        if (!peggle_cpp_dispatch(wide_append, arguments, &result)) {
+            failure = "wide append(3, ch) went unhandled";
+            break;
+        }
+        if (!string_self_test_expect(object, 4, expect_wide_run, 3, detail,
+                                     sizeof detail)) {
+            failure = "wide append(3, ch)";
+            break;
+        }
+
+        /* The narrow overload shares the branch, so prove it still works. */
+        pg_string_set(object, NULL, 0, 1, false);
+        arguments[0] = object; arguments[1] = 3; arguments[2] = 'z';
+        if (!peggle_cpp_dispatch(narrow_append, arguments, &result)) {
+            failure = "narrow append(3, ch) went unhandled";
+            break;
+        }
+        if (!string_self_test_expect(object, 1, expect_narrow_run, 3, detail,
+                                     sizeof detail)) {
+            failure = "narrow append(3, ch)";
+            break;
+        }
+
+        /* resize(n, c) growing an empty string, at both widths: the same
+           narrow-only match and the same byte-wise fill. */
+        pg_string_set(object, NULL, 0, 4, false);
+        arguments[0] = object; arguments[1] = 2; arguments[2] = 0x3042;
+        if (!peggle_cpp_dispatch(wide_resize, arguments, &result)) {
+            failure = "wide resize(n, ch) went unhandled";
+            break;
+        }
+        if (!string_self_test_expect(object, 4, expect_wide_grown, 2, detail,
+                                     sizeof detail)) {
+            failure = "wide resize(n, ch)";
+            break;
+        }
+
+        pg_string_set(object, NULL, 0, 1, false);
+        arguments[0] = object; arguments[1] = 3; arguments[2] = 'q';
+        if (!peggle_cpp_dispatch(narrow_resize, arguments, &result)) {
+            failure = "narrow resize(n, ch) went unhandled";
+            break;
+        }
+        if (!string_self_test_expect(object, 1, expect_narrow_grown, 3, detail,
+                                     sizeof detail)) {
+            failure = "narrow resize(n, ch)";
+            break;
+        }
+    } while (0);
+
+    guest_string_dispose_object(object);
+    compat_runtime32_deallocate(object);
+
+    if (failure) {
+        fprintf(stderr, "String bridge self-test: FAIL (%s%s%s)\n", failure,
+                detail[0] ? ": " : "", detail);
+        return -1;
+    }
+    fputs("String bridge self-test: PASS (wide append(1,ch), append onto"
+          " content, wide append(3,ch), narrow append(3,ch), wide resize(n,ch),"
+          " narrow resize(n,ch))\n", stderr);
+    return 0;
+}
+
+/* Sexy::Locale::CommaSeparate(int) formats every number on the end-of-level
+   tally.  It loops over the digits, and for each one calls the guest's own
+   operator+(wchar_t, const wstring&), which reserves and then appends the digit
+   with append(1, ch) -- the overload whose wide form this bridge used to decode
+   as the single-character one, taking the count for the character.  Every digit
+   came out U+0001 and the numbers drew as nothing; only a zero survived,
+   because CommaSeparate returns a literal "0" without ever appending.
+   Calling the guest function itself checks the whole path, so this fails if any
+   part of the digit loop regresses and not merely the one handler below it. */
+int compat_runtime32_run_score_self_test(void)
+{
+    static const char *const candidate_names[] = {
+        "__ZN4Sexy6Locale13CommaSeparateEi",
+        "_ZN4Sexy6Locale13CommaSeparateEi",
+    };
+    static const uint32_t expect_zero[] = {'0'};
+    static const uint32_t expect_forty_two[] = {'4', '2'};
+    static const uint32_t expect_thousand[] = {'1', ',', '0', '0', '0'};
+    static const uint32_t expect_tally[] = {'1', ',', '2', '3', '4',
+                                            ',', '5', '6', '7'};
+    static const struct {
+        int value;
+        const uint32_t *expected;
+        size_t length;
+    } cases[] = {
+        {0, expect_zero, 1},              /* the literal path, never appended */
+        {42, expect_forty_two, 2},
+        {1000, expect_thousand, 5},
+        {1234567, expect_tally, 9},
+    };
+    const char *failure = NULL;
+    char detail[160] = "";
+    int failing_value = 0;
+
+    uint32_t function = 0;
+    for (size_t i = 0; !function && i < sizeof candidate_names /
+                                          sizeof candidate_names[0]; ++i) {
+        function = compat_runtime32_guest_symbol(candidate_names[i]);
+    }
+    if (!function) {
+        fputs("Score format self-test: SKIP (image has no "
+              "Sexy::Locale::CommaSeparate)\n", stderr);
+        return 0;
+    }
+
+    uint32_t result_object = compat_runtime32_allocate(4, 1);
+    if (!result_object) {
+        fputs("Score format self-test: FAIL (allocation)\n", stderr);
+        return -1;
+    }
+
+    for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i) {
+        /* i386 sret: the hidden result pointer is the first argument, so the
+           wstring the function returns lands in result_object. */
+        uint32_t arguments[2] = {result_object, (uint32_t)cases[i].value};
+        *(uint32_t *)(uintptr_t)result_object = 0;
+        failing_value = cases[i].value;
+        compat_runtime32_call(function, arguments, 2);
+        /* A trapped import abandons the whole guest call, which would leave the
+           string empty -- the same thing a formatting failure looks like. */
+        if (compat_runtime32_last_call_trapped()) {
+            failure = "a trapped import abandoned the guest call";
+            break;
+        }
+        if (!string_self_test_expect(result_object, 4, cases[i].expected,
+                                     cases[i].length, detail, sizeof detail)) {
+            failure = "wrong text";
+            break;
+        }
+    }
+
+    guest_string_dispose_object(result_object);
+    compat_runtime32_deallocate(result_object);
+
+    if (failure) {
+        fprintf(stderr, "Score format self-test: FAIL (CommaSeparate(%d): %s%s%s)\n",
+                failing_value, failure, detail[0] ? ": " : "", detail);
+        return -1;
+    }
+    fputs("Score format self-test: PASS (0, 42, 1000, 1234567 all comma"
+          "-separated correctly)\n", stderr);
     return 0;
 }

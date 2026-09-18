@@ -12,6 +12,10 @@ void compat_runtime32_struct_return(void);
 int compat_runtime32_initialize(struct macho_image32 *image);
 /* The loaded guest image (valid after compat_runtime32_initialize). */
 const struct macho_image32 *compat_runtime32_image(void);
+/* The library mapped beside it, or NULL when the title has none.  It carries
+   its own constant strings and class references, so anything resolving a
+   guest address has to consider both images. */
+const struct macho_image32 *compat_runtime32_companion_image(void);
 uint32_t compat_runtime32_call(uint32_t function, const uint32_t *arguments,
                                size_t argument_count);
 int compat_runtime32_last_call_trapped(void);
@@ -25,6 +29,16 @@ int compat_runtime32_run_heap_self_test(void);
 int compat_runtime32_run_file_self_test(void);
 int compat_runtime32_run_cg_self_test(void);
 int compat_runtime32_run_sync_self_test(void);
+/* Exercises basic_string::append(size_type, CharT) for both widths.  The wide
+   overload ("Emw") was decoded as the single-character form, which took the
+   count for the character, so every digit the guest's operator+ prepended
+   became U+0001 and Locale::CommaSeparate's scores drew as nothing. */
+int compat_runtime32_run_string_self_test(void);
+/* Calls the guest's own Sexy::Locale::CommaSeparate(int) -- the function that
+   formats every number on the end-of-level tally -- and checks the text it
+   produces.  Covers the whole path rather than the one string handler beneath
+   it, so it fails if any part of the digit loop regresses. */
+int compat_runtime32_run_score_self_test(void);
 uint32_t compat_runtime32_cg_object_count(void);
 uint32_t compat_runtime32_cg_string_count(void);
 uint64_t compat_runtime32_dispatch_import(const char *name,
@@ -34,6 +48,31 @@ uint64_t compat_runtime32_dispatch_import(const char *name,
    given import name, for function pointers the game expects to call back
    (the same mechanism dlsym results use).  0 if the thunk table is full. */
 uint32_t compat_runtime32_guest_callback(const char *name);
+
+/* Address of a symbol in the game image, or 0 when it has none.  For calling
+   back into guest code the shipped binary never calls itself. */
+uint32_t compat_runtime32_guest_symbol(const char *name);
+
+/* Call SystemX::CloseRegistry() so the values the game wrote into its
+   in-memory registry reach RegistryData.xml.  The shipped Mac binary never
+   calls it, so the selected profile (LastUser), Is3D, HiRes, the volumes and
+   the screen mode are otherwise all discarded at exit.  A no-op for titles
+   whose image has no such symbol; LP32_NO_REGISTRY_FLUSH disables it. */
+void compat_runtime32_flush_guest_registry(const char *reason);
+
+/* Told by the Carbon bridge when the guest has read its registry file back in,
+   with the path it came from and how many bytes it held.  Flushing before this
+   has happened would serialise a tree the guest has not populated yet and
+   overwrite the real settings with an empty one -- which is exactly what a
+   flush firing on the first frame did. */
+void compat_runtime32_note_registry_loaded(const char *path, long bytes);
+
+/* Map an i386 dylib the game ships beside itself (Zuma's Revenge reaches
+   Direct3D and DirectSound through SmartDX.framework) at `slide`, bind its
+   imports through this bridge, apply its relocations and run its module
+   initializers.  Afterwards the symbols it exports are dispatched into guest
+   code, so the game's own imports of them reach the real library. */
+int compat_runtime32_load_companion(const char *path, uint32_t slide);
 
 /* Install a handler consulted first by the import dispatcher, before any
    built-in bridge.  Returns 1 (and sets *result) to handle an import by name,
@@ -93,5 +132,19 @@ typedef uint64_t (*lp32_fast_import_fn)(const uint32_t *arguments,
    import handler should return (0). */
 uint64_t compat_runtime32_return_double(double value);
 uint64_t compat_runtime32_return_float(float value);
+
+/* For the crash report: describe the guest heap block a pointer lands in.
+   Fills header[4], data[4] and a "live"/"FREED"/"not-a-block" state, and
+   returns non-zero when the pointer is inside the heap at all. */
+int compat_runtime32_guest_block_info(uint32_t pointer, uint32_t *header,
+                                      uint32_t *data, const char **state);
+
+/* LP32_APPLICATION_SUPPORT_DIR rewrite, shared with the Carbon bridge: maps a
+   path under the real ~/Library/Application Support into the override so a
+   test run cannot touch the player's saved games.  Returns `path` unchanged
+   when the override is unset or the path lies elsewhere; otherwise builds the
+   result in `buffer`. */
+const char *compat_runtime32_redirect_path(const char *path, char *buffer,
+                                           size_t size);
 
 #endif

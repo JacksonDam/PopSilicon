@@ -20,7 +20,13 @@ static int peggle_graphics_dispatch(const char *n, const uint32_t *a, uint64_t *
     if (IS("_glTexCoord2f")) RET(fast_glTexCoord2f(a, 0));
     if (IS("_glLineWidth")) { glLineWidth(pg_float(a[0])); RET(0); }
     if (IS("_glPointSize")) { glPointSize(pg_float(a[0])); RET(0); }
-    if (IS("_glOrtho")) { glOrtho(pg_double(a), pg_double(a + 2), pg_double(a + 4), pg_double(a + 6), pg_double(a + 8), pg_double(a + 10)); RET(0); }
+    if (IS("_glOrtho")) {
+        double ortho_left = pg_double(a), ortho_right = pg_double(a + 2);
+        double ortho_bottom = pg_double(a + 4), ortho_top = pg_double(a + 6);
+        glOrtho(ortho_left, ortho_right, ortho_bottom, ortho_top,
+                pg_double(a + 8), pg_double(a + 10));
+        RET(0);
+    }
     if (IS("_glPixelStorei")) { glPixelStorei(a[0], a[1]); RET(0); }
     if (IS("_glShadeModel")) { glShadeModel(a[0]); RET(0); }
     if (IS("_glTexEnvi")) { glTexEnvi(a[0], a[1], (GLint)a[2]); RET(0); }
@@ -40,7 +46,88 @@ static int peggle_graphics_dispatch(const char *n, const uint32_t *a, uint64_t *
         RET(a[0]);
     }
     if (IS("_CGGetDisplaysWithRect")) RET(CGGetDisplaysWithRect(pg_cgrect(a), a[4], P(5), P(6)));
-    if (IS("_CGAssociateMouseAndMouseCursorPosition")) RET(0);
+    /* The bridge presents one fixed display whose mode it controls, so a
+       reconfiguration callback would never have anything to report: accept
+       the registration and never call back.  Unregistering is the same. */
+    if (IS("_CGDisplayRegisterReconfigurationCallback") ||
+        IS("_CGDisplayRemoveReconfigurationCallback")) RET(0);
+    if (IS("_CGGetActiveDisplayList") || IS("_CGGetOnlineDisplayList")) {
+        uint32_t capacity = a[0];
+        uint32_t *displays = a[1] ? P(1) : NULL;
+        if (displays && capacity) displays[0] = CGMainDisplayID();
+        /* The count is reported even when no array was supplied, which is how
+           the caller asks how many displays there are: the bridge shows one. */
+        if (a[2]) *(uint32_t *)P(2) = 1;
+        RET(0);
+    }
+    if (IS("_CGCursorIsVisible")) RET(CGCursorIsVisible());
+    if (IS("_CGRectContainsPoint")) {
+        /* CGRect is four floats and CGPoint two, all passed by value. */
+        RET(CGRectContainsPoint(pg_cgrect(a),
+                                CGPointMake(pg_float(a[4]), pg_float(a[5]))));
+    }
+    if (IS("_CGContextConcatCTM")) {
+        CGContextRef context = (CGContextRef)CG(0);
+        CGAffineTransform t = CGAffineTransformMake(
+            pg_float(a[1]), pg_float(a[2]), pg_float(a[3]),
+            pg_float(a[4]), pg_float(a[5]), pg_float(a[6]));
+        if (context) CGContextConcatCTM(context, t);
+        RET(0);
+    }
+    /* Returned by value: the hidden buffer comes first and the callee pops
+       it, exactly as for CGDisplayBounds above. */
+    if (IS("_CGContextGetCTM")) {
+        CGContextRef context = (CGContextRef)CG(1);
+        CGAffineTransform t = context ? CGContextGetCTM(context)
+                                      : CGAffineTransformIdentity;
+        if (a[0]) {
+            float out[6] = {(float)t.a, (float)t.b, (float)t.c,
+                            (float)t.d, (float)t.tx, (float)t.ty};
+            memcpy(P(0), out, sizeof(out));
+        }
+        compat_runtime32_struct_return();
+        RET(a[0]);
+    }
+    if (IS("_CGContextSetInterpolationQuality")) {
+        CGContextRef context = (CGContextRef)CG(0);
+        if (context) CGContextSetInterpolationQuality(context, (int32_t)a[1]);
+        RET(0);
+    }
+    if (IS("_CGBitmapContextCreate"))
+        RET(pg_cf_register(CGBitmapContextCreate(a[0] ? P(0) : NULL, a[1], a[2],
+                a[3], a[4], (CGColorSpaceRef)CG(5), a[6])));
+    if (IS("_CGImageGetAlphaInfo")) RET(CGImageGetAlphaInfo((CGImageRef)CG(0)));
+    /* GetColorSpace hands back a borrowed reference; retain it so the handle
+       the guest keeps stays valid for as long as it holds it. */
+    if (IS("_CGImageGetColorSpace")) {
+        CGColorSpaceRef space = CGImageGetColorSpace((CGImageRef)CG(0));
+        RET(space ? pg_cf_register(CGColorSpaceRetain(space)) : 0);
+    }
+    if (IS("_CGImageSourceCreateWithURL"))
+        RET(pg_cf_register(CGImageSourceCreateWithURL((CFURLRef)CG(0),
+                                                      (CFDictionaryRef)CG(1))));
+    if (IS("_CGImageSourceCreateWithData"))
+        RET(pg_cf_register(CGImageSourceCreateWithData((CFDataRef)CG(0),
+                                                       (CFDictionaryRef)CG(1))));
+    if (IS("_CGImageSourceCreateImageAtIndex"))
+        RET(pg_cf_register(CGImageSourceCreateImageAtIndex(
+                (CGImageSourceRef)CG(0), a[1], (CFDictionaryRef)CG(2))));
+    /* Games detach the pointer for relative mouse motion and re-attach when
+       they are done; ignoring the call left it in whatever state the last warp
+       put it, so absolute reads kept returning the warped position. */
+    if (IS("_CGAssociateMouseAndMouseCursorPosition")) {
+        if (a[0] == 0) {
+            static bool refused;
+            if (!refused) {
+                refused = true;
+                fprintf(stderr, "compat32: refusing CGAssociateMouseAndMouseCursor"
+                        "Position(false) -- it locks the user's pointer;"
+                        " the guest polls absolute position anyway\n");
+            }
+            RET(0);                       /* kCGErrorSuccess */
+        }
+        RET((uint32_t)CGAssociateMouseAndMouseCursorPosition(true));
+    }
     /* CoreGraphics images: real host objects behind proxy handles.  Pixel
        data providers copy the guest bytes because the game frees them
        before the image is drawn. */

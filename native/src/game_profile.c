@@ -112,6 +112,56 @@ static const struct lp32_game_profile chuzzle_profile = {
     .main_address = 0,
 };
 
+static const struct lp32_game_profile bookworm_profile = {
+    .title = LP32_TITLE_BOOKWORM,
+    .name = "Bookworm",
+    .display_name = "Bookworm Deluxe",
+    .log_directory = "Bookworm",
+    .image_file = "Bookworm.image",
+    .entry_eip = 0x000029bc,
+    .image_end = 0x00274000,
+    .main_address = 0,
+};
+
+static const struct lp32_game_profile feeding_frenzy_profile = {
+    .title = LP32_TITLE_FEEDING_FRENZY,
+    .name = "FeedingFrenzy",
+    .display_name = "Feeding Frenzy Deluxe",
+    .log_directory = "FeedingFrenzy",
+    .image_file = "FeedingFrenzy.image",
+    .entry_eip = 0x00002c2c,
+    .image_end = 0x001cfa7c,
+    .main_address = 0,
+};
+
+static const struct lp32_profile_selection_guard zumas_profile_selection_guard = {
+    .hook = {
+        .address = 0x001078bf,
+        .expected = {0x8b, 0x87, 0xe8, 0x07, 0x00, 0x00},
+        .length = 6,
+    },
+    .resume = 0x001078c5,
+    .safe_return = 0x00107925,
+    .profile_manager_load = 0x001aae00,
+    .profile_manager_any = 0x001a5d60,
+};
+
+static const struct lp32_game_profile zumas_revenge_profile = {
+    .title = LP32_TITLE_ZUMAS_REVENGE,
+    .name = "ZumaRevenge",
+    .display_name = "Zuma's Revenge!",
+    .log_directory = "ZumaRevenge",
+    .image_file = "ZumaRevenge.image",
+    .entry_eip = 0x00002980,
+    .image_end = 0x00af8000,
+    .main_address = 0,
+    .profile_selection_guard = &zumas_profile_selection_guard,
+    .null_deref_fault = 0x00188fba,
+    .null_deref_resume = 0x00188fc0,
+    .null_deref_fault2 = 0x00189c68,
+    .null_deref_resume2 = 0x00189dbd,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -129,6 +179,9 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &chuzzle_profile,
     &plantsvszombies_profile,
     &zuma_profile,
+    &bookworm_profile,
+    &feeding_frenzy_profile,
+    &zumas_revenge_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -165,6 +218,14 @@ const struct lp32_game_profile *lp32_profile_named(const char *name)
         strcasecmp(name, "PvZ") == 0) return &plantsvszombies_profile;
     if (strcasecmp(name, "Chuzzle") == 0 ||
         strcasecmp(name, "Chuzzle Deluxe") == 0) return &chuzzle_profile;
+    if (strcasecmp(name, "Bookworm") == 0 ||
+        strcasecmp(name, "Bookworm Deluxe") == 0) return &bookworm_profile;
+    if (strcasecmp(name, "FeedingFrenzy") == 0 ||
+        strcasecmp(name, "Feeding Frenzy") == 0 ||
+        strcasecmp(name, "Feeding Frenzy Deluxe") == 0) return &feeding_frenzy_profile;
+    if (strcasecmp(name, "ZumaRevenge") == 0 ||
+        strcasecmp(name, "Zuma's Revenge") == 0 ||
+        strcasecmp(name, "Zuma's Revenge!") == 0) return &zumas_revenge_profile;
     return NULL;
 }
 

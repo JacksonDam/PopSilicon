@@ -62,6 +62,11 @@ struct audio_callback_context {
     uint32_t guest_data[kAudioCallbackBufferCapacity];
     size_t guest_data_capacity[kAudioCallbackBufferCapacity];
     pthread_mutex_t lock;
+    /* The worker thread currently inside this context's guest render, or NULL.
+       Only that thread must defer a release: it already holds `lock`, so
+       releasing inline would block against itself.  Any other caller releases
+       inline, which is what the code did before deferral existed. */
+    pthread_t render_thread;
     pthread_cond_t request_condition;
     pthread_cond_t response_condition;
     bool request_pending;
@@ -81,6 +86,83 @@ struct audio_callback_context {
 };
 
 static uint64_t render_silent_count;
+/* Times the guest handed back a buffer description different from the one we
+   gave it.  Counted unconditionally: a finding that only exists when tracing is
+   on is a finding about tracing. */
+static uint64_t guest_rewrote_buffer_list;
+/* Guest audio calls in flight at once.  OpenAL renders every source through a
+   SHARED scratch buffer -- 17 callback contexts were measured repointing at the
+   same pair of addresses -- which is safe only while the host pulls inputs
+   sequentially, as CoreAudio does on its one IO thread.  We dispatch each call
+   to a pool of 8 workers, so if this ever exceeds 1 for input callbacks, two
+   voices are writing the same guest memory unsynchronised and a torn read is
+   scattered garbage inside otherwise coherent audio.  Measured, not assumed:
+   the caller blocks on response_ready, so the concurrency may well be 1. */
+static uint32_t audio_calls_in_flight;
+static uint32_t audio_calls_in_flight_max;
+static uint64_t delivered_bad_total;
+static uint64_t delivered_buffers_total;
+static uint64_t delivered_mag_over_1;
+static uint64_t delivered_mag_over_2;
+static uint64_t delivered_mag_over_4;
+static uint64_t delivered_samples_total;
+static uint64_t delivered_bad_reports;
+/* Sample-rate converter output attributed to the guest call in progress.  Safe
+   to attribute this way because inflightMax == 1 (measured over whole runs):
+   exactly one guest audio call is ever in flight, and the converter runs inside
+   it.  Reset before the call, accumulated during it, read after the handshake. */
+static uint32_t converter_calls_this_call;
+static uint32_t converter_frames_this_call;
+static uint64_t short_fill_clamped;
+
+static bool clamp_short_fill(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("LP32_CLAMP_SHORT_FILL") != NULL;
+    return enabled != 0;
+}
+
+static bool count_delivered_samples(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("LP32_PROBE_OUTPUT") != NULL ||
+                  getenv("LP32_TRACE_AUDIO") != NULL;
+    }
+    return enabled != 0;
+}
+
+static uint64_t converter_calls_none;
+static uint64_t converter_calls_single;
+static uint64_t converter_calls_multi;
+
+static bool sanitize_delivered(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *text = getenv("LP32_SANITIZE_DELIVERED");
+        enabled = text && strcmp(text, "0") != 0;
+    }
+    return enabled != 0;
+}
+static uint64_t sanitized_samples;
+
+static int silence_bus(void)
+{
+    static int value = -2;
+    if (value == -2) {
+        const char *text = getenv("LP32_SILENCE_BUS");
+        value = text ? atoi(text) : -1;
+    }
+    return value;
+}
+
+static bool silence_3d(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("LP32_SILENCE_3D") != NULL;
+    return enabled != 0;
+}
 static uint64_t render_gap_count;
 static uint64_t render_gap_frames;
 static uint64_t render_callback_max_ns;
@@ -141,6 +223,22 @@ static bool mute_audio_output(void)
     if (enabled < 0) enabled = getenv("LP32_MUTE_AUDIO") != NULL;
     return enabled != 0;
 }
+
+static bool mute_only_at_output(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) enabled = getenv("LP32_MUTE_AT_OUTPUT") != NULL;
+    return enabled != 0;
+}
+
+static bool output_mute_installed;
+
+static bool output_mute_active(void)
+{
+    return mute_only_at_output() &&
+           __atomic_load_n(&output_mute_installed, __ATOMIC_ACQUIRE);
+}
+
 
 /* Frame delta clamp shared by both titles (0.1f in the tick).  LP32_AUDIO_HOLD_MS
    overrides it; 0 disables the hold. */
@@ -319,6 +417,20 @@ static void *audio_callback_worker(void *opaque)
 
         struct audio_callback_context *context = job->context;
         pthread_mutex_lock(&context->lock);
+        /* The context can be retired between the enqueue and this pickup: the
+           render's cond_wait drops context->lock, so a deferred release may
+           take it and zero the callback before this job runs.  Calling a
+           zeroed guest_function would jump to address 0, and dropping the job
+           would strand the render thread in its wait, so finish the handshake
+           with the status a trapped guest call reports -- the caller already
+           skips the copy-back for it. */
+        if (!context->in_use || !context->guest_function) {
+            context->guest_status = kAudio_ParamError;
+            context->response_ready = true;
+            pthread_cond_signal(&context->response_condition);
+            pthread_mutex_unlock(&context->lock);
+            continue;
+        }
         const uint32_t guest_arguments[] = {
             context->guest_refcon,
             context->guest_flags,
@@ -327,9 +439,12 @@ static void *audio_callback_worker(void *opaque)
             context->frame_count,
             context->host_has_buffer_list ? context->guest_buffer_list : 0,
         };
+        __atomic_store_n(&context->render_thread, pthread_self(),
+                         __ATOMIC_RELEASE);
         context->guest_status = (int32_t)compat_runtime32_call(
             context->guest_function, guest_arguments,
             sizeof(guest_arguments) / sizeof(guest_arguments[0]));
+        __atomic_store_n(&context->render_thread, NULL, __ATOMIC_RELEASE);
         if (compat_runtime32_last_call_trapped()) {
             fprintf(stderr,
                     "compat32: guest audio callback 0x%08x escaped\n",
@@ -547,7 +662,6 @@ static void release_audio_callback(struct audio_callback_context *context)
     context->guest_function = 0;
     context->guest_refcon = 0;
     context->request_pending = false;
-    context->response_ready = false;
     context->host_has_buffer_list = false;
     pthread_mutex_unlock(&context->lock);
 }
@@ -568,7 +682,6 @@ static uint32_t release_audio_callbacks_for_graph(AUGraph graph)
             context->guest_function = 0;
             context->guest_refcon = 0;
             context->request_pending = false;
-            context->response_ready = false;
             context->host_has_buffer_list = false;
             ++released;
         }
@@ -686,8 +799,10 @@ static OSStatus host_audio_callback(void *refcon,
     }
     if (!context->in_use || !context->guest_function || held ||
         __atomic_load_n(&context->muted, __ATOMIC_ACQUIRE)) {
+        bool clear_buffers =
+            strcmp(context->callback_kind, "render-notify") != 0;
         pthread_mutex_unlock(&context->lock);
-        if (host_list) {
+        if (host_list && clear_buffers) {
             for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
                 AudioBuffer *host_buffer = &host_list->mBuffers[index];
                 if (host_buffer->mData && host_buffer->mDataByteSize) {
@@ -709,6 +824,13 @@ static OSStatus host_audio_callback(void *refcon,
                sizeof(AudioTimeStamp));
     }
 
+    /* Non-zero bytes in the host buffer *before* the guest runs.  For a
+       post-render notify this is what the mixer actually produced; the count
+       taken after the guest call cannot distinguish "the mixer emitted
+       silence" from "the guest handed back a cleared buffer and we copied it
+       over the mixer's output". */
+    size_t host_nonzero_in = 0;
+    bool is_input_callback = strcmp(context->callback_kind, "render-notify") != 0;
     uint32_t buffer_count = host_list ? host_list->mNumberBuffers : 0;
     if (buffer_count > kAudioCallbackBufferCapacity) {
         buffer_count = kAudioCallbackBufferCapacity;
@@ -716,6 +838,14 @@ static OSStatus host_audio_callback(void *refcon,
     uint32_t *guest_count = (void *)(uintptr_t)context->guest_buffer_list;
     *guest_count = buffer_count;
     struct guest_audio_buffer *guest_buffers = (void *)(guest_count + 1);
+
+    /* What we hand the guest, kept so the copy-back can tell whether the guest
+       REWROTE the buffer description.  OpenAL's OALSource::DoRender rebases the
+       list it is given -- mData advanced past what it produced, mDataByteSize
+       reduced to the unfilled remainder -- which is its internal chaining
+       convention, not a description of where the audio is. */
+    uint32_t original_byte_size[kAudioCallbackBufferCapacity];
+    uint32_t original_data[kAudioCallbackBufferCapacity];
 
     for (uint32_t index = 0; index < buffer_count; ++index) {
         const AudioBuffer *host_buffer = &host_list->mBuffers[index];
@@ -733,9 +863,27 @@ static OSStatus host_audio_callback(void *refcon,
         guest_buffers[index].channels = host_buffer->mNumberChannels;
         guest_buffers[index].byte_size = (uint32_t)byte_size;
         guest_buffers[index].data = context->guest_data[index];
-        if (byte_size && host_buffer->mData) {
+        original_byte_size[index] = guest_buffers[index].byte_size;
+        original_data[index] = guest_buffers[index].data;
+        if (!byte_size) continue;
+        static int legacy_seed = -1;
+        if (legacy_seed < 0) legacy_seed = getenv("LP32_LEGACY_SEED") != NULL;
+        if (legacy_seed && host_buffer->mData) {
             memcpy((void *)(uintptr_t)guest_buffers[index].data,
                    host_buffer->mData, byte_size);
+        } else if (is_input_callback || !host_buffer->mData) {
+            memset((void *)(uintptr_t)guest_buffers[index].data, 0, byte_size);
+        } else {
+            /* A render notify is the opposite case: it observes audio the unit
+               has already produced, so the incoming bytes are real. */
+            memcpy((void *)(uintptr_t)guest_buffers[index].data,
+                   host_buffer->mData, byte_size);
+        }
+        if (trace_audio() && host_buffer->mData) {
+            const unsigned char *incoming = host_buffer->mData;
+            for (size_t offset = 0; offset < byte_size; ++offset) {
+                if (incoming[offset]) ++host_nonzero_in;
+            }
         }
     }
 
@@ -753,6 +901,18 @@ static OSStatus host_audio_callback(void *refcon,
         .context = context,
         .next = NULL,
     };
+    /* Attribute converter output to THIS call: cleared before the guest runs,
+       accumulated by the converter bridge while it does. */
+    converter_calls_this_call = 0;
+    converter_frames_this_call = 0;
+    uint32_t in_flight = __atomic_add_fetch(&audio_calls_in_flight, 1, __ATOMIC_ACQ_REL);
+    uint32_t seen_max = __atomic_load_n(&audio_calls_in_flight_max, __ATOMIC_RELAXED);
+    while (in_flight > seen_max &&
+           !__atomic_compare_exchange_n(&audio_calls_in_flight_max, &seen_max,
+                                        in_flight, true,
+                                        __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+        /* seen_max reloaded by the compare-exchange */
+    }
     uint64_t round_trip_start = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
     pthread_mutex_lock(&audio_job_lock);
     if (audio_job_tail) audio_job_tail->next = &job;
@@ -763,6 +923,7 @@ static OSStatus host_audio_callback(void *refcon,
     while (!context->response_ready) {
         pthread_cond_wait(&context->response_condition, &context->lock);
     }
+    __atomic_sub_fetch(&audio_calls_in_flight, 1, __ATOMIC_ACQ_REL);
     int32_t status = context->guest_status;
     uint64_t round_trip_ns =
         clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - round_trip_start;
@@ -770,7 +931,6 @@ static OSStatus host_audio_callback(void *refcon,
         __atomic_store_n(&render_callback_max_ns, round_trip_ns, __ATOMIC_RELAXED);
     }
 
-    bool is_input_callback = strcmp(context->callback_kind, "render-notify") != 0;
     if (is_input_callback) {
         uint64_t requested = __atomic_exchange_n(&context->start_requested_ns, 0,
                                                  __ATOMIC_ACQ_REL);
@@ -814,27 +974,142 @@ static OSStatus host_audio_callback(void *refcon,
         }
     }
 
+    if (is_input_callback) {
+        uint64_t *bucket = converter_calls_this_call == 0 ? &converter_calls_none :
+                           converter_calls_this_call == 1 ? &converter_calls_single :
+                                                            &converter_calls_multi;
+        __atomic_fetch_add(bucket, 1, __ATOMIC_RELAXED);
+    }
+    if (is_input_callback && count_delivered_samples()) {
+        for (uint32_t index = 0; index < buffer_count; ++index) {
+            const unsigned char *bytes =
+                (const void *)(uintptr_t)original_data[index];
+            size_t byte_size = original_byte_size[index];
+            if (!bytes || (byte_size & 3u)) continue;
+            float delivered_peak = 0.0f;
+            uint64_t delivered_bad = 0;
+            for (size_t i = 0; i < byte_size / 4u; ++i) {
+                float sample;
+                uint32_t pattern;
+                memcpy(&sample, bytes + i * 4u, sizeof(sample));
+                memcpy(&pattern, &sample, sizeof(pattern));
+                if (((pattern >> 23) & 0xffu) == 0xffu) { ++delivered_bad; continue; }
+                float magnitude = sample < 0.0f ? -sample : sample;
+                if (magnitude > 1.0f) {
+                    __atomic_fetch_add(&delivered_mag_over_1, 1, __ATOMIC_RELAXED);
+                    if (magnitude > 2.0f) {
+                        __atomic_fetch_add(&delivered_mag_over_2, 1, __ATOMIC_RELAXED);
+                    }
+                }
+                if (magnitude > 4.0f) {
+                    ++delivered_bad;
+                    __atomic_fetch_add(&delivered_mag_over_4, 1, __ATOMIC_RELAXED);
+                    continue;
+                }
+                if (magnitude > delivered_peak) delivered_peak = magnitude;
+            }
+            if (delivered_bad) {
+                __atomic_fetch_add(&delivered_bad_total, delivered_bad, __ATOMIC_RELAXED);
+                uint64_t reported =
+                    __atomic_fetch_add(&delivered_bad_reports, 1, __ATOMIC_RELAXED);
+                if (reported < 40) {
+                    uint32_t first = 0xffffffffu, last = 0;
+                    for (size_t i = 0; i < byte_size / 4u; ++i) {
+                        float sample;
+                        uint32_t pattern;
+                        memcpy(&sample, bytes + i * 4u, sizeof(sample));
+                        memcpy(&pattern, &sample, sizeof(pattern));
+                        float magnitude = sample < 0.0f ? -sample : sample;
+                        if (((pattern >> 23) & 0xffu) == 0xffu || magnitude > 4.0f) {
+                            if (i < first) first = (uint32_t)i;
+                            if (i > last) last = (uint32_t)i;
+                        }
+                    }
+                    fprintf(stderr,
+                            "compat32: audio callback[%u] DELIVERED BAD list[%u]: "
+                            "ptr=0x%08x orig=0x%08x bytes=%zu bad=%llu of %zu "
+                            "range=%u..%u rewritten=%d convCalls=%u frames=%u\n",
+                            context->callback_index, index,
+                            guest_buffers[index].data, original_data[index],
+                            byte_size, (unsigned long long)delivered_bad,
+                            byte_size / 4u, first == 0xffffffffu ? 0 : first, last,
+                            guest_buffers[index].data != original_data[index],
+                            converter_calls_this_call, frame_count);
+                }
+            }
+            __atomic_fetch_add(&delivered_buffers_total, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&delivered_samples_total, byte_size / 4u,
+                               __ATOMIC_RELAXED);
+        }
+    }
+
+    for (uint32_t index = 0; index < buffer_count; ++index) {
+        if (guest_buffers[index].byte_size != original_byte_size[index] ||
+            guest_buffers[index].data != original_data[index]) {
+            __atomic_fetch_add(&guest_rewrote_buffer_list, 1, __ATOMIC_RELAXED);
+            if (trace_audio()) {
+                fprintf(stderr,
+                        "compat32: audio callback[%u] %s GUEST REWROTE list[%u]: "
+                        "byte_size %u -> %u, data 0x%08x -> 0x%08x (delta %d)\n",
+                        context->callback_index, context->callback_kind, index,
+                        original_byte_size[index], guest_buffers[index].byte_size,
+                        original_data[index], guest_buffers[index].data,
+                        (int)guest_buffers[index].data - (int)original_data[index]);
+            }
+        }
+    }
+
     uint64_t call_count = ++context->host_call_count;
     if (trace_audio() && host_list &&
         (call_count <= 8 || (call_count % 1000) == 0)) {
         size_t total_bytes = 0;
         size_t nonzero_bytes = 0;
+        float voice_peak = 0.0f;
+        uint64_t voice_nonfinite = 0;
+        uint64_t voice_hash = 1469598103934665603ull;   /* FNV-1a */
         for (uint32_t index = 0; index < buffer_count; ++index) {
-            size_t byte_size = guest_buffers[index].byte_size;
+            size_t byte_size = is_input_callback ? original_byte_size[index]
+                                                 : guest_buffers[index].byte_size;
             const unsigned char *bytes =
-                (const void *)(uintptr_t)guest_buffers[index].data;
+                (const void *)(uintptr_t)(is_input_callback ? original_data[index]
+                                                            : guest_buffers[index].data);
             total_bytes += byte_size;
             for (size_t offset = 0; bytes && offset < byte_size; ++offset) {
                 if (bytes[offset]) ++nonzero_bytes;
+                voice_hash = (voice_hash ^ bytes[offset]) * 1099511628211ull;
+            }
+            if (bytes && (byte_size & 3u) == 0) {
+                for (size_t i = 0; i < byte_size / 4u; ++i) {
+                    float sample;
+                    uint32_t pattern;
+                    memcpy(&sample, bytes + i * 4u, sizeof(sample));
+                    memcpy(&pattern, &sample, sizeof(pattern));
+                    if (((pattern >> 23) & 0xffu) == 0xffu) {
+                        ++voice_nonfinite;
+                        continue;
+                    }
+                    float magnitude = sample < 0.0f ? -sample : sample;
+                    if (magnitude > 4.0f) {   /* finite, but not audio */
+                        ++voice_nonfinite;
+                        continue;
+                    }
+                    if (magnitude > voice_peak) voice_peak = magnitude;
+                }
             }
         }
+        uint32_t action = flags ? *flags : 0;
+        const char *phase = (action & kAudioUnitRenderAction_PreRender) ? "pre" :
+                            (action & kAudioUnitRenderAction_PostRender) ? "post" : "-";
         fprintf(stderr,
                 "compat32: audio callback[%u] %s call=%llu fn=0x%08x "
-                "bus=%u frames=%u buffers=%u bytes=%zu nonzero=%zu status=%d\n",
+                "bus=%u frames=%u buffers=%u bytes=%zu in-nonzero=%zu "
+                "nonzero=%zu peak=%.6f hash=%016llx invalid=%llu status=%d "
+                "action=0x%02x(%s)\n",
                 context->callback_index, context->callback_kind,
                 (unsigned long long)call_count, context->guest_function,
-                bus, frame_count, buffer_count, total_bytes, nonzero_bytes,
-                status);
+                bus, frame_count, buffer_count, total_bytes, host_nonzero_in,
+                nonzero_bytes, voice_peak, (unsigned long long)voice_hash,
+                (unsigned long long)voice_nonfinite, status, action, phase);
     }
 
     if (status != kAudio_ParamError) {
@@ -844,24 +1119,78 @@ static OSStatus host_audio_callback(void *refcon,
                    sizeof(guest_flags_value));
             *flags = guest_flags_value;
         }
-        for (uint32_t index = 0; index < buffer_count; ++index) {
-            AudioBuffer *host_buffer = &host_list->mBuffers[index];
-            size_t copy_size = guest_buffers[index].byte_size;
-            if (copy_size > host_buffer->mDataByteSize) {
-                copy_size = host_buffer->mDataByteSize;
+        if (is_input_callback) {
+            for (uint32_t index = 0; index < buffer_count; ++index) {
+                AudioBuffer *host_buffer = &host_list->mBuffers[index];
+                size_t copy_size = original_byte_size[index];
+                if (copy_size > host_buffer->mDataByteSize) {
+                    copy_size = host_buffer->mDataByteSize;
+                }
+                host_buffer->mDataByteSize = (UInt32)copy_size;
+                size_t filled = copy_size;
+                if (is_input_callback && clamp_short_fill() &&
+                    converter_calls_this_call == 1) {
+                    size_t produced = (size_t)converter_frames_this_call * 4u;
+                    if (produced && produced < filled) filled = produced;
+                }
+                if (copy_size && host_buffer->mData && guest_buffers[index].data) {
+                    memcpy(host_buffer->mData,
+                           (const void *)(uintptr_t)original_data[index],
+                           filled);
+                    if (filled < copy_size) {
+                        memset((unsigned char *)host_buffer->mData + filled, 0,
+                               copy_size - filled);
+                        __atomic_fetch_add(&short_fill_clamped, 1, __ATOMIC_RELAXED);
+                    }
+                    if (is_input_callback &&
+                        ((silence_bus() >= 0 && (int)bus == silence_bus()) ||
+                         (silence_3d() && bus > 0))) {
+                        memset(host_buffer->mData, 0, copy_size);
+                    }
+                    if (is_input_callback && sanitize_delivered() &&
+                        (copy_size & 3u) == 0) {
+                        float *samples = host_buffer->mData;
+                        uint64_t fixed = 0;
+                        for (size_t i = 0; i < copy_size / 4u; ++i) {
+                            uint32_t pattern;
+                            memcpy(&pattern, &samples[i], sizeof(pattern));
+                            float magnitude = samples[i] < 0.0f ? -samples[i]
+                                                                : samples[i];
+                            if (((pattern >> 23) & 0xffu) == 0xffu ||
+                                magnitude > 2.0f) {
+                                samples[i] = 0.0f;
+                                ++fixed;
+                            }
+                        }
+                        if (fixed) {
+                            __atomic_fetch_add(&sanitized_samples, fixed,
+                                               __ATOMIC_RELAXED);
+                        }
+                    }
+                }
             }
-            host_buffer->mDataByteSize = (UInt32)copy_size;
-            if (copy_size && host_buffer->mData && guest_buffers[index].data) {
-                memcpy(host_buffer->mData,
-                       (const void *)(uintptr_t)guest_buffers[index].data,
-                       copy_size);
+        }
+    } else if (host_list && is_input_callback) {
+        for (uint32_t index = 0; index < host_list->mNumberBuffers; ++index) {
+            AudioBuffer *host_buffer = &host_list->mBuffers[index];
+            if (host_buffer->mData && host_buffer->mDataByteSize) {
+                memset(host_buffer->mData, 0, host_buffer->mDataByteSize);
             }
         }
     }
 
     /* Keep the complete guest audio path running during unattended tests,
-       while ensuring that it cannot interrupt the user's system audio. */
-    if (mute_audio_output() && host_list) {
+       while ensuring that it cannot interrupt the user's system audio.
+
+       Only an *input* callback's buffer may be cleared here.  Clearing a
+       render notify's buffer is wrong for the same reason as above, and
+       clearing a node-input buffer is worse than wrong for measurement: that
+       buffer is what the mixer pulls from, so muting silenced the graph itself
+       and made every downstream reading meaningless -- 18,800 output-unit
+       renders measured 0.0% non-zero purely because of this memset.  Mute the
+       device end instead (LP32_PROBE_OUTPUT sits on the output unit). */
+    if (mute_audio_output() && host_list && is_input_callback &&
+        !output_mute_active()) {
         for (uint32_t index = 0; index < buffer_count; ++index) {
             AudioBuffer *host_buffer = &host_list->mBuffers[index];
             if (host_buffer->mData && host_buffer->mDataByteSize) {
@@ -949,6 +1278,16 @@ enum deferred_graph_kind {
     kDeferredUnitSetParameter,
     /* Builds one pre-opened graph for the pool (graph is NULL). */
     kDeferredPoolRefill,
+    /* Hand a callback context back to the pool.  Never release one inline from
+       a guest thread: release_audio_callback takes context->lock, and
+       host_audio_callback holds that lock across a guest render on CoreAudio's
+       real-time IO thread -- which is itself holding the HAL mutex.  Blocking
+       on it there deadlocks any concurrent AudioOutputUnitStart, which is
+       exactly what BASS does to start a level's music.  Deferring keeps the
+       guest thread free and lets the worker release it once the render that
+       may be in flight has finished.  Not a teardown kind: it waits for
+       nothing and nothing waits for it. */
+    kDeferredCallbackRelease,
     /* Teardown steps every later operation on the graph must wait for. */
     kDeferredGraphUninitialize,
     kDeferredGraphClose,
@@ -1031,6 +1370,7 @@ static const char *deferred_graph_kind_name(enum deferred_graph_kind kind)
     case kDeferredGraphStop: return "AUGraphStop";
     case kDeferredUnitSetParameter: return "AudioUnitSetParameter";
     case kDeferredPoolRefill: return "pool refill";
+    case kDeferredCallbackRelease: return "callback release";
     case kDeferredGraphUninitialize: return "AUGraphUninitialize";
     case kDeferredGraphClose: return "AUGraphClose";
     case kDeferredGraphDispose: return "DisposeAUGraph";
@@ -1079,6 +1419,9 @@ static void perform_graph_op(const struct deferred_graph_op *op)
         return;
     case kDeferredPoolRefill:
         perform_graph_pool_refill();
+        return;
+    case kDeferredCallbackRelease:
+        release_audio_callback(op->context);
         return;
     default:
         break;
@@ -1262,6 +1605,53 @@ static void enqueue_graph_teardown(AUGraph graph, enum deferred_graph_kind kind,
             .graph = graph, .kind = kind, .context = context,
         };
         perform_graph_op(&inline_op);
+        return;
+    }
+    op->context = context;
+    pthread_mutex_lock(&deferred_graph_lock);
+    append_deferred_graph_op_locked(op);
+    pthread_mutex_unlock(&deferred_graph_lock);
+}
+
+/*
+ * Retire a callback context from a thread that may be inside its own render.
+ *
+ * audio_callback_worker holds context->lock across the entire guest call, so
+ * guest code reached from a render must never call release_audio_callback:
+ * context->lock is a default, non-recursive mutex and the thread would block
+ * against itself forever.  It is not a hypothetical -- a render notify removing
+ * itself as its sound completes wedged worker 8, and because the CoreAudio IO
+ * thread waits for that render's reply while holding the HAL mutex, the next
+ * AudioOutputUnitStart (BASS starting a level's music) blocked behind it and
+ * froze the game on level entry.
+ *
+ * Muting is the lock-free half, exactly as set_graph_callbacks_muted does it:
+ * any later render sees the flag, writes silence and returns without entering
+ * the guest.  The render already in flight finishes normally, and the worker
+ * performs the release once the lock is genuinely free.  Deliberately not
+ * gated on synchronous_audio_teardown(): this is required for correctness, not
+ * a latency optimisation.
+ */
+static void enqueue_callback_release(struct audio_callback_context *context)
+{
+    if (!context) return;
+    static int force_unconditional = -1;
+    if (force_unconditional < 0) {
+        force_unconditional = getenv("LP32_FORCE_UNCONDITIONAL_DEFER") != NULL;
+    }
+    pthread_t render = __atomic_load_n(&context->render_thread, __ATOMIC_ACQUIRE);
+    if (!force_unconditional &&
+        (!render || !pthread_equal(render, pthread_self()))) {
+        release_audio_callback(context);
+        return;
+    }
+    __atomic_store_n(&context->muted, true, __ATOMIC_RELEASE);
+    struct deferred_graph_op *op =
+        new_deferred_graph_op(NULL, kDeferredCallbackRelease);
+    if (!op) {
+        /* No worker to hand it to.  Leave the context muted and in_use rather
+           than releasing it here: one retired slot out of kAudioCallbackCapacity
+           is a bounded leak, while an inline release is a frozen game. */
         return;
     }
     op->context = context;
@@ -1605,6 +1995,253 @@ static OSStatus set_unit_parameter_for_guest(const uint32_t *arguments,
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
 
 #include "peggle_audio.inc"
+#include "audio_bridge_selftest.inc"
+
+static uint64_t probe_output_renders;
+static uint64_t probe_output_bytes;
+static uint64_t probe_output_nonzero;
+
+static const char *dump_audio_path(void)
+{
+    static const char *path;
+    static int resolved;
+    if (!resolved) { path = getenv("LP32_DUMP_AUDIO"); resolved = 1; }
+    return path;
+}
+
+static uint64_t probe_out_over_1;
+static uint64_t probe_out_over_2;
+static uint64_t probe_out_total;
+
+static float output_headroom(void)
+{
+    static int resolved;
+    static float factor;
+    if (!resolved) {
+        const char *text = getenv("LP32_OUTPUT_HEADROOM");
+        factor = text ? (float)atof(text) : 0.0f;
+        if (factor < 0.0f || factor > 1.0f) factor = 0.0f;
+        resolved = 1;
+    }
+    return factor;
+}
+
+static bool limiter_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        const char *text = getenv("LP32_OUTPUT_LIMITER");
+        enabled = text && strcmp(text, "0") != 0;
+    }
+    return enabled != 0;
+}
+static float limiter_gain = 1.0f;
+static uint64_t limiter_engaged_renders;
+
+static float probe_output_peak;
+static double probe_output_sumsq;
+static uint64_t probe_output_samples;
+static uint64_t probe_output_nonfinite;
+static uint64_t probe_bad_by_buffer[8];
+static uint32_t probe_bad_first = 0xffffffffu;
+static uint32_t probe_bad_last;
+static uint32_t probe_buffers_seen;
+static uint32_t probe_frames_per_buffer;
+
+static OSStatus lp32_output_probe(void *refcon,
+                                  AudioUnitRenderActionFlags *flags,
+                                  const AudioTimeStamp *timestamp,
+                                  UInt32 bus, UInt32 frame_count,
+                                  AudioBufferList *host_list)
+{
+    (void)refcon; (void)timestamp; (void)bus; (void)frame_count;
+    if (!flags || !(*flags & kAudioUnitRenderAction_PostRender) || !host_list) {
+        return noErr;
+    }
+    uint64_t bytes = 0, nonzero = 0;
+    for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+        const AudioBuffer *buffer = &host_list->mBuffers[index];
+        const unsigned char *data = buffer->mData;
+        if (!data) continue;
+        bytes += buffer->mDataByteSize;
+        for (UInt32 offset = 0; offset < buffer->mDataByteSize; ++offset) {
+            if (data[offset]) ++nonzero;
+        }
+        if ((buffer->mDataByteSize & 3u) == 0) {
+            UInt32 count = buffer->mDataByteSize / 4u;
+            probe_buffers_seen = host_list->mNumberBuffers;
+            probe_frames_per_buffer = count;
+            for (UInt32 i = 0; i < count; ++i) {
+                float sample;
+                uint32_t pattern;
+                memcpy(&sample, data + (size_t)i * 4u, sizeof(sample));
+                memcpy(&pattern, &sample, sizeof(pattern));
+                if (((pattern >> 23) & 0xffu) == 0xffu) {
+                    ++probe_output_nonfinite;   /* inf/NaN: a parse fault */
+                    continue;
+                }
+                float magnitude = sample < 0.0f ? -sample : sample;
+                ++probe_out_total;
+                if (magnitude > 1.0f) {
+                    ++probe_out_over_1;          /* clipped by the device */
+                    if (magnitude > 2.0f) ++probe_out_over_2;
+                }
+                if (magnitude > 4.0f) {
+                    ++probe_output_nonfinite;
+                    probe_bad_by_buffer[index < 8 ? index : 7] += 1;
+                    if (i < probe_bad_first) probe_bad_first = i;
+                    if (i > probe_bad_last) probe_bad_last = i;
+                    continue;
+                }
+                if (magnitude > probe_output_peak) probe_output_peak = magnitude;
+                probe_output_sumsq += (double)sample * (double)sample;
+                ++probe_output_samples;
+            }
+        }
+    }
+    __atomic_fetch_add(&probe_output_bytes, bytes, __ATOMIC_RELAXED);
+    __atomic_fetch_add(&probe_output_nonzero, nonzero, __ATOMIC_RELAXED);
+
+    float headroom = output_headroom();
+    if (headroom > 0.0f) {
+        for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+            AudioBuffer *buffer = &host_list->mBuffers[index];
+            if (!buffer->mData || (buffer->mDataByteSize & 3u)) continue;
+            float *samples = buffer->mData;
+            for (UInt32 i = 0; i < buffer->mDataByteSize / 4u; ++i) {
+                samples[i] *= headroom;
+            }
+        }
+    }
+
+    if (limiter_enabled()) {
+        float peak = 0.0f;
+        for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+            const AudioBuffer *buffer = &host_list->mBuffers[index];
+            if (!buffer->mData || (buffer->mDataByteSize & 3u)) continue;
+            const float *samples = buffer->mData;
+            for (UInt32 i = 0; i < buffer->mDataByteSize / 4u; ++i) {
+                float magnitude = samples[i] < 0.0f ? -samples[i] : samples[i];
+                if (magnitude > peak && magnitude < 1.0e6f) peak = magnitude;
+            }
+        }
+        float target = peak > 1.0f ? 1.0f / peak : 1.0f;
+        if (target < limiter_gain) limiter_gain = target;           /* attack */
+        else limiter_gain += (target - limiter_gain) * 0.02f;       /* release */
+        if (limiter_gain < 1.0f) {
+            for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+                AudioBuffer *buffer = &host_list->mBuffers[index];
+                if (!buffer->mData || (buffer->mDataByteSize & 3u)) continue;
+                float *samples = buffer->mData;
+                for (UInt32 i = 0; i < buffer->mDataByteSize / 4u; ++i) {
+                    samples[i] *= limiter_gain;
+                }
+            }
+            __atomic_fetch_add(&limiter_engaged_renders, 1, __ATOMIC_RELAXED);
+        }
+    }
+
+    if (dump_audio_path()) {
+        static FILE *dump_file;
+        static uint64_t dump_bytes;
+        static bool dump_failed;
+        if (!dump_file && !dump_failed) {
+            dump_file = fopen(dump_audio_path(), "wb");
+            if (!dump_file) dump_failed = true;
+        }
+        if (dump_file && dump_bytes < (320ull << 20)) {
+            UInt32 frames = 0;
+            for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+                UInt32 available = host_list->mBuffers[index].mDataByteSize / 4u;
+                if (index == 0 || available < frames) frames = available;
+            }
+            for (UInt32 f = 0; f < frames; ++f) {
+                for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+                    const float *samples = host_list->mBuffers[index].mData;
+                    float value = samples ? samples[f] : 0.0f;
+                    fwrite(&value, sizeof(value), 1, dump_file);
+                    dump_bytes += sizeof(value);
+                }
+            }
+            fflush(dump_file);
+        }
+    }
+
+    if (mute_only_at_output()) {
+        for (UInt32 index = 0; index < host_list->mNumberBuffers; ++index) {
+            AudioBuffer *buffer = &host_list->mBuffers[index];
+            if (buffer->mData && buffer->mDataByteSize) {
+                memset(buffer->mData, 0, buffer->mDataByteSize);
+            }
+        }
+    }
+    uint64_t count = __atomic_add_fetch(&probe_output_renders, 1, __ATOMIC_RELAXED);
+    if ((count % 200) == 0) {
+        uint64_t total = __atomic_load_n(&probe_output_bytes, __ATOMIC_RELAXED);
+        uint64_t nz = __atomic_load_n(&probe_output_nonzero, __ATOMIC_RELAXED);
+        double mean_square = probe_output_samples ?
+            probe_output_sumsq / (double)probe_output_samples : 0.0;
+        fprintf(stderr,
+                "compat32: audio OUTPUT-UNIT renders=%llu bytes=%llu "
+                "nonzero=%llu (%.1f%%) peak=%.6f meansq=%.9f "
+                "samples=%llu invalid=%llu inflightMax=%u rewrites=%llu "
+                "deliveredBad=%llu deliveredBufs=%llu clamped=%llu "
+                "convCalls=%llu/%llu/%llu sanitized=%llu "
+                "mag>1=%llu mag>2=%llu mag>4=%llu ofSamples=%llu "
+                "OUTclip=%llu OUTover2=%llu OUTtotal=%llu\n",
+                (unsigned long long)count, (unsigned long long)total,
+                (unsigned long long)nz,
+                total ? 100.0 * (double)nz / (double)total : 0.0,
+                probe_output_peak, mean_square,
+                (unsigned long long)probe_output_samples,
+                (unsigned long long)probe_output_nonfinite,
+                __atomic_exchange_n(&audio_calls_in_flight_max, 0, __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&guest_rewrote_buffer_list,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&delivered_bad_total,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&delivered_buffers_total,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&short_fill_clamped,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&converter_calls_none,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&converter_calls_single,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&converter_calls_multi,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&sanitized_samples,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&delivered_mag_over_1,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&delivered_mag_over_2,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&delivered_mag_over_4,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)__atomic_load_n(&delivered_samples_total,
+                                                    __ATOMIC_RELAXED),
+                (unsigned long long)probe_out_over_1,
+                (unsigned long long)probe_out_over_2,
+                (unsigned long long)probe_out_total);
+        fprintf(stderr,
+                "compat32: audio OUTPUT-LAYOUT buffers=%u framesPerBuffer=%u "
+                "badByBuffer=[%llu,%llu,%llu,%llu] badIndexRange=%u..%u\n",
+                probe_buffers_seen, probe_frames_per_buffer,
+                (unsigned long long)probe_bad_by_buffer[0],
+                (unsigned long long)probe_bad_by_buffer[1],
+                (unsigned long long)probe_bad_by_buffer[2],
+                (unsigned long long)probe_bad_by_buffer[3],
+                probe_bad_first == 0xffffffffu ? 0 : probe_bad_first,
+                probe_bad_last);
+        probe_output_peak = 0.0f;
+        probe_output_sumsq = 0.0;
+        probe_output_samples = 0;
+        for (unsigned b = 0; b < 8; ++b) probe_bad_by_buffer[b] = 0;
+        probe_bad_first = 0xffffffffu;
+        probe_bad_last = 0;
+    }
+    return noErr;
+}
 
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result)
@@ -1807,6 +2444,63 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         *result = noErr;
         return 1;
     }
+    /*
+     * The pre-10.5 spellings of the graph calls.  SmartDX was built against
+     * them, and they differ from the modern ones only in carrying the old
+     * "class data" pair that nothing has ever used: AUGraphNewNode returns the
+     * node through its fifth argument rather than its third, and
+     * AUGraphGetNodeInfo returns the unit through its sixth rather than its
+     * fourth.  Route both onto the current implementations rather than
+     * duplicating them.
+     */
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphNewNode")) {
+        uint32_t forwarded[3] = {arguments[0], arguments[1], arguments[4]};
+        return audio_bridge32_dispatch("_AUGraphAddNode", forwarded, result);
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphGetNodeInfo")) {
+        uint32_t forwarded[4] = {arguments[0], arguments[1], arguments[2],
+                                 arguments[5]};
+        return audio_bridge32_dispatch("_AUGraphNodeInfo", forwarded, result);
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphIsRunning")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        Boolean running = false;
+        OSStatus status = graph ? AUGraphIsRunning(graph, &running)
+                                : kAudio_ParamError;
+        if (arguments[1]) *(uint8_t *)(uintptr_t)arguments[1] = running ? 1 : 0;
+        if (trace_audio()) {
+            fprintf(stderr, "compat32: audio IsRunning graph=0x%08x -> %d\n",
+                    arguments[0], (int)running);
+            trace_audio_status("AUGraphIsRunning", status);
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphUpdate")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        Boolean updated = false;
+        OSStatus status = graph ? AUGraphUpdate(graph,
+                                                arguments[1] ? &updated : NULL)
+                                : kAudio_ParamError;
+        if (arguments[1]) *(uint8_t *)(uintptr_t)arguments[1] = updated ? 1 : 0;
+        if (trace_audio()) trace_audio_status("AUGraphUpdate", status);
+        *result = (uint32_t)status;
+        return 1;
+    }
+    if (LP32_NAME_IS(import_name, import_length, "_AUGraphDisconnectNodeInput")) {
+        AUGraph graph = synchronized_graph_for_guest(arguments[0]);
+        OSStatus status = graph ? AUGraphDisconnectNodeInput(
+            graph, (AUNode)arguments[1], arguments[2]) : kAudio_ParamError;
+        if (status == noErr) mark_graph_unpoolable(arguments[0]);
+        if (trace_audio()) {
+            fprintf(stderr,
+                    "compat32: audio DisconnectNodeInput graph=0x%08x node=%u "
+                    "input=%u\n", arguments[0], arguments[1], arguments[2]);
+            trace_audio_status("AUGraphDisconnectNodeInput", status);
+        }
+        *result = (uint32_t)status;
+        return 1;
+    }
     if (LP32_NAME_IS(import_name, import_length, "_AUGraphNodeInfo")) {
         AUGraph graph = synchronized_graph_for_guest(arguments[0]);
         AudioComponentDescription description;
@@ -1824,6 +2518,61 @@ int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
         if (arguments[3]) {
             *(uint32_t *)(uintptr_t)arguments[3] =
                 status == noErr ? guest_handle_for_unit(unit, graph) : 0;
+        }
+        bool node_is_output = false;
+        if (arguments[2] && status == noErr) {
+            node_is_output = description.componentType == kAudioUnitType_Output;
+        } else {
+            const struct graph_topology *topology =
+                topology_for_guest(arguments[0]);
+            for (uint32_t i = 0; topology && i < topology->node_count; ++i) {
+                if (topology->node_ids[i] == (AUNode)arguments[1] &&
+                    topology->nodes[i].componentType == kAudioUnitType_Output) {
+                    node_is_output = true;
+                    break;
+                }
+            }
+        }
+        if (status == noErr && unit && node_is_output) {
+            static int probe_enabled = -1;
+            if (probe_enabled < 0) {
+                probe_enabled = getenv("LP32_PROBE_OUTPUT") != NULL;
+            }
+            if (probe_enabled || mute_only_at_output()) {
+                OSStatus probe = AudioUnitAddRenderNotify(unit, lp32_output_probe,
+                                                          NULL);
+                if (probe == noErr) {
+                    __atomic_store_n(&output_mute_installed, true,
+                                     __ATOMIC_RELEASE);
+                }
+                AudioDeviceID unit_device = 0;
+                UInt32 device_size = sizeof(unit_device);
+                OSStatus device_status = AudioUnitGetProperty(
+                    unit, kAudioOutputUnitProperty_CurrentDevice,
+                    kAudioUnitScope_Global, 0, &unit_device, &device_size);
+                AudioDeviceID default_device = 0;
+                UInt32 default_size = sizeof(default_device);
+                AudioObjectPropertyAddress address = {
+                    kAudioHardwarePropertyDefaultOutputDevice,
+                    kAudioObjectPropertyScopeGlobal,
+                    kAudioObjectPropertyElementMain,
+                };
+                OSStatus default_status = AudioObjectGetPropertyData(
+                    kAudioObjectSystemObject, &address, 0, NULL,
+                    &default_size, &default_device);
+                fprintf(stderr,
+                        "compat32: audio OUTPUT-DEVICE graph=%u (status=%d) "
+                        "systemDefault=%u (status=%d) %s\n",
+                        (unsigned)unit_device, (int)device_status,
+                        (unsigned)default_device, (int)default_status,
+                        (device_status == noErr && default_status == noErr &&
+                         unit_device == default_device) ? "MATCH" : "MISMATCH");
+                fprintf(stderr,
+                        "compat32: audio OUTPUT-UNIT probe attached to unit=0x%08x "
+                        "status=%d\n",
+                        arguments[3] ? *(const uint32_t *)(uintptr_t)arguments[3] : 0,
+                        (int)probe);
+            }
         }
         if (trace_audio()) {
             fprintf(stderr,

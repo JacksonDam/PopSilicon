@@ -4,6 +4,9 @@
 /* Which bridged operation is currently running, so a string probe can name
    the culprit.  Diagnostic only; costs one store per dispatch. */
 static const char *pg_current_op = "?";
+/* Mirrored into the runtime, which reports a string whose representation it
+   cannot read and needs to name the operation that was running. */
+extern const char *lp32_string_op;
 
 /* LP32_DEBUG_STRINGS=<text>: report every string whose new value contains
    <text>, naming the operation that wrote it.  A corrupted accumulator is
@@ -164,6 +167,29 @@ static int peggle_file_stream_dispatch(const char *name, const uint32_t *a, uint
         if (feof(file)) pg_files[slot].eof = true;
         PG_RETURN(a[0]);
     }
+    /* istream::getline(char*, streamsize, char): the same, with the caller's
+       own delimiter instead of a newline.  Bookworm reads its word lists this
+       way, and stalls on the loading bar without it. */
+    if (strcmp(name, "__ZNSi7getlineEPcic") == 0) {
+        char *buffer = (void *)(uintptr_t)a[1];
+        int32_t limit = (int32_t)a[2];
+        int delimiter = (int)(int8_t)a[3];
+        if (!buffer || limit <= 0) PG_RETURN(a[0]);
+        int32_t length = 0;
+        int value = EOF;
+        while (length < limit - 1 && (value = fgetc(file)) != EOF &&
+               value != delimiter) {
+            buffer[length++] = (char)value;
+        }
+        buffer[length] = '\0';
+        if (value == EOF) {
+            pg_files[slot].eof = true;
+            /* Extracting nothing before the end is a failure, as it is for the
+               newline form above. */
+            if (length == 0) pg_files[slot].fail = true;
+        }
+        PG_RETURN(a[0]);
+    }
     if (strcmp(name, "__ZNSi4readEPci") == 0) {
         size_t want = (size_t)(int32_t)a[2];
         size_t got = a[1] && want ? fread((void *)(uintptr_t)a[1], 1, want, file) : 0;
@@ -193,6 +219,7 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
     if (trace_cpp < 0) trace_cpp = getenv("LP32_TRACE_CPP") ? 1 : 0;
     if (trace_cpp) { fprintf(stderr, "compat32: cpp %s a0=%08x a1=%08x a2=%08x\n", name, a[0], a[1], a[2]); }
     pg_current_op = name;
+    lp32_string_op = name;
     /* std::copy(reverse_iterator first, reverse_iterator last, wchar_t* dest):
        EncodingParser::PutString copies a wstring in reverse into a vector<wchar_t>.
        The iterators (single "current" pointers) are passed by address; operator*
@@ -345,6 +372,21 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
             size_t len=counted?a[2]:(wide?wcslen(s):strlen(s));
             PG_RETURN(pg_string_set(obj,s,len,w,true));
         }
+        /* basic_string(const basic_string&, pos, n) -- the substring ctor.
+           The tokeniser builds every trimmed token with it (dropping a
+           trailing "?>" or "/"), so copying the whole source instead left the
+           element's value untrimmed: a self-closing tag then read as an open
+           one, its path was pushed and never popped, and the next end tag was
+           reported as mismatched.  Must be matched before the plain C1ERK
+           form below, which ignores the extra arguments. */
+        if (strcmp(op,"C1ERKS2_mm")==0 || strcmp(op,"C2ERKS2_mm")==0 ||
+            strcmp(op,"C1ERKSsmm")==0 || strcmp(op,"C2ERKSsmm")==0) {
+            const char *src=guest_string_data(a[1]);
+            size_t len_src=guest_string_length(a[1]);
+            size_t pos=a[2]<len_src?a[2]:len_src;
+            size_t len=a[3]<len_src-pos?a[3]:len_src-pos;
+            PG_RETURN(pg_string_set(obj,src+pos*w,len,w,true));
+        }
         if (strncmp(op,"C1ERK",5)==0) PG_RETURN(pg_string_set(obj,guest_string_data(a[1]),guest_string_length(a[1]),w,true));
         if (strcmp(op,"C1EmcRKSaIcE")==0) {char *s=malloc(a[1]);memset(s,a[2],a[1]);pg_string_set(obj,s,a[1],1,true);free(s);PG_RETURN(obj);}
         /* Wide fill ctor: basic_string(size_type n, wchar_t c, allocator) --
@@ -380,6 +422,52 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
             size_t cap=a[1]>n?a[1]:n;uint32_t rep=guest_allocate_at(12+(cap+1)*w,true,kGuestHeapStringSite);uint32_t *r=(void *)(uintptr_t)rep;r[0]=(uint32_t)n;r[1]=(uint32_t)cap;memcpy(r+3,s,n*w);uint32_t old=*(uint32_t *)(uintptr_t)obj;*(uint32_t *)(uintptr_t)obj=rep+12;if(old>=12)guest_string_dispose_rep(old-12);PG_RETURN(0);
         }
         if (strcmp(op,"5clearEv")==0) PG_RETURN(pg_string_set(obj,NULL,0,w,false));
+        /* swap(): the two objects only carry a data pointer each, so trade
+           them rather than copying either representation. */
+        if (strncmp(op,"4swapER",7)==0) {
+            uint32_t *left=(void *)(uintptr_t)obj,*right=(void *)(uintptr_t)a[1];
+            if(left&&right){uint32_t t=*left;*left=*right;*right=t;}
+            PG_RETURN(0);
+        }
+        /* _M_leak_hard(): force an unshared representation.  Every rep this
+           bridge hands out is already private (pg_string_set allocates a new
+           one per write), so copying it to itself is enough; libstdc++ marks
+           a leaked rep with a negative reference count, and the guest tests
+           that sign before calling, so set it too or it calls again forever. */
+        if (strncmp(op,"12_M_leak_hardE",15)==0) {
+            pg_string_set(obj,s,n,w,false);
+            uint32_t data=*(uint32_t *)(uintptr_t)obj;
+            if(data>=12) *(int32_t *)(uintptr_t)(data-4)=-1;
+            PG_RETURN(0);
+        }
+        /* _M_mutate(pos, len, n): drop len units at pos and open a gap of n
+           in their place, leaving the gap uninitialised the way libstdc++
+           does -- the caller fills it immediately afterwards. */
+        if (strncmp(op,"9_M_mutateE",11)==0) {
+            size_t pos=a[1],len=a[2],extra=a[3];
+            if(pos>n)pos=n;
+            if(len>n-pos)len=n-pos;
+            char *buf=calloc(n-len+extra+1,w);
+            memcpy(buf,s,pos*w);
+            memcpy(buf+(pos+extra)*w,s+(pos+len)*w,(n-pos-len)*w);
+            pg_string_set(obj,buf,n-len+extra,w,false);
+            free(buf);
+            PG_RETURN(0);
+        }
+        /* _M_replace_aux(pos, n1, n2, c): replace n1 units at pos with n2
+           copies of one character. */
+        if (strncmp(op,"14_M_replace_auxE",17)==0) {
+            size_t pos=a[1],len=a[2],count=a[3];uint32_t ch=a[4];
+            if(pos>n)pos=n;
+            if(len>n-pos)len=n-pos;
+            char *buf=malloc((n-len+count+1)*w);
+            memcpy(buf,s,pos*w);
+            for(size_t i=0;i<count;i++) memcpy(buf+(pos+i)*w,&ch,w);
+            memcpy(buf+(pos+count)*w,s+(pos+len)*w,(n-pos-len)*w);
+            pg_string_set(obj,buf,n-len+count,w,false);
+            free(buf);
+            PG_RETURN(obj);
+        }
         if (strncmp(op,"aSEPK",5)==0 || strncmp(op,"6assignEPK",10)==0) {
             const void *v=(void *)(uintptr_t)a[1];
             bool counted=strstr(op,"PKcm")!=NULL||strstr(op,"PKwm")!=NULL;
@@ -392,12 +480,40 @@ static int peggle_cpp_dispatch(const char *name, const uint32_t *a, uint64_t *ou
             const void *v=NULL;size_t len=0;bool repeat=false;uint32_t ch=a[1];
             if(strstr(op,"EPK")){v=(void *)(uintptr_t)a[1];len=(strstr(op,"PKcm")||strstr(op,"PKwm"))?a[2]:(wide?wcslen(v):strlen(v));}
             else if(strstr(op,"ERK")){v=guest_string_data(a[1]);len=guest_string_length(a[1]);}
-            else if(strstr(op,"Emc")){len=a[1];ch=a[2];repeat=true;}
+            else if(strstr(op,"Emc")||strstr(op,"Emw")){len=a[1];ch=a[2];repeat=true;}
             else {v=&ch;len=1;}
-            char *buf=malloc((n+len+1)*w);memcpy(buf,s,n*w);if(repeat)memset(buf+n*w,ch,len);else memcpy(buf+n*w,v,len*w);pg_string_set(obj,buf,n+len,w,false);free(buf);PG_RETURN(obj);
+            char *buf=malloc((n+len+1)*w);memcpy(buf,s,n*w);
+            /* memset fills bytes, which is only correct at width 1; a wide
+               repeat has to write the character once per element. */
+            if(repeat){for(size_t i=0;i<len;i++)memcpy(buf+(n+i)*w,&ch,w);}
+            else memcpy(buf+n*w,v,len*w);
+            pg_string_set(obj,buf,n+len,w,false);free(buf);PG_RETURN(obj);
         }
-        if (strncmp(op,"6resizeEm",9)==0) {size_t len=a[1];char *buf=calloc(len+1,w);memcpy(buf,s,(n<len?n:len)*w);if(len>n && strstr(op,"Emc"))memset(buf+n,a[2],len-n);pg_string_set(obj,buf,len,w,false);free(buf);PG_RETURN(0);}
-        if (strncmp(op,"7compareE",9)==0) {const void *v=strstr(op,"EPK")?(void *)(uintptr_t)a[1]:guest_string_data(a[1]);PG_RETURN((uint32_t)(wide?wcscmp((void *)s,v):strcmp(s,v)));}
+        /* resize(n, c): the fill character carried both halves of the append
+           bug above -- only the narrow "Emc" was matched, so a wide resize left
+           the new elements at the calloc's U+0000, and memset fills bytes
+           rather than elements even when it did run. */
+        if (strncmp(op,"6resizeEm",9)==0) {size_t len=a[1];char *buf=calloc(len+1,w);memcpy(buf,s,(n<len?n:len)*w);if(len>n && (strstr(op,"Emc")||strstr(op,"Emw")))for(size_t i=n;i<len;i++)memcpy(buf+i*w,&a[2],w);pg_string_set(obj,buf,len,w,false);free(buf);PG_RETURN(0);}
+        /* compare(): the plain forms take the comparand first, but the
+           (pos, n, ...) ones take it third, so reading it from a[1] used the
+           position as a pointer -- Feeding Frenzy's compare(9, 2, str) died
+           dereferencing 0x9.  Those forms also compare a substring by length
+           rather than as C strings, so the result is memcmp over the shared
+           part and then the lengths, as std::string::compare defines it. */
+        if (strncmp(op,"7compareE",9)==0) {
+            bool ranged=strncmp(op,"7compareEmm",11)==0;
+            uint32_t slot=ranged?3:1;
+            size_t pos=ranged?a[1]:0,count=ranged?a[2]:n;
+            if(pos>n)pos=n;
+            if(count>n-pos)count=n-pos;
+            const void *v;size_t vn;
+            if(strstr(op,"PK")){v=(void *)(uintptr_t)a[slot];vn=(strstr(op,"PKcm")||strstr(op,"PKwm"))?a[slot+1]:(wide?wcslen(v):strlen(v));}
+            else {v=guest_string_data(a[slot]);vn=guest_string_length(a[slot]);}
+            size_t shared=count<vn?count:vn;
+            int order=shared?memcmp(s+pos*w,v,shared*w):0;
+            if(!order)order=count<vn?-1:(count>vn?1:0);
+            PG_RETURN((uint32_t)order);
+        }
         if (strncmp(op,"4findE",6)==0 || strncmp(op,"5rfindE",7)==0 || strstr(op,"find_first") || strstr(op,"find_last")) {
             bool reverse=strstr(op,"rfind")||strstr(op,"find_last");bool set=strstr(op,"_ofE")!=NULL || strstr(op,"_not_ofE")!=NULL;bool neg=strstr(op,"not_of")!=NULL;bool character=strstr(op,"Ecm")||strstr(op,"Ewm");
             const char *v=character?(void *)&a[1]:(strstr(op,"ERK")?guest_string_data(a[1]):(void *)(uintptr_t)a[1]);size_t vn=character?1:(wide?wcslen((void *)v):strlen(v));size_t pos=a[2];uint32_t found=UINT32_MAX;

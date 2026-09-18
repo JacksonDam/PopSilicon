@@ -32,6 +32,10 @@ struct macho_reloc32 {
 
 struct macho_image32 {
     const struct mach_header *header;
+    /* Non-zero for an image mapped away from its own addresses: a dylib the
+       game loads beside itself (Zuma's Revenge's SmartDX) is linked at 0, so
+       every address the loader records already has this added. */
+    uint32_t slide;
     uint32_t entry_eip;
     uint32_t min_address;
     uint32_t max_address;
@@ -57,6 +61,12 @@ struct macho_image32 {
 };
 
 int macho_image32_load(const char *path, struct macho_image32 *image);
+/* Map an i386 dylib the game ships beside itself at `slide`, which must sit
+   above the game image and below the guest heap.  Its local relocations are
+   applied here; its imports and external relocations are bound by the runtime,
+   which already resolves them by name. */
+int macho_image32_load_beside(const char *path, uint32_t slide,
+                              struct macho_image32 *image);
 void macho_image32_unload(const struct macho_image32 *image);
 
 #endif

@@ -6,6 +6,7 @@
 
 int audio_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                             uint64_t *result);
+int audio_bridge32_run_self_test(void);
 
 /* Pre-opened graph pool counters for frame statistics. */
 void audio_bridge32_pool_statistics(uint64_t *hits, uint64_t *misses);
