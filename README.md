@@ -14,11 +14,10 @@ seems to work well.
 start of Adventure mode and seems to work well.
 - **ZumaSilicon** for Zuma Deluxe 1.0.0 and Zuma's Revenge 1.0.0. Passed basic 
 testing and seems to work well.
-- **BookwormSilicon** for Bookworm Deluxe 1.0.5. Boots to the main menu, with a
-new player profile created in the game's own name dialog; the Classic and Action
-modes have not been played through yet.
-- **FeedingFrenzySilicon** for Feeding Frenzy Deluxe 1.0. Boots to its animated
-main menu; the modes themselves have not been played through yet.
+- **BookwormSilicon** for Bookworm Deluxe 1.0.5. Passes
+basic play testing.
+- **FeedingFrenzySilicon** for Feeding Frenzy Deluxe 1.0. Passes basic 
+play testing.
 
 A single loader serves all nine titles; it detects which game an image is and
 applies the right profile.
