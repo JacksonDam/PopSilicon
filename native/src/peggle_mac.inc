@@ -457,7 +457,7 @@ static int peggle_mac_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         NSString *title = O(6), *message = O(7);
         fprintf(stderr, "compat32: alert \"%s\": %s\n", [title UTF8String] ?: "", [message UTF8String] ?: "");
         NSAlert *alert = [[[NSAlert alloc] init] autorelease];
-        [alert setMessageText:title ?: @"Peggle"];
+        [alert setMessageText:title ?: pg_display_name()];
         [alert setInformativeText:message ?: @""];
         [alert addButtonWithTitle:O(8) ?: @"OK"];
         if (O(9)) [alert addButtonWithTitle:O(9)];

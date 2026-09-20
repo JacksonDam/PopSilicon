@@ -610,8 +610,6 @@ static uint32_t cz_set_video_mode(uint32_t width, uint32_t height,
         pg_create_window(content, false);
         window = pg_main_win();
         if (!window) return 0;
-        [window->window setTitle:[NSString stringWithUTF8String:
-                                     lp32_profile()->display_name]];
     }
     /* pg_create_window is shaped for the 4:3 Sexy titles, so hold this one to
        the size SDL asked for -- and re-apply that on every mode change, not

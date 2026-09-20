@@ -8874,13 +8874,34 @@ int objc_bridge32_run_window_geometry_self_test(void)
         break;
     }
 
+    static const struct {
+        const char *what;
+        NSSize requested;
+        NSSize screen;
+        bool display_sized;
+    } switches[] = {
+        {"fullscreen switch covers the display", {1920, 1102}, {1920, 1080}, true},
+        {"windowed switch with caption does not", {1080, 832}, {1920, 1080}, false},
+        {"same switch on a larger display",      {1920, 1102}, {2560, 1440}, false},
+        {"no screen to compare against",         {1920, 1102}, {0, 0},       false},
+    };
+    for (size_t i = 0; !failure && i < sizeof switches / sizeof switches[0]; ++i) {
+        if (pg_request_is_display_sized(switches[i].requested, switches[i].screen) ==
+            switches[i].display_sized) continue;
+        snprintf(detail, sizeof detail, "%.0fx%.0f on a %.0fx%.0f display",
+                 switches[i].requested.width, switches[i].requested.height,
+                 switches[i].screen.width, switches[i].screen.height);
+        failure = switches[i].what;
+    }
+
     if (failure) {
         fprintf(stderr, "Window geometry self-test: FAIL (%s%s%s)\n", failure,
                 detail[0] ? ": " : "", detail);
         return -1;
     }
     fputs("Window geometry self-test: PASS (caption drift rejected, 4:3"
-          " requests kept, first non-4:3 request snapped)\n", stderr);
+          " requests kept, first non-4:3 request snapped, fullscreen switch"
+          " recognised)\n", stderr);
     return 0;
 }
 

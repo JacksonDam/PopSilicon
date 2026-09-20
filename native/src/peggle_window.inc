@@ -3,6 +3,15 @@
    AGL (windowed) and CGL (emulated fullscreen) paths share; overlay windows
    (the custom cursor) are borderless image windows that follow the game's
    QuickDraw drawing through a bitmap CGContext. */
+static NSString *pg_display_name(void)
+{
+    const struct lp32_game_profile *profile = lp32_profile();
+    const char *name = profile && profile->title != LP32_TITLE_UNKNOWN ?
+        profile->display_name : NULL;
+    NSString *text = name ? [NSString stringWithUTF8String:name] : nil;
+    return [text length] ? text : @"PopSilicon";
+}
+
 @interface PeggleView : NSView
 @end
 @implementation PeggleView
@@ -22,6 +31,7 @@
    while the game runs. */
 @interface PeggleLetterboxView : NSView
 @property (nonatomic) NSSize contentAspect;
+@property (nonatomic) CGFloat topInset;
 @end
 @implementation PeggleLetterboxView
 - (instancetype)initWithFrame:(NSRect)frame
@@ -41,6 +51,7 @@
     [super layout];
     if (![[self subviews] count]) return;
     NSRect bounds = [self bounds];
+    if (_topInset > 0 && _topInset < bounds.size.height) bounds.size.height -= _topInset;
     NSSize aspect = _contentAspect;
     if (aspect.width <= 0 || aspect.height <= 0) aspect = NSMakeSize(4, 3);
     CGFloat scale = fmin(bounds.size.width / aspect.width,
@@ -60,6 +71,20 @@
        frame synchronously so a display-sized fullscreen window cannot leave
        the GL view at its old 4:3 size. */
     [self layout];
+}
+@end
+
+static void pg_leave_host_fullscreen_for_window(NSWindow *window);
+static void pg_reconcile_host_fullscreen(void);
+@interface PeggleWindow : NSWindow
+@end
+@implementation PeggleWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (BOOL)canBecomeMainWindow { return YES; }
+- (void)toggleFullScreen:(id)sender
+{
+    pg_leave_host_fullscreen_for_window(self);
+    [super toggleFullScreen:sender];
 }
 @end
 
@@ -380,6 +405,8 @@ static void pg_run_script(NSWindow *window)
         if (!colon || (stop && colon > stop)) { pg_script = ""; return; }
         const char *argument = colon + 1;
         size_t length = stop ? (size_t)(stop - argument) : strlen(argument);
+        if (!strncmp(action, "titlebutton:", 12) && pg_timer_depth == 0 &&
+            memmem(argument, length, ":nested", 7)) return;
         fprintf(stderr, "compat32: script t=%.0f %.*s\n", at, (int)(stop ? stop - action : (long)strlen(action)), action);
         if (!strncmp(action, "text:", 5)) {
             for (size_t i = 0; i < length; ++i) pg_post_key(window, argument[i], pg_keycode_for(argument[i]), 0);
@@ -421,10 +448,9 @@ static void pg_run_script(NSWindow *window)
             /* Call the game's own mode switch, which is what its in-game
                fullscreen option invokes.  Every synthesised input route is
                ignored by this guest (NSEvent clicks, NSEvent keys and real
-               CGEvent keys were each tested and produce no reaction), and its
-               ScreenMode registry value is written on the way out of a switch
-               rather than read at startup, so this is the only way to reach
-               that path without a person pressing the button.
+               CGEvent keys were each tested and produce no reaction), so this
+               is the only way to reach that path without a person pressing
+               the button.
 
                gSexyAppBase is a real heap pointer -- the layout trace read
                0x020012d0 through it -- and the argument shape comes from the
@@ -466,6 +492,27 @@ static void pg_run_script(NSWindow *window)
             bool is_full =
                 ([window styleMask] & NSWindowStyleMaskFullScreen) != 0;
             if (want_full != is_full) [window toggleFullScreen:nil];
+        } else if (!strncmp(action, "titlebutton:", 12)) {
+            NSWindowButton which = argument[0] == 'm' ? NSWindowMiniaturizeButton :
+                                   argument[0] == 'z' ? NSWindowZoomButton :
+                                                        NSWindowCloseButton;
+            NSButton *button = [window standardWindowButton:which];
+            if (button) {
+                NSRect r = [button convertRect:[button bounds] toView:nil];
+                NSPoint centre = NSMakePoint(NSMidX(r), NSMidY(r));
+                NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+                NSEventType types[] = {NSEventTypeLeftMouseDown, NSEventTypeLeftMouseUp};
+                for (unsigned i = 0; i < 2; ++i) {
+                    [NSApp postEvent:[NSEvent mouseEventWithType:types[i] location:centre
+                                                   modifierFlags:0 timestamp:now
+                                                    windowNumber:[window windowNumber]
+                                                         context:nil eventNumber:0
+                                                      clickCount:1 pressure:i ? 0 : 1]
+                             atStart:NO];
+                }
+                fprintf(stderr, "compat32: script clicked title button at %.0f,%.0f"
+                        " (pump depth %d)\n", centre.x, centre.y, pg_timer_depth);
+            }
         }
         pg_script = stop ? stop + 1 : "";
     }
@@ -504,9 +551,17 @@ static void pg_queue_text_input(NSEvent *event)
 @interface PeggleWindowDelegate : NSObject <NSWindowDelegate>
 @end
 @implementation PeggleWindowDelegate
-- (BOOL)windowShouldClose:(id)sender { (void)sender; pg_post_window_event(kEventWindowClose); return NO; }
+- (BOOL)windowShouldClose:(id)sender
+{
+    (void)sender;
+    fprintf(stderr, "compat32: AppKit asked to close the window\n");
+    pg_post_window_event(kEventWindowClose);
+    return NO;
+}
 - (void)windowDidBecomeKey:(NSNotification *)note { (void)note; pg_post_window_event(kEventWindowActivated); }
 - (void)windowDidResignKey:(NSNotification *)note { (void)note; pg_post_window_event(kEventWindowDeactivated); }
+- (void)windowDidExitFullScreen:(NSNotification *)note { (void)note; pg_reconcile_host_fullscreen(); }
+- (void)windowDidFailToEnterFullScreen:(NSWindow *)window { (void)window; pg_reconcile_host_fullscreen(); }
 - (void)windowDidResize:(NSNotification *)note
 {
     (void)note;
@@ -674,6 +729,20 @@ static void pg_report_guest_geometry(const char *when)
             surface_w, surface_h, gfx,
             logical.width, logical.height,
             view.size.width, view.size.height);
+    uint32_t widgets = *(const uint32_t *)(const void *)(base + 0x2ac);
+    if (widgets >= kGuestHeapFloor) {
+        const int32_t *r = (const int32_t *)(uintptr_t)(widgets + 0xac);
+        fprintf(stderr, "compat32: geom %s: RemapMouse source=(%d,%d %dx%d)"
+                " dest=(%d,%d %dx%d)", when, r[4], r[5], r[6], r[7],
+                r[0], r[1], r[2], r[3]);
+        if (gfx >= kGuestHeapFloor) {
+            const int32_t *c = (const int32_t *)(uintptr_t)(gfx + 0xd84);
+            fprintf(stderr, " cursor=(%d,%d)", c[0], c[1]);
+        }
+        const int32_t *last = (const int32_t *)(uintptr_t)(widgets + 0xd0);
+        fprintf(stderr, " widgets=(%d,%d) mouseIn=%u\n", last[0], last[1],
+                (unsigned)base[0x468]);
+    }
 }
 /* Put the letterbox on a given aspect and make the drawable follow it.
    Re-issuing glViewport here is required, not belt-and-braces: this guest
@@ -696,14 +765,80 @@ static void pg_apply_letterbox_aspect(struct pg_win *w, NSSize aspect)
         if (bw > 0 && bh > 0) glViewport(0, 0, bw, bh);
     }
 }
-/* The guest's layout span expressed in logical_content_size units, so the
-   pointer can be mapped into the same space the guest hit-tests in.  Zero
-   means "not in widescreen fullscreen; use the plain mapping". */
-static double pg_mouse_span_x;
-static double pg_mouse_origin_x;
-static double pg_mouse_span_y;
-static double pg_mouse_origin_y;
-static NSSize pg_hit_test_size;
+static bool pg_guest_fullscreen;
+static bool pg_host_fullscreen;
+static NSRect pg_windowed_content;
+static NSWindowStyleMask pg_windowed_style;
+static NSApplicationPresentationOptions pg_windowed_presentation;
+
+static bool pg_host_fullscreen_follows_guest(void)
+{
+    return lp32_profile()->title == LP32_TITLE_ZUMAS_REVENGE;
+}
+static void pg_enter_host_fullscreen(struct pg_win *w)
+{
+    if (pg_host_fullscreen || !w || !w->window || w->overlay) return;
+    if ([w->window styleMask] & NSWindowStyleMaskFullScreen) return;
+    NSScreen *screen = [w->window screen] ?: [NSScreen mainScreen];
+    if (!screen) return;
+    pg_windowed_style = [w->window styleMask];
+    pg_windowed_content = [w->window contentRectForFrameRect:[w->window frame]];
+    pg_windowed_presentation = [NSApp presentationOptions];
+    pg_host_fullscreen = true;
+    [NSApp setPresentationOptions:NSApplicationPresentationAutoHideDock |
+                                  NSApplicationPresentationAutoHideMenuBar];
+    [w->window setStyleMask:NSWindowStyleMaskBorderless];
+    [w->window setFrame:[screen frame] display:YES];
+    if ([[w->window contentView] isKindOfClass:[PeggleLetterboxView class]]) {
+        CGFloat inset = 0;
+        if (@available(macOS 12.0, *)) inset = [screen safeAreaInsets].top;
+        [(PeggleLetterboxView *)[w->window contentView] setTopInset:inset];
+    }
+    if (w->render_view) [w->window makeFirstResponder:w->render_view];
+    if (pg_gl) [pg_gl update];
+    NSRect frame = [w->window frame];
+    fprintf(stderr, "compat32: host fullscreen: entered, %.0fx%.0f at %.0f,%.0f"
+            " (windowed content was %.0fx%.0f at %.0f,%.0f)\n",
+            frame.size.width, frame.size.height, frame.origin.x, frame.origin.y,
+            pg_windowed_content.size.width, pg_windowed_content.size.height,
+            pg_windowed_content.origin.x, pg_windowed_content.origin.y);
+}
+static void pg_leave_host_fullscreen(struct pg_win *w)
+{
+    if (!pg_host_fullscreen || !w || !w->window) return;
+    pg_host_fullscreen = false;
+    [NSApp setPresentationOptions:pg_windowed_presentation];
+    NSString *title = [[[w->window title] retain] autorelease];
+    if ([[w->window contentView] isKindOfClass:[PeggleLetterboxView class]])
+        [(PeggleLetterboxView *)[w->window contentView] setTopInset:0];
+    [w->window setFrame:pg_windowed_content display:NO];
+    [w->window setStyleMask:pg_windowed_style];
+    if (title) [w->window setTitle:title];
+    [w->window setFrame:[w->window frameRectForContentRect:pg_windowed_content]
+                display:YES];
+    if (w->render_view) [w->window makeFirstResponder:w->render_view];
+    if (pg_gl) [pg_gl update];
+    NSRect frame = [w->window frame];
+    fprintf(stderr, "compat32: host fullscreen: left, window %.0fx%.0f at"
+            " %.0f,%.0f\n", frame.size.width, frame.size.height,
+            frame.origin.x, frame.origin.y);
+}
+static void pg_leave_host_fullscreen_for_window(NSWindow *window)
+{
+    struct pg_win *w = pg_main_win();
+    if (w && w->window == window) pg_leave_host_fullscreen(w);
+}
+static void pg_reconcile_host_fullscreen(void)
+{
+    struct pg_win *w = pg_main_win();
+    if (!w || !pg_guest_fullscreen || pg_host_fullscreen) return;
+    pg_enter_host_fullscreen(w);
+    if ([[w->window contentView] isKindOfClass:[PeggleLetterboxView class]]) {
+        pg_apply_letterbox_aspect(w,
+            [(PeggleLetterboxView *)[w->window contentView] contentAspect]);
+    }
+}
+static void pg_settle_guest_mouse_source(void);
 static void pg_sync_guest_layout(void)
 {
     enum { kSexyAppBaseGlobal = 0x00534c30, kGuestHeapFloor = 0x02000000 };
@@ -713,6 +848,8 @@ static void pg_sync_guest_layout(void)
        left logical stuck at the fullscreen value and windowed mode inherited
        16:10, drawing its 4:3 scene stretched. */
     static NSSize saved_logical;
+    static bool applied_fullscreen;
+    if (!pg_host_fullscreen_follows_guest()) return;
     struct pg_win *w = pg_main_win();
     if (!w || !w->window || w->overlay) return;
     uint32_t app = *(const uint32_t *)(uintptr_t)kSexyAppBaseGlobal;
@@ -723,11 +860,28 @@ static void pg_sync_guest_layout(void)
     int32_t layout_x = *(const int32_t *)(const void *)(base + 0x578);
     uint32_t layout_w = *(const uint32_t *)(const void *)(base + 0x580);
     uint32_t layout_h = *(const uint32_t *)(const void *)(base + 0x584);
-    NSSize want = (!guest_windowed && layout_w > 0 && layout_h > 0 &&
-                   screen_w > 0 && layout_w > screen_w)
+    bool guest_fullscreen = !guest_windowed && layout_w > 0 && layout_h > 0 &&
+                            screen_w > 0;
+    NSSize want = (guest_fullscreen && layout_w > screen_w)
         ? NSMakeSize((CGFloat)layout_w, (CGFloat)layout_h) : NSZeroSize;
-    if (NSEqualSizes(want, applied)) return;
+    bool layout_changed = !NSEqualSizes(want, applied);
+    bool mode_changed = guest_fullscreen != applied_fullscreen;
+    if (!layout_changed && !mode_changed) return;
     applied = want;
+    applied_fullscreen = guest_fullscreen;
+    if (mode_changed) {
+        pg_guest_fullscreen = guest_fullscreen;
+        if (guest_fullscreen) {
+            pg_enter_host_fullscreen(w);
+            pg_settle_guest_mouse_source();
+        } else {
+            pg_leave_host_fullscreen(w);
+        }
+    }
+    if (!layout_changed) {
+        pg_apply_letterbox_aspect(w, want.width > 0 ? want : w->logical_content_size);
+        return;
+    }
     if (want.width > 0) {
         pg_projection_x_scale = (double)screen_w / (double)layout_w;
         /* In NDC units: one layout pixel is 2/screen_w of the modelview's
@@ -737,20 +891,6 @@ static void pg_sync_guest_layout(void)
            value blanks the screen. */
         pg_projection_x_translate =
             (double)layout_x * (2.0 / (double)screen_w) * pg_projection_x_scale;
-        /* The pointer has to land in the same space or the cursor and the
-           drawn UI disagree by exactly the ratio the projection was corrected
-           by -- which is why the right-hand controls could not be reached.
-           logical_content_size is the guest's window in its own units
-           (1080 <-> screen_w), so carry the span and origin into those. */
-        static int cursor_fix = -1;
-        if (cursor_fix < 0)
-            cursor_fix = getenv("LP32_FULLSCREEN_CURSOR_FIX") != NULL;
-        pg_mouse_span_x = cursor_fix ? (double)layout_w : 0.0;
-        pg_mouse_origin_x = 0.0;
-        /* This older path only ever corrected X; leave Y on its original
-           mapping here so the two knobs stay independently testable. */
-        pg_mouse_span_y = 0.0;
-        pg_mouse_origin_y = 0.0;
         static int wide_logical = -1;
         if (wide_logical < 0) {
             const char *want = getenv("LP32_FULLSCREEN_WIDE_LOGICAL");
@@ -758,12 +898,6 @@ static void pg_sync_guest_layout(void)
         }
         if (wide_logical) {
             if (saved_logical.width <= 0) saved_logical = w->logical_content_size;
-            pg_hit_test_size = NSMakeSize((CGFloat)layout_w, (CGFloat)layout_h);
-            pg_mouse_span_x = (double)layout_w;
-            pg_mouse_origin_x = (double)layout_x;
-            pg_mouse_span_y = (double)layout_h;
-            pg_mouse_origin_y =
-                (double)*(const int32_t *)(const void *)(base + 0x57c);
             uint32_t screen_h = *(const uint32_t *)(const void *)(base + 0x3c);
             int32_t layout_y = *(const int32_t *)(const void *)(base + 0x57c);
             if (screen_h > 0 && layout_h > 0) {
@@ -776,31 +910,24 @@ static void pg_sync_guest_layout(void)
             }
             fprintf(stderr, "compat32: wide logical: window LEFT at %.0fx%.0f"
                     " (clicks only work at the true size); guest screen %ux%u,"
-                    " layout %ux%u at (%d,%d); pointer span %.1f origin %.1f;"
+                    " layout %ux%u at (%d,%d);"
                     " projection x %.4f/%+.4f y %.4f/%+.4f\n",
                     w->logical_content_size.width, w->logical_content_size.height,
                     *(const uint32_t *)(const void *)(base + 0x38), screen_h,
                     layout_w, layout_h, layout_x, layout_y,
-                    pg_mouse_span_x, pg_mouse_origin_x,
                     pg_projection_x_scale, pg_projection_x_translate,
                     pg_projection_y_scale, pg_projection_y_translate);
         }
         pg_apply_letterbox_aspect(w, want);
         fprintf(stderr, "compat32: widescreen layout %ux%u at x=%d;"
-                " projection ndc' = %.4f * ndc %+.4f; mouse span %.1f"
-                " origin %.1f\n",
+                " projection ndc' = %.4f * ndc %+.4f\n",
                 layout_w, layout_h, layout_x, pg_projection_x_scale,
-                pg_projection_x_translate, pg_mouse_span_x, pg_mouse_origin_x);
+                pg_projection_x_translate);
     } else {
         pg_projection_x_scale = 1.0;
         pg_projection_x_translate = 0.0;
         pg_projection_y_scale = 1.0;
         pg_projection_y_translate = 0.0;
-        pg_mouse_span_x = 0.0;
-        pg_mouse_origin_x = 0.0;
-        pg_mouse_span_y = 0.0;
-        pg_mouse_origin_y = 0.0;
-        pg_hit_test_size = NSZeroSize;
         if (saved_logical.width > 0) {
             fprintf(stderr, "compat32: wide logical: restoring window to"
                     " %.0fx%.0f\n", saved_logical.width, saved_logical.height);
@@ -826,25 +953,85 @@ static NSRect pg_content_rect(struct pg_win *w)
     }
     return [w->window contentRectForFrameRect:[w->window frame]];
 }
+struct pg_guest_window { double left, top, width, height; };
+enum { kPgGuestTitleBarHeight = 22 };
+static const uint8_t *pg_guest_app_in_fullscreen(void)
+{
+    enum { kSexyAppBaseGlobal = 0x00534c30, kGuestHeapFloor = 0x02000000 };
+    if (!pg_host_fullscreen_follows_guest()) return NULL;
+    uint32_t app = *(const uint32_t *)(uintptr_t)kSexyAppBaseGlobal;
+    if (app < kGuestHeapFloor) return NULL;
+    const uint8_t *base = (const uint8_t *)(uintptr_t)app;
+    return base[0x2d7] == 0 ? base : NULL;
+}
+static bool pg_guest_fullscreen_client(NSSize *client)
+{
+    if (!pg_guest_app_in_fullscreen()) return false;
+    NSScreen *screen = preferred_game_screen();
+    if (!screen) return false;
+    *client = [screen frame].size;
+    return client->width > 0 && client->height > 0;
+}
+static bool pg_guest_mouse_source(NSRect *source)
+{
+    enum { kGuestHeapFloor = 0x02000000 };
+    const uint8_t *base = pg_guest_app_in_fullscreen();
+    if (!base) return false;
+    uint32_t widgets = *(const uint32_t *)(const void *)(base + 0x2ac);
+    if (widgets < kGuestHeapFloor) return false;
+    const int32_t *r = (const int32_t *)(uintptr_t)(widgets + 0xbc);
+    if (r[2] <= 0 || r[3] <= 0) return false;
+    *source = NSMakeRect(r[0], r[1], r[2], r[3]);
+    return true;
+}
+static void pg_settle_guest_mouse_source(void)
+{
+    enum { kGuestHeapFloor = 0x02000000 };
+    const uint8_t *base = pg_guest_app_in_fullscreen();
+    NSRect source;
+    NSSize client;
+    if (!base || !pg_guest_mouse_source(&source) || !pg_guest_fullscreen_client(&client)) return;
+    NSRect whole = NSMakeRect(0, 0, client.width, client.height);
+    if (NSEqualRects(source, whole)) return;
+    uint32_t widgets = *(const uint32_t *)(const void *)(base + 0x2ac);
+    int32_t *r = (int32_t *)(uintptr_t)(widgets + 0xbc);
+    fprintf(stderr, "compat32: guest mouse source was (%d,%d %dx%d), sized for the"
+            " start-up window; set to the client area (0,0 %.0fx%.0f)\n",
+            r[0], r[1], r[2], r[3], client.width, client.height);
+    r[0] = 0; r[1] = 0;
+    r[2] = (int32_t)client.width; r[3] = (int32_t)client.height;
+}
+static struct pg_guest_window pg_guest_window_for(struct pg_win *w)
+{
+    NSRect content = pg_content_rect(w);
+    NSSize size = w->logical_content_size;
+    if (w->overlay || size.width <= 0 || size.height <= 0) size = content.size;
+    struct pg_guest_window g = {
+        content.origin.x, pg_screen_top() - NSMaxY(content), size.width, size.height,
+    };
+    NSSize client;
+    if (!w->overlay && pg_guest_fullscreen_client(&client)) {
+        g.left = 0; g.top = 0;
+        g.width = client.width; g.height = client.height;
+    }
+    return g;
+}
 static NSPoint pg_logical_mouse_point(struct pg_win *w, NSPoint screen)
 {
     NSRect content = pg_content_rect(w);
-    NSSize logical = w->logical_content_size;
-    if (logical.width <= 0 || logical.height <= 0 ||
+    if (w->logical_content_size.width <= 0 || w->logical_content_size.height <= 0 ||
         content.size.width <= 0 || content.size.height <= 0) {
         return NSMakePoint(screen.x - content.origin.x, NSMaxY(content) - screen.y);
     }
-    double x = (screen.x - content.origin.x) * logical.width / content.size.width;
-    if (pg_mouse_span_x > 0.0) {
-        x = pg_mouse_origin_x +
-            (screen.x - content.origin.x) * pg_mouse_span_x / content.size.width;
+    double across = (screen.x - content.origin.x) / content.size.width;
+    double down = (NSMaxY(content) - screen.y) / content.size.height;
+    NSRect source;
+    if (pg_guest_mouse_source(&source)) {
+        return NSMakePoint(source.origin.x + across * source.size.width,
+                           source.origin.y + down * source.size.height);
     }
-    double y = (NSMaxY(content) - screen.y) * logical.height / content.size.height;
-    if (pg_mouse_span_y > 0.0) {
-        y = pg_mouse_origin_y +
-            (NSMaxY(content) - screen.y) * pg_mouse_span_y / content.size.height;
-    }
-    return NSMakePoint(x, y);
+    struct pg_guest_window g = pg_guest_window_for(w);
+    return NSMakePoint(across * g.width, down * g.height);
 }
 /* Carbon hands the game both window-local and global points.  While the
    drawable is scaled, expose a virtual global point whose origin remains at
@@ -853,9 +1040,9 @@ static NSPoint pg_logical_mouse_point(struct pg_win *w, NSPoint screen)
 static NSPoint pg_virtual_screen_mouse_point(struct pg_win *w, NSPoint screen)
 {
     if (!w) return screen;
-    NSRect content = pg_content_rect(w);
+    struct pg_guest_window g = pg_guest_window_for(w);
     NSPoint local = pg_logical_mouse_point(w, screen);
-    return NSMakePoint(content.origin.x + local.x, NSMaxY(content) - local.y);
+    return NSMakePoint(g.left + local.x, pg_screen_top() - (g.top + local.y));
 }
 
 /* Carbon fullscreen passes the physical display rectangle through
@@ -905,6 +1092,11 @@ static NSSize pg_logical_size_for_request(NSSize requested, NSSize previous)
     }
     return requested;
 }
+static bool pg_request_is_display_sized(NSSize requested, NSSize screen)
+{
+    return screen.width > 0 && screen.height > 0 &&
+           requested.width >= screen.width && requested.height >= screen.height;
+}
 static void pg_start_app(void)
 {
     if (pg_app_started) return;
@@ -914,16 +1106,21 @@ static void pg_start_app(void)
     NSMenu *bar = [[[NSMenu alloc] init] autorelease];
     NSMenuItem *app_item = [[[NSMenuItem alloc] init] autorelease];
     [bar addItem:app_item];
-    NSMenu *menu = [[[NSMenu alloc] initWithTitle:@"Peggle"] autorelease];
+    NSMenu *menu = [[[NSMenu alloc] initWithTitle:pg_display_name()] autorelease];
     NSMenuItem *fullscreen = [[[NSMenuItem alloc]
         initWithTitle:@"Toggle Full Screen" action:@selector(toggleFullScreen:)
         keyEquivalent:@"f"] autorelease];
     [fullscreen setKeyEquivalentModifierMask:NSEventModifierFlagControl |
                                                NSEventModifierFlagCommand];
     [menu addItem:fullscreen];
-    [menu addItemWithTitle:@"Quit Peggle" action:@selector(terminate:) keyEquivalent:@"q"];
+    [menu addItemWithTitle:[@"Quit " stringByAppendingString:pg_display_name()]
+                    action:@selector(terminate:) keyEquivalent:@"q"];
     [app_item setSubmenu:menu];
     [NSApp setMainMenu:bar];
+    if (getenv("LP32_TRACE_DISPLAY")) {
+        fprintf(stderr, "compat32: application menu: %s\n",
+                [[[[menu itemArray] valueForKey:@"title"] componentsJoinedByString:@" | "] UTF8String]);
+    }
     /* A Carbon/AGL title never reaches the NSOpenGLView path that installs
        this, so until now a Dock quit -- or the Quit item just added, which is
        bound to terminate: -- tore the process down through AppKit with no
@@ -978,11 +1175,11 @@ static uint32_t pg_create_window(NSRect content, bool overlay)
         slot->window = window;
         slot->image_view = view;
     } else {
-        NSWindow *window = [[NSWindow alloc] initWithContentRect:content
-                                                       styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
-                                                                 NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
-                                                         backing:NSBackingStoreBuffered defer:NO];
-        [window setTitle:@"PeggleSilicon"];
+        NSWindow *window = [[PeggleWindow alloc] initWithContentRect:content
+                                                           styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                                                                     NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
+                                                             backing:NSBackingStoreBuffered defer:NO];
+        [window setTitle:pg_display_name()];
         [window setReleasedWhenClosed:NO];
         [window setAcceptsMouseMovedEvents:YES];
         /* Peggle renders at 4:3.  Keep that constraint in our child view
@@ -1023,6 +1220,10 @@ static void pg_dispose_window(struct pg_win *w)
         }
         pg_overlay_cache = *w;
     } else {
+        if (pg_host_fullscreen && pg_main_win() == w) {
+            pg_host_fullscreen = false;
+            [NSApp setPresentationOptions:pg_windowed_presentation];
+        }
         if (w->context_handle) pg_cf_release(w->context_handle);
         [w->window setDelegate:nil];
         [w->window release];
@@ -1034,6 +1235,14 @@ static void pg_set_bounds(struct pg_win *w, NSRect rect, bool is_content)
     if (!w->overlay && is_content && rect.size.width > 0 && rect.size.height > 0) {
         w->logical_content_size = pg_logical_size_for_request(
             rect.size, w->logical_content_size);
+    }
+    bool host_owns_frame = false;
+    if (!w->overlay && pg_host_fullscreen_follows_guest()) {
+        host_owns_frame = pg_host_fullscreen;
+        for (NSScreen *screen in [NSScreen screens]) {
+            if (pg_request_is_display_sized(rect.size, [screen frame].size))
+                host_owns_frame = true;
+        }
     }
     NSRect frame = is_content ? [w->window frameRectForContentRect:rect] : rect;
     if (!w->overlay && guest_display_mode_active()) {
@@ -1051,7 +1260,7 @@ static void pg_set_bounds(struct pg_win *w, NSRect rect, bool is_content)
        projection, but let AppKit retain the display-sized frame. */
     bool native_fullscreen = !w->overlay &&
         (([w->window styleMask] & NSWindowStyleMaskFullScreen) != 0);
-    if (!native_fullscreen) [w->window setFrame:frame display:YES];
+    if (!native_fullscreen && !host_owns_frame) [w->window setFrame:frame display:YES];
     if (!w->overlay) {
         [pg_gl update];
         if (native_fullscreen && [[w->window contentView] respondsToSelector:@selector(layout)]) {
@@ -1461,11 +1670,11 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
             NSRect frame = [w->window frame];
             fprintf(stderr, "compat32: %s handle=0x%08x -> NSWindow #%ld "
                     "visible=%d onscreen=%d key=%d %.0fx%.0f at %.0f,%.0f "
-                    "policy=%ld\n", n + 1, a[0], (long)[w->window windowNumber],
+                    "policy=%ld title=\"%s\"\n", n + 1, a[0], (long)[w->window windowNumber],
                     (int)[w->window isVisible], (int)[w->window isOnActiveSpace],
                     (int)[w->window isKeyWindow], frame.size.width,
                     frame.size.height, frame.origin.x, frame.origin.y,
-                    (long)[NSApp activationPolicy]);
+                    (long)[NSApp activationPolicy], [[w->window title] UTF8String] ?: "");
         }
         RET(0);
     }
@@ -1578,9 +1787,11 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         if (point && a[1] != a[3]) {
             struct pg_win *w = pg_win_for(a[4] ? a[4] : a[2]);
             if (w) {
-                NSRect c = pg_content_rect(w);
-                float left = (float)c.origin.x;
-                float top = (float)(pg_screen_top() - NSMaxY(c));
+                struct pg_guest_window g = pg_guest_window_for(w);
+                float left = (float)g.left;
+                float top = (float)g.top;
+                if (!w->overlay && pg_host_fullscreen_follows_guest())
+                    top -= kPgGuestTitleBarHeight;
                 if (a[1] == kSpaceScreen && a[3] == kSpaceWindow) {
                     point[0] -= left; point[1] -= top;
                 } else if (a[1] == kSpaceWindow && a[3] == kSpaceScreen) {
@@ -1590,7 +1801,16 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         }
         RET(0);
     }
-    if (IS("_SetWindowTitleWithCFString")) { struct pg_win *w = pg_win_for(a[0]); if (w) [w->window setTitle:@"PeggleSilicon"]; RET(0); }
+    if (IS("_SetWindowTitleWithCFString")) {
+        struct pg_win *w = pg_win_for(a[0]);
+        NSString *title = O(1);
+        title = [title isKindOfClass:[NSString class]] ?
+            [title stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : nil;
+        if (![title length]) title = pg_display_name();
+        if (pg_tracing()) fprintf(stderr, "compat32: window title \"%s\"\n", [title UTF8String] ?: "");
+        if (w && !w->overlay) [w->window setTitle:title];
+        RET(0);
+    }
     if (IS("_SizeWindow")) {
         struct pg_win *w = pg_win_for(a[0]);
         if (w) {
@@ -1615,17 +1835,29 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
                origin a title bar above the content and pushed every hit test
                down by the same amount, so buttons only responded below
                themselves.  Report the content region for both. */
-            pg_qd_from_rect(pg_content_rect(w), q);
-            bool widen = pg_hit_test_size.width > 0 &&
-                         (a[1] == kPgWindowStructureRgn ||
-                          a[1] == kPgWindowContentRgn);
-            NSSize reported = widen ? pg_hit_test_size : w->logical_content_size;
-            if (a[1] == 0) {
+            struct pg_guest_window g = pg_guest_window_for(w);
+            q[0] = (int16_t)g.top;
+            q[1] = (int16_t)g.left;
+            q[2] = (int16_t)(g.top + g.height);
+            q[3] = (int16_t)(g.left + g.width);
+            if (!w->overlay && pg_host_fullscreen_follows_guest()) {
+                if (a[1] == kPgWindowStructureRgn) q[0] -= kPgGuestTitleBarHeight;
+                if (a[1] == kPgWindowTitleBarRgn) {
+                    q[2] = q[0];
+                    q[0] -= kPgGuestTitleBarHeight;
+                }
+            } else if (a[1] == kPgWindowTitleBarRgn) {
                 q[0] = q[1] = q[2] = q[3] = 0;
-            } else if (!w->overlay && reported.width > 0 && reported.height > 0) {
-                q[2] = q[0] + (int16_t)reported.height;
-                q[3] = q[1] + (int16_t)reported.width;
             }
+        }
+        static int trace_bounds = -1;
+        if (trace_bounds < 0) trace_bounds = getenv("LP32_TRACE_BOUNDS") != NULL;
+        if (trace_bounds && w && !w->overlay) {
+            NSSize client;
+            fprintf(stderr, "compat32: GetWindowBounds handle=0x%08x region=%u ->"
+                    " top=%d left=%d bottom=%d right=%d (guest fullscreen client: %s)\n",
+                    a[0], a[1], q[0], q[1], q[2], q[3],
+                    pg_guest_fullscreen_client(&client) ? "yes" : "no");
         }
         if (a[2]) memcpy(P(2), q, sizeof(q));
         RET(0);
@@ -1674,17 +1906,14 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         NSPoint screen = pg_qd_point(NSMakePoint((int16_t)(a[0] >> 16),
                                                  (int16_t)(a[0] & 0xffff)));
         struct pg_win *w = pg_main_win();
-        NSRect hit = NSZeroRect;
         bool inside = false;
         if (w) {
-            hit = pg_content_rect(w);
-            if (pg_mouse_span_x > 0.0) {
-                hit.origin.x += pg_mouse_origin_x;
-                hit.size.width = pg_mouse_span_x;
-            }
-            if (pg_mouse_span_y > 0.0) {
-                hit.origin.y = NSMaxY(hit) - (pg_mouse_origin_y + pg_mouse_span_y);
-                hit.size.height = pg_mouse_span_y;
+            NSRect hit = pg_content_rect(w);
+            NSSize client;
+            if (pg_guest_fullscreen_client(&client)) {
+                struct pg_guest_window g = pg_guest_window_for(w);
+                hit = NSMakeRect(g.left, pg_screen_top() - (g.top + g.height),
+                                 g.width, g.height);
             }
             inside = NSPointInRect(screen, hit);
         }
@@ -1719,10 +1948,9 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
         struct pg_win *w = pg_main_win();
         int16_t *q = P(0);
         if (q && w) {
-            int16_t bounds[4];
-            pg_qd_from_rect(pg_content_rect(w), bounds);
-            q[0] -= bounds[0];
-            q[1] -= bounds[1];
+            struct pg_guest_window g = pg_guest_window_for(w);
+            q[0] -= (int16_t)g.top;
+            q[1] -= (int16_t)g.left;
         }
         RET(0);
     }
@@ -2118,6 +2346,8 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
                     [e type] == NSEventTypeKeyDown || [e type] == NSEventTypeKeyUp ? [[e characters] UTF8String] : "",
                     (const char[]){cls >> 24, cls >> 16, cls >> 8, cls}, kind);
         }
+        [NSApp sendEvent:e];
+        [NSApp updateWindows];
         if (pg_timer_depth > 0 && cls == kEventClassMouse) {
             ++pg_nested_mouse_dispatches;
             pg_last_nested_mouse_kind = kind;
@@ -2129,8 +2359,6 @@ static int peggle_window_dispatch(const char *n, const uint32_t *a, uint64_t *r)
             OUT(5, 0);
             RET(eventLoopTimedOutErr);
         }
-        [NSApp sendEvent:e];
-        [NSApp updateWindows];
         if (!cls) { OUT(5, 0); RET(eventLoopTimedOutErr); }
         if (cls == kEventClassKeyboard && (kind == kEventRawKeyDown || kind == kEventRawKeyRepeat)) pg_queue_text_input(e);
         OUT(5, pg_make_event(cls, kind, e));
