@@ -73,6 +73,7 @@ struct proxy_entry {
        kept its slot forever -- and the registry writer alone builds twelve of
        them per flush, so 2048 slots went in well under an hour of play. */
     uint32_t references;
+    bool callback_scoped;
     /* Bumped each time the slot is reused.  It rides in the low bits of the
        handle (kProxyStride is 16, so four bits are free), which makes a handle
        the guest kept past its release fail object_for_receiver's
@@ -92,6 +93,8 @@ static uint32_t event_proxy_count;
 static NSEvent *current_proxy_event;
 static bool logged_proxy_exhaustion;
 static uint64_t objc_bridge_swap_count;
+static char guest_fullscreen_content_key;
+static char guest_fullscreen_source_key;
 
 /*
  * O(1) object -> proxy-index map (open addressing, append-only).  The
@@ -178,7 +181,7 @@ static int32_t proxy_object_hash_find(id object)
 id guest_companion_for_block(uint32_t block);
 uint32_t guest_block_for_companion(id obj);
 static bool guest_objc_msgsend(const uint32_t *arguments, uint32_t avail, uint64_t *out);
-static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint32_t avail, uint64_t *out);
+static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint64_t *out);
 bool guest_objc_super_init(uint32_t receiver, const char *selector,
                            const uint32_t *init_args, uint64_t *out);
 static GLuint trace_vertex_program;
@@ -597,6 +600,7 @@ static uint32_t proxy_for_object(id object)
     proxies[index].handle = handle;
     proxies[index].object = object;
     proxies[index].references = 1;
+    proxies[index].callback_scoped = false;
     if (proxy_object_is_retained(object)) [object retain];
     proxy_object_hash_insert(index);
     return handle;
@@ -610,6 +614,44 @@ static int32_t proxy_index_for_handle(uint32_t handle)
     uint32_t index = (handle - kProxyBase) / kProxyStride;
     if (index >= proxy_count || proxies[index].handle != handle) return -1;
     return (int32_t)index;
+}
+
+static void recycle_proxy(uint32_t index)
+{
+    struct proxy_entry *entry = &proxies[index];
+    id object = entry->object;
+    proxy_object_hash_remove(object);
+    entry->object = nil;
+    entry->handle = 0;
+    entry->references = 0;
+    entry->callback_scoped = false;
+    entry->generation = (entry->generation + 1) & (kProxyStride - 1);
+    proxy_free_indices[proxy_free_count++] = index;
+    if (proxy_object_is_retained(object)) [object release];
+}
+
+/* Notifications handed to guest delegates are borrowed for the callback.
+   Thousands of view-frame notifications during Bejeweled's load otherwise
+   consume the entire persistent pool before the first resolution change.
+   An explicit guest retain promotes the handle to persistent lifetime. */
+static uint32_t proxy_for_callback_argument(id object, uint32_t *borrowed)
+{
+    bool notification = [object isKindOfClass:[NSNotification class]];
+    bool existing = notification && proxy_object_hash_find(object) >= 0;
+    uint32_t handle = proxy_for_object(object);
+    int32_t index = proxy_index_for_handle(handle);
+    if (notification && !existing && index >= 0) {
+        proxies[index].callback_scoped = true;
+        *borrowed = handle;
+    }
+    return handle;
+}
+
+static void release_callback_argument(uint32_t handle)
+{
+    int32_t index = proxy_index_for_handle(handle);
+    if (index >= 0 && proxies[index].callback_scoped)
+        recycle_proxy((uint32_t)index);
 }
 
 /* The guest giving a CoreFoundation object back.  Drops one reference and, at
@@ -648,16 +690,7 @@ static void proxy_release_handle(uint32_t handle)
         --entry->references;
         return;
     }
-    id object = entry->object;
-    proxy_object_hash_remove(object);
-    entry->object = nil;
-    entry->handle = 0;
-    entry->references = 0;
-    entry->generation = (entry->generation + 1) & (kProxyStride - 1);
-    if (proxy_free_count < kProxyCapacity) {
-        proxy_free_indices[proxy_free_count++] = (uint32_t)found;
-    }
-    if (object && proxy_object_is_retained(object)) [object release];
+    recycle_proxy((uint32_t)found);
 }
 
 static uint32_t proxy_for_returned_object(id receiver, id object)
@@ -5302,6 +5335,7 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
 
 #include "peggle_mac.inc"
 #include "objc_guest_class.inc"
+#include "objc_guest_class_tests.inc"
 
 int objc_bridge32_dispatch(const char *import_name, const uint32_t *arguments,
                            uint64_t *result)
@@ -7181,7 +7215,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
     }
     if (LP32_NAME_IS(import_name, import_length, "_CFRetain")) {
         int32_t retained = proxy_index_for_handle(arguments[0]);
-        if (retained >= 0) ++proxies[retained].references;
+        if (retained >= 0) {
+            ++proxies[retained].references;
+            proxies[retained].callback_scoped = false;
+        }
         *result = arguments[0];
         return 1;
     }
@@ -7588,6 +7625,13 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             const char *sel = (const char *)(uintptr_t)arguments[1];
             if (sel && guest_objc_super_init(super[0], sel, arguments + 2, result))
                 return 1;
+            struct guest_objc_instance *inst = guest_instance_for_block(super[0]);
+            if (inst && inst->companion) {
+                bool handled = guest_objc_super_message(inst, sel, arguments + 2, result);
+                if (!handled)
+                    fprintf(stderr, "compat32: unsupported guest super message %s\n", sel ?: "(null)");
+                return handled;
+            }
         }
         uint32_t newargs[16];
         newargs[0] = super[0];
@@ -7627,6 +7671,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             return 1;
         }
         id receiver = object_for_receiver(arguments[0]);
+        if (selector_name && strcmp(selector_name, "retain") == 0) {
+            int32_t retained = proxy_index_for_handle(arguments[0]);
+            if (retained >= 0) proxies[retained].callback_scoped = false;
+        }
         static int trace_selectors = -1;
         if (trace_selectors < 0) {
             trace_selectors = getenv("LP32_TRACE_OBJC_SELECTORS") != NULL;
@@ -7817,6 +7865,26 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             *result = proxy_for_object(value);
             return 1;
         }
+        if (strcmp(selector_name, "contentView") == 0 &&
+            [receiver isKindOfClass:[NSWindow class]]) {
+            NSView *fullscreen_view = objc_getAssociatedObject(receiver, &guest_fullscreen_content_key);
+            if (fullscreen_view && [fullscreen_view isInFullScreenMode]) {
+                *result = proxy_for_object(fullscreen_view);
+                return 1;
+            }
+        }
+        if (strcmp(selector_name, "exitFullScreenModeWithOptions:") == 0 &&
+            [receiver isKindOfClass:[NSView class]]) {
+            NSWindow *source = objc_getAssociatedObject(receiver, &guest_fullscreen_source_key);
+            [(NSView *)receiver exitFullScreenModeWithOptions:object_for_argument(arguments[2])];
+            if (source) {
+                if ([source contentView] != receiver) [source setContentView:receiver];
+                objc_setAssociatedObject(source, &guest_fullscreen_content_key, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(receiver, &guest_fullscreen_source_key, nil, OBJC_ASSOCIATION_ASSIGN);
+            }
+            *result = 0;
+            return 1;
+        }
         if (strcmp(selector_name, "enterFullScreenMode:withOptions:") == 0) {
             /* Bejeweled 3 asks NSView to go fullscreen with options that
                capture the display and disable process switching, which locks
@@ -7832,8 +7900,16 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                       NSApplicationPresentationAutoHideMenuBar),
                 NSFullScreenModeAllScreens : @NO,
             };
+            NSWindow *source = [(NSView *)receiver window];
             BOOL entered = [(NSView *)receiver enterFullScreenMode:screen
                                                        withOptions:options];
+            /* Modern AppKit detaches the content view from its source window.
+               Bejeweled still finds its fullscreen view through that window's
+               contentView, including for input and the top-right toggle. */
+            if (entered && source && guest_instance_for_companion(source)) {
+                objc_setAssociatedObject(source, &guest_fullscreen_content_key, receiver, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(receiver, &guest_fullscreen_source_key, source, OBJC_ASSOCIATION_ASSIGN);
+            }
             *result = entered ? 1 : 0;
             return 1;
         }
@@ -7952,7 +8028,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
            gateway and would otherwise consume the pending pop. */
         {
             uint64_t guest_result = 0;
-            if (guest_objc_msgsend_stret(arguments, 16, &guest_result)) {
+            if (guest_objc_msgsend_stret(arguments, &guest_result)) {
                 *result = guest_result;
                 compat_runtime32_struct_return();
                 return 1;

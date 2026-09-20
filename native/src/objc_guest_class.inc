@@ -205,6 +205,7 @@ static uint32_t guest_invoke(uint32_t imp, uint32_t self_value, const char *sele
                              const char *types, intptr_t *args, uint32_t host_argc)
 {
     uint32_t words[10];
+    uint32_t borrowed[4] = {0};
     uint32_t n = 0;
     words[n++] = self_value;
     words[n++] = guest_selector(selector);
@@ -220,7 +221,7 @@ static uint32_t guest_invoke(uint32_t imp, uint32_t self_value, const char *sele
         enum guest_arg_kind kind = *t ? guest_arg_kind(t) : GA_INT;
         intptr_t raw = args[i];
         if (kind == GA_OBJECT) {
-            words[n++] = raw ? proxy_for_object((id)raw) : 0;
+            words[n++] = raw ? proxy_for_callback_argument((id)raw, &borrowed[i]) : 0;
         } else {
             words[n++] = (uint32_t)raw;      /* pointer / int / SEL */
         }
@@ -229,6 +230,8 @@ static uint32_t guest_invoke(uint32_t imp, uint32_t self_value, const char *sele
     if (getenv("LP32_TRACE_OBJC_SELECTORS"))
         fprintf(stderr, "compat32: guest-call -[%s] imp=0x%x words=%u\n", selector, imp, n);
     uint32_t result = compat_runtime32_call(imp, words, n);
+    for (uint32_t i = 0; i < host_argc && i < 4; ++i)
+        release_callback_argument(borrowed[i]);
     if (compat_runtime32_last_call_trapped()) {
         if (getenv("LP32_TRACE_OBJC_SELECTORS")) fprintf(stderr, "compat32: guest ObjC method -[%s] trapped\n", selector);
     }
@@ -535,6 +538,10 @@ static bool guest_super_init(struct guest_objc_instance *inst,
     Class host = inst->cls->host_class;
     const float *r = (const float *)init_args;
     NSRect rect = NSMakeRect(r[0], r[1], r[2], r[3]);
+    if (getenv("LP32_TRACE_DISPLAY"))
+        fprintf(stderr, "compat32: %s %s rect=(%.0f,%.0f %.0fx%.0f)\n",
+                inst->cls->name, selector, rect.origin.x, rect.origin.y,
+                rect.size.width, rect.size.height);
     id obj = [host alloc];
     if (!obj) return false;
     /* Map the companion to the guest block BEFORE running the initializer.
@@ -591,6 +598,68 @@ bool guest_objc_super_init(uint32_t receiver, const char *selector,
     return false;
 }
 
+/* A super send must begin lookup at the native superclass, even when AppKit
+   has installed a KVO subclass on the companion.  Suppressing guest lookup
+   and then using NSInvocation still sends to the override: sendEvent: loops
+   until the guest stack limit instead of delivering input. */
+static bool guest_objc_super_message(struct guest_objc_instance *inst,
+                                     const char *selector,
+                                     const uint32_t *args, uint64_t *out)
+{
+    if (!inst || !inst->companion || !selector) return false;
+    Class superclass = class_getSuperclass(inst->cls->host_class);
+    SEL sel = sel_registerName(selector);
+    Method method = class_getInstanceMethod(superclass, sel);
+    if (!method) return false;
+    NSMethodSignature *signature = [NSMethodSignature
+        signatureWithObjCTypes:method_getTypeEncoding(method)];
+    struct objc_super sup = { inst->companion, superclass };
+    NSUInteger count = [signature numberOfArguments] - 2;
+    const char *ret = skip_type_qualifiers([signature methodReturnType]);
+    if (count == 1 && *ret == 'v') {
+        const char *type = skip_type_qualifiers([signature getArgumentTypeAtIndex:2]);
+        if (strncmp(type, "{CGRect=", 8) == 0) {
+            const float *r = (const float *)args;
+            typedef void (*RectSend)(struct objc_super *, SEL, NSRect);
+            ((RectSend)objc_msgSendSuper)(&sup, sel,
+                NSMakeRect(r[0], r[1], r[2], r[3]));
+            *out = 0;
+            return true;
+        }
+    }
+    if (count > 4 || !strchr("v@#cCBsSiIlLqQ", *ret)) return false;
+    uintptr_t values[4] = {0};
+    for (NSUInteger i = 0; i < count; ++i) {
+        const char *type = skip_type_qualifiers([signature getArgumentTypeAtIndex:i + 2]);
+        switch (*type) {
+            case '@': case '#': values[i] = (uintptr_t)object_for_argument(args[i]); break;
+            case ':': {
+                SEL value = args[i] ? sel_registerName((const char *)(uintptr_t)args[i]) : NULL;
+                memcpy(&values[i], &value, sizeof(value));
+                break;
+            }
+            case '^': case '*': values[i] = (uintptr_t)(peggle_object_for_handle(args[i]) ?: (id)(uintptr_t)args[i]); break;
+            case 'c': values[i] = (intptr_t)(int8_t)args[i]; break;
+            case 's': values[i] = (intptr_t)(int16_t)args[i]; break;
+            case 'i': case 'l': case 'q': values[i] = (intptr_t)(int32_t)args[i]; break;
+            case 'C': case 'B': values[i] = (uint8_t)args[i]; break;
+            case 'S': values[i] = (uint16_t)args[i]; break;
+            case 'I': case 'L': case 'Q': values[i] = args[i]; break;
+            default: return false;
+        }
+    }
+    if (*ret == 'v') {
+        typedef void (*VoidSend)(struct objc_super *, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+        ((VoidSend)objc_msgSendSuper)(&sup, sel, values[0], values[1], values[2], values[3]);
+        *out = 0;
+    } else {
+        typedef uintptr_t (*ScalarSend)(struct objc_super *, SEL, uintptr_t, uintptr_t, uintptr_t, uintptr_t);
+        uintptr_t value = ((ScalarSend)objc_msgSendSuper)(&sup, sel, values[0], values[1], values[2], values[3]);
+        *out = (*ret == '@' || *ret == '#') ? proxy_for_object((id)value) : (uint32_t)value;
+    }
+    return true;
+}
+
 /*
  * Guest-side objc_msgSend hook for synthesized classes and their instances.
  * `arguments` is the full guest msgSend frame (0=receiver, 1=selector,
@@ -609,7 +678,7 @@ static bool guest_objc_msgsend(const uint32_t *arguments, uint32_t avail, uint64
        class-name ref (in the cstring section, pre-fixup) or the guest class
        object address itself (when the guest holds a direct class pointer). */
     struct guest_objc_class *cls = NULL;
-    if (receiver >= bridge_image->cstring_start && receiver < bridge_image->cstring_end) {
+    if (bridge_image && receiver >= bridge_image->cstring_start && receiver < bridge_image->cstring_end) {
         cls = guest_class_named((const char *)(uintptr_t)receiver);
     }
     if (!cls) cls = guest_class_for_addr(receiver);
@@ -665,8 +734,7 @@ static bool guest_objc_msgsend(const uint32_t *arguments, uint32_t avail, uint64
  * site (set AFTER this call so the nested guest call does not consume it).
  * Returns true and sets *out (the returned struct pointer) when handled.
  */
-static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint32_t avail,
-                                     uint64_t *out)
+static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint64_t *out)
 {
     guest_synthesize_all_classes();
     uint32_t hidden = arguments[0];
@@ -674,12 +742,11 @@ static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint32_t avail,
     const char *selector = (const char *)(uintptr_t)arguments[2];
     if (!selector) return false;
     const uint32_t *method_args = arguments + 3;
-    uint32_t arg_avail = avail > 3 ? avail - 3 : 0;
 
     const struct guest_objc_method *m = NULL;
     uint32_t self_value = 0;
     struct guest_objc_class *cls = NULL;
-    if (receiver >= bridge_image->cstring_start &&
+    if (bridge_image && receiver >= bridge_image->cstring_start &&
         receiver < bridge_image->cstring_end)
         cls = guest_class_named((const char *)(uintptr_t)receiver);
     if (!cls) cls = guest_class_for_addr(receiver);
@@ -694,13 +761,21 @@ static bool guest_objc_msgsend_stret(const uint32_t *arguments, uint32_t avail,
     }
     if (!m) return false;
 
-    uint32_t words[16];
+    /* The method encoding describes the actual caller frame.  In particular,
+       Bejeweled 3's contentRectForContent:preferred:safe:min:max: needs 17
+       words including the hidden result pointer.  The old 16-word cap lost
+       max.height, clamping every saved window rectangle to 320x240. */
+    uint32_t words[64];
+    uint32_t argw = guest_frame_arg_words(m->types);
+    if (argw > sizeof(words) / sizeof(words[0]) - 3) {
+        fprintf(stderr, "compat32: guest stret frame too large for %s: %u words\n",
+                selector, argw);
+        return false;
+    }
     uint32_t n = 0;
     words[n++] = hidden;
     words[n++] = self_value;
     words[n++] = guest_selector(selector);
-    uint32_t argw = arg_avail;
-    if (argw > 16 - n) argw = 16 - n;
     for (uint32_t i = 0; i < argw; ++i) words[n++] = method_args[i];
     if (getenv("LP32_TRACE_OBJC_SELECTORS"))
         fprintf(stderr, "compat32: guest-stret [%s] imp=0x%x words=%u hidden=0x%08x\n",

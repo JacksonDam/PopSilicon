@@ -48,6 +48,23 @@ python3 tools/build.py "/path/to/Peggle Deluxe.app"
 open build/PeggleSilicon.app
 ```
 
+Bejeweled 3 stores its display preferences in
+`~/Library/Preferences/local.peggle.compat.plist`, outside the exported app,
+so rebuilding does not reset them. Older runtimes could reopen a saved window
+at 320×240 and stop delivering input. Rebuild with the current runtime to fix
+window sizing and input. To also reset the saved window position and size,
+quit the game and run:
+
+```sh
+defaults write local.peggle.compat PreferredX -int -1
+defaults write local.peggle.compat PreferredY -int -1
+defaults write local.peggle.compat PreferredWidth -int -1
+defaults write local.peggle.compat PreferredHeight -int -1
+```
+
+This leaves saved games intact. The preferences domain is shared with other
+PopSilicon titles; avoid deleting the entire plist to reset one game.
+
 For a graphical installer, build and open the included helper app:
 
 ```sh

@@ -10,6 +10,118 @@ static pthread_t pg_threads[256];
    aligned on i386, so it packs tightly after the fd): aio_fildes@0,
    aio_offset (8 bytes)@4, aio_buf@12, aio_nbytes@16. */
 static struct { uint32_t cb; long res; } pg_aio[64];
+/* Reuse whole and partial unmaps.  During a resolution restart Bejeweled can
+   also open its 100 MiB pak while the previous mapping is still live; that
+   pair exceeds this arena, so use an OS-chosen upper 32-bit address below. */
+enum { PG_MAP_BASE = 0x71000000, PG_MAP_LIMIT = 0x7b000000,
+       PG_MAP_PAGE = 4096, PG_MAP_PAGES = (PG_MAP_LIMIT - PG_MAP_BASE) / PG_MAP_PAGE };
+static uint8_t pg_mapped_pages[PG_MAP_PAGES];
+static pthread_mutex_t pg_mapping_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static uint32_t pg_guest_mmap(const uint32_t *a)
+{
+    uint64_t length = ((uint64_t)a[1] + PG_MAP_PAGE - 1) & ~(uint64_t)(PG_MAP_PAGE - 1);
+    if (!length || length > PG_MAP_LIMIT - PG_MAP_BASE) {
+        errno = length ? ENOMEM : EINVAL;
+        return UINT32_MAX;
+    }
+    uint32_t pages = (uint32_t)(length / PG_MAP_PAGE), start = 0;
+    pthread_mutex_lock(&pg_mapping_lock);
+    if (a[3] & MAP_FIXED) {
+        if (a[0] < PG_MAP_BASE || (a[0] & (PG_MAP_PAGE - 1)) ||
+            (uint64_t)a[0] + length > PG_MAP_LIMIT) {
+            pthread_mutex_unlock(&pg_mapping_lock);
+            errno = EINVAL;
+            return UINT32_MAX;
+        }
+        start = (a[0] - PG_MAP_BASE) / PG_MAP_PAGE;
+    } else {
+        uint32_t run = 0;
+        for (uint32_t i = 0; i < PG_MAP_PAGES; ++i) {
+            run = pg_mapped_pages[i] ? 0 : run + 1;
+            if (run == pages) { start = i + 1 - pages; break; }
+        }
+        if (run != pages) {
+            pthread_mutex_unlock(&pg_mapping_lock);
+            /* This is a hint, never MAP_FIXED: the kernel must not overwrite
+               another mapping.  Reject a result the i386 guest cannot address. */
+            void *mapped = mmap((void *)(uintptr_t)0x80000000u, (size_t)length,
+                a[2], a[3], (int)a[4],
+                (off_t)((uint64_t)a[5] | ((uint64_t)a[6] << 32)));
+            if (mapped != MAP_FAILED &&
+                ((uintptr_t)mapped > UINT32_MAX || (uintptr_t)mapped + length > UINT32_MAX)) {
+                munmap(mapped, (size_t)length);
+                mapped = MAP_FAILED;
+                errno = ENOMEM;
+            }
+            if (getenv("LP32_TRACE_MMAP"))
+                fprintf(stderr, "compat32: mmap overflow len=%llu fd=%d -> %p\n",
+                        (unsigned long long)length, (int)a[4], mapped);
+            return mapped == MAP_FAILED ? UINT32_MAX : (uint32_t)(uintptr_t)mapped;
+        }
+    }
+    uint32_t address = PG_MAP_BASE + start * PG_MAP_PAGE;
+    void *mapped = mmap((void *)(uintptr_t)address, (size_t)length, a[2],
+                        a[3] | MAP_FIXED, (int)a[4],
+                        (off_t)((uint64_t)a[5] | ((uint64_t)a[6] << 32)));
+    int saved_errno = errno;
+    if (mapped != MAP_FAILED) memset(pg_mapped_pages + start, 1, pages);
+    pthread_mutex_unlock(&pg_mapping_lock);
+    if (getenv("LP32_TRACE_MMAP"))
+        fprintf(stderr, "compat32: mmap len=%llu fd=%d -> 0x%08x\n",
+                (unsigned long long)length, (int)a[4], mapped == MAP_FAILED ? 0 : address);
+    errno = saved_errno;
+    return mapped == MAP_FAILED ? UINT32_MAX : address;
+}
+
+static int pg_guest_munmap(uint32_t address, uint32_t size)
+{
+    uint64_t length = ((uint64_t)size + PG_MAP_PAGE - 1) & ~(uint64_t)(PG_MAP_PAGE - 1);
+    pthread_mutex_lock(&pg_mapping_lock);
+    int result = munmap((void *)(uintptr_t)address, size);
+    int saved_errno = errno;
+    if (!result && address >= PG_MAP_BASE && (uint64_t)address + length <= PG_MAP_LIMIT)
+        memset(pg_mapped_pages + (address - PG_MAP_BASE) / PG_MAP_PAGE, 0,
+               (size_t)(length / PG_MAP_PAGE));
+    pthread_mutex_unlock(&pg_mapping_lock);
+    errno = saved_errno;
+    return result;
+}
+
+static int pg_mapping_self_test(void)
+{
+    uint32_t args[7] = {0, 96 * 1024 * 1024, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANON, UINT32_MAX, 0, 0};
+    for (unsigned i = 0; i < 8; ++i) {
+        uint32_t address = pg_guest_mmap(args);
+        if (address == UINT32_MAX) return -1;
+        *(volatile uint32_t *)(uintptr_t)address = i;
+        if (pg_guest_munmap(address, args[1])) return -1;
+    }
+    uint32_t old_archive = pg_guest_mmap(args);
+    uint32_t new_archive = pg_guest_mmap(args);
+    if (old_archive == UINT32_MAX || new_archive == UINT32_MAX ||
+        old_archive == new_archive) return -1;
+    *(volatile uint32_t *)(uintptr_t)old_archive = 123;
+    *(volatile uint32_t *)(uintptr_t)new_archive = 456;
+    if (*(volatile uint32_t *)(uintptr_t)old_archive != 123) return -1;
+    if (pg_guest_munmap(old_archive, args[1]) || pg_guest_munmap(new_archive, args[1])) return -1;
+    args[1] = 3 * PG_MAP_PAGE;
+    uint32_t base = pg_guest_mmap(args);
+    if (base == UINT32_MAX) return -1;
+    uint32_t *first = (void *)(uintptr_t)base;
+    uint32_t *last = (void *)(uintptr_t)(base + 2 * PG_MAP_PAGE);
+    *first = 123; *last = 456;
+    if (pg_guest_munmap(base + PG_MAP_PAGE, PG_MAP_PAGE)) return -1;
+    args[1] = PG_MAP_PAGE;
+    uint32_t hole = pg_guest_mmap(args);
+    if (hole != base + PG_MAP_PAGE || *first != 123 || *last != 456) return -1;
+    if (pg_guest_munmap(base, 3 * PG_MAP_PAGE)) return -1;
+    args[1] = 0;
+    if (pg_guest_mmap(args) != UINT32_MAX) return -1;
+    puts("Mapping self-test: PASS (8 reloads, simultaneous archives, partial unmap, live neighbours)");
+    return 0;
+}
 static uint32_t pg_thread_count=2;
 static _Thread_local uint32_t pg_thread_id;
 struct pg_thread_start {uint32_t function,argument,identifier;};
@@ -208,14 +320,8 @@ static int peggle_libc_dispatch(const char *n,const uint32_t *a,uint64_t *r)
     if(IS("_aio_return")){uint32_t cb=a[0];long got=-1;for(int i=0;i<64;i++)if(pg_aio[i].cb==cb){got=pg_aio[i].res;pg_aio[i].cb=0;break;}RET((uint32_t)got);}
     if(IS("_aio_suspend"))RET(0);
     if(IS("_aio_cancel"))RET(2); /* AIO_ALLDONE */
-    if(IS("_mmap")) {
-        static uint32_t cursor=0x71000000;size_t len=(a[1]+4095)&~4095u;uint32_t addr=__atomic_fetch_add(&cursor,(uint32_t)len,__ATOMIC_RELAXED);
-        if(addr+len>0x7b000000)RET(UINT32_MAX);
-        void *p=mmap((void *)(uintptr_t)addr,len,a[2],a[3]|MAP_FIXED,a[4],(uint64_t)a[5]|((uint64_t)a[6]<<32));
-        if(getenv("LP32_TRACE_MMAP"))fprintf(stderr,"compat32: mmap len=%zu prot=%x flags=%x fd=%d off=%u -> 0x%08x\n",len,a[2],a[3],(int)a[4],a[5],p==MAP_FAILED?0:(uint32_t)(uintptr_t)p);
-        RET(p==MAP_FAILED?UINT32_MAX:(uint32_t)(uintptr_t)p);
-    }
-    if(IS("_munmap"))RET((uint32_t)munmap((void *)(uintptr_t)a[0],a[1]));
+    if(IS("_mmap"))RET(pg_guest_mmap(a));
+    if(IS("_munmap"))RET((uint32_t)pg_guest_munmap(a[0],a[1]));
     if(IS("_time")){int32_t t=(int32_t)time(NULL);if(a[0])*(int32_t *)(uintptr_t)a[0]=t;RET((uint32_t)t);}
     if(IS("_localtime")){time_t t=*(int32_t *)(uintptr_t)a[0];struct tm tm;localtime_r(&t,&tm);uint32_t result=compat_runtime32_allocate(44,1);memcpy((void *)(uintptr_t)result,&tm,36);((int32_t *)(uintptr_t)result)[9]=(int32_t)tm.tm_gmtoff;((uint32_t *)(uintptr_t)result)[10]=compat_runtime32_copy_cstring(tm.tm_zone);RET(result);}
     if(IS("_gmtime")){time_t t=*(int32_t *)(uintptr_t)a[0];struct tm tm;gmtime_r(&t,&tm);uint32_t result=compat_runtime32_allocate(44,1);memcpy((void *)(uintptr_t)result,&tm,36);((int32_t *)(uintptr_t)result)[9]=(int32_t)tm.tm_gmtoff;((uint32_t *)(uintptr_t)result)[10]=compat_runtime32_copy_cstring(tm.tm_zone);RET(result);}

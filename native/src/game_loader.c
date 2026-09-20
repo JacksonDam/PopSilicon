@@ -56,6 +56,7 @@ static int selftest_requested(void)
         "LP32_SCORE_SELFTEST",        "LP32_GL_PARAMETER_SELFTEST",
         "LP32_GL_BUFFER_SELFTEST",    "LP32_GL_TEXTURE_SELFTEST",
         "LP32_WINDOW_SELFTEST",       "LP32_OBJC_PROXY_SELFTEST",
+        "LP32_OBJC_GUEST_SELFTEST",
         "LP32_CRASH_DIAGNOSTIC_SELFTEST",
     };
     /* Every LP32_*_SELFTEST above must appear here.  LP32_WINDOW_SELFTEST was
@@ -1009,6 +1010,11 @@ int main(int argc, char **argv)
     }
     if (getenv("LP32_WINDOW_SELFTEST")) {
         int result = objc_bridge32_run_window_geometry_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_OBJC_GUEST_SELFTEST")) {
+        int result = objc_bridge32_run_guest_class_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

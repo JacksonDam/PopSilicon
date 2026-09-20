@@ -6222,6 +6222,10 @@ static void *guest_file_test_worker_main(void *opaque)
 
 int compat_runtime32_run_file_self_test(void)
 {
+    if (pg_mapping_self_test() != 0) {
+        fputs("Mapping self-test: FAIL\n", stderr);
+        return -1;
+    }
     enum {
         sequential_iterations = 20000,
         worker_count = 4,
