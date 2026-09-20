@@ -46,6 +46,12 @@ enum SteamLocator {
     /// Intel executable.
     static func isSource(_ bundle: URL, for game: Game) -> Bool {
         guard bundleIdentifier(of: bundle) == game.id else { return false }
+        if let payloadPath = game.payloadPath {
+            let payload = bundle.appendingPathComponent(payloadPath)
+            if FileManager.default.fileExists(atPath: payload.path) {
+                return MachOInspector.isI386MacProtectPayload(at: payload)
+            }
+        }
         let executable = bundle.appendingPathComponent(
             "Contents/MacOS/\(game.executableName)")
         return MachOInspector.isI386Executable(at: executable)
@@ -78,22 +84,34 @@ enum SteamLocator {
 private enum MachOInspector {
     private static let cpuTypeI386: UInt32 = 7
     private static let machHeader32: UInt32 = 0xfeedface
-    private static let machHeader64: UInt32 = 0xfeedfacf
     private static let fatHeader: UInt32 = 0xcafebabe
     /// Valve's DRM wrapper appends its unlock stub, which carries the wrapper's
     /// own source paths; the native loader checks the same marker.
     private static let steamDRMMarker = Data("/src/drm/mach-o/".utf8)
 
     static func isI386Executable(at url: URL) -> Bool {
-        guard let data = try? Data(contentsOf: url), data.count >= 12 else { return false }
+        guard let data = try? Data(contentsOf: url) else { return false }
+        return containsI386(data)
+    }
 
-        let magic = readUInt32(data, at: 0, bigEndian: false)
-        switch magic {
-        case machHeader32:
-            return readUInt32(data, at: 4, bigEndian: false) == cpuTypeI386
-        case machHeader64:
-            return false
-        case fatHeader:
+    static func isI386MacProtectPayload(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else { return false }
+        defer { try? handle.close() }
+        let head = handle.readData(ofLength: 4096)
+        var recovered = Data(capacity: head.count)
+        var offset = 0
+        while offset + 16 <= head.count {
+            recovered.append(contentsOf: head[offset..<(offset + 16)].reversed())
+            offset += 16
+        }
+        return containsI386(recovered)
+    }
+
+    private static func containsI386(_ data: Data) -> Bool {
+        guard data.count >= 12 else { return false }
+
+        // A universal header is big-endian on disk; a thin i386 one is little-endian.
+        if readUInt32(data, at: 0, bigEndian: true) == fatHeader {
             let architectureCount = Int(readUInt32(data, at: 4, bigEndian: true))
             guard architectureCount > 0,
                   architectureCount <= (data.count - 8) / 20 else { return false }
@@ -104,9 +122,9 @@ private enum MachOInspector {
                 }
             }
             return false
-        default:
-            return false
         }
+        return readUInt32(data, at: 0, bigEndian: false) == machHeader32
+            && readUInt32(data, at: 4, bigEndian: false) == cpuTypeI386
     }
 
     static func isSteamDRMWrapped(at url: URL) -> Bool {

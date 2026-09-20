@@ -15,6 +15,7 @@ struct Game: Identifiable, Hashable {
     /// Contents/Resources.  The Peggle-era titles pack everything into
     /// main.pak; Bejeweled 2 predates that and ships loose folders.
     let resourceMarker: String
+    var payloadPath: String? = nil
 
     /// Steam install location for this game, if the folder/app exist.
     var steamInstallationURL: URL? {
@@ -116,7 +117,8 @@ struct Game: Identifiable, Hashable {
         executableName: "Bookworm",
         outputAppName: "Bookworm.app",
         imageFileName: "Bookworm.image",
-        resourceMarker: "properties/resources.xml"
+        resourceMarker: "properties/resources.xml",
+        payloadPath: "Contents/Resources/Bookworm.payload"
     )
 
     static let feedingFrenzy = Game(
