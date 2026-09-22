@@ -39,6 +39,7 @@ final class InstallerModel: ObservableObject {
     @Published private(set) var statusMessage = "Drop the game app to begin."
     @Published private(set) var errorMessage: String?
     @Published private(set) var buildOutput: String?
+    @Published private(set) var buildProgress: String?
     @Published var isBuildOutputExpanded = false
     @Published private(set) var installationSucceeded = false
     @Published private(set) var successProgress = 0.0
@@ -279,13 +280,17 @@ final class InstallerModel: ObservableObject {
             var failed: [String] = []
             for (index, game) in games.enumerated() {
                 guard let installation = SteamLocator.find(game) else { continue }
-                self?.bulkUpdateProgress =
-                    "\(index + 1) of \(games.count): \(game.displayName)…"
+                let step = "\(index + 1) of \(games.count): \(game.displayName)"
+                self?.bulkUpdateProgress = "\(step)…"
                 let result = await SteamReplacementRunner.run(
                     source: installation.appendingPathExtension("bak"),
                     target: installation,
                     game: game,
-                    projectRoot: projectRoot
+                    projectRoot: projectRoot,
+                    onOutputLine: { [weak self] line in
+                        guard let progress = InstallerModel.progress(in: line) else { return }
+                        Task { @MainActor in self?.bulkUpdateProgress = "\(step): \(progress)" }
+                    }
                 )
                 if result.succeeded {
                     updated.append(game.displayName)
@@ -356,6 +361,7 @@ final class InstallerModel: ObservableObject {
         isBuilding = true
         errorMessage = nil
         buildOutput = nil
+        buildProgress = nil
         installationSucceeded = false
         successProgress = 0
         statusMessage = "Building…"
@@ -364,11 +370,16 @@ final class InstallerModel: ObservableObject {
             let result = await BuildRunner.run(
                 source: sourceURL,
                 destination: destinationURL,
-                projectRoot: projectRoot
+                projectRoot: projectRoot,
+                onOutputLine: { [weak self] line in
+                    guard let progress = InstallerModel.progress(in: line) else { return }
+                    Task { @MainActor in self?.buildProgress = progress }
+                }
             )
 
             guard let self else { return }
             isBuilding = false
+            buildProgress = nil
             buildOutput = result.output
             if result.succeeded {
                 statusMessage = "Installation complete."
@@ -415,6 +426,7 @@ final class InstallerModel: ObservableObject {
         isBuilding = true
         errorMessage = nil
         buildOutput = nil
+        buildProgress = nil
         installationSucceeded = false
         successProgress = 0
         steamReplacementSucceeded = false
@@ -430,11 +442,16 @@ final class InstallerModel: ObservableObject {
                 source: source,
                 target: steamInstallationURL,
                 game: game,
-                projectRoot: projectRoot
+                projectRoot: projectRoot,
+                onOutputLine: { [weak self] line in
+                    guard let progress = InstallerModel.progress(in: line) else { return }
+                    Task { @MainActor in self?.buildProgress = progress }
+                }
             )
 
             guard let self else { return }
             isBuilding = false
+            buildProgress = nil
             buildOutput = result.output
             if result.succeeded {
                 statusMessage = "Installation complete."
@@ -523,6 +540,14 @@ final class InstallerModel: ObservableObject {
         successProgress = 0
         steamReplacementSucceeded = false
         statusMessage = "\(droppedGame.displayName) selected. Choose an export location."
+    }
+}
+
+extension InstallerModel {
+    nonisolated static func progress(in line: String) -> String? {
+        guard line.hasPrefix("==> ") else { return nil }
+        let progress = line.dropFirst(4).trimmingCharacters(in: .whitespacesAndNewlines)
+        return progress.isEmpty ? nil : progress
     }
 }
 

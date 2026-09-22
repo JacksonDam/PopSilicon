@@ -101,8 +101,10 @@ struct ContentView: View {
                 if model.isBuilding {
                     ProgressView()
                         .controlSize(.small)
-                    Text("Building \(product.displayName)…")
+                    Text(model.buildProgress ?? "Building \(product.displayName)…")
                         .foregroundColor(.gray)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
                 } else {
                     Text(model.statusMessage)
                         .foregroundColor(.gray)

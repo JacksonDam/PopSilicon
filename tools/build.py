@@ -13,8 +13,18 @@ def is_steam_drm(executable: pathlib.Path) -> bool:
     return STEAM_DRM_MARKER in executable.read_bytes()
 
 
+STEAM_IPC_SERVICE = 'com.valvesoftware.steam.ipctool'
+STEAM_UNLOCK_WAIT_SECONDS = 180
+
+
 def steam_is_running() -> bool:
     return subprocess.run(['pgrep', '-x', 'steam_osx'],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+def steam_ipc_is_registered() -> bool:
+    return subprocess.run(['launchctl', 'list', STEAM_IPC_SERVICE],
                           stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL).returncode == 0
 
@@ -24,12 +34,17 @@ def ensure_steam_running() -> None:
     Steam must be running (and signed in, owning the game) to unwrap the code."""
     if steam_is_running():
         return
-    # Launch Steam in the background (no focus steal) and give it time to come up.
-    subprocess.run(['open', '-g', '-a', 'Steam'],
-                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print('==> Starting Steam…', flush=True)
+    launched = subprocess.run(['open', '-g', '-a', 'Steam'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if launched.returncode != 0:
+        raise SystemExit(
+            'Steam could not be started.\n'
+            'Valve wraps the executable in Steam DRM that only decrypts after a live\n'
+            'ownership check with the Steam client. Install Steam, sign in to the\n'
+            'account that owns the game, then run the installation again.')
     for _ in range(60):
         if steam_is_running():
-            time.sleep(3)  # let the client finish signing in
             return
         time.sleep(1)
     raise SystemExit(
@@ -39,8 +54,34 @@ def ensure_steam_running() -> None:
         'account that owns the game, then run the installation again.')
 
 
+def steam_refused_message(display_name: str) -> str:
+    if steam_ipc_is_registered():
+        state = ('Steam is running, but it did not confirm that the signed-in '
+                 'account owns the game.')
+    else:
+        state = ("Steam's client service is not registered yet, so the client has "
+                 'not finished starting or signing in.')
+    return (
+        f'Steam did not unlock {display_name} within '
+        f'{STEAM_UNLOCK_WAIT_SECONDS // 60} minutes.\n{state}\n'
+        "Valve's DRM only decrypts the game after the Steam client confirms that\n"
+        'the signed-in account owns it. Finish signing in to Steam with the account\n'
+        f'that owns {display_name} (past the login window and any client update),\n'
+        'then run the installation again.')
+
+
+def unwrap_hint(output: str) -> str:
+    if 'Bad CPU type in executable' in output:
+        return ('Rosetta 2 is not installed. Install it with:\n'
+                '    softwareupdate --install-rosetta --agree-to-license\n')
+    if 'steamloader' in output:
+        return ('steamloader.dylib is part of the Steam client '
+                '(Steam.AppBundle); update or reinstall Steam.\n')
+    return ''
+
+
 def unwrap_steam_drm(loader: pathlib.Path, drm_executable: pathlib.Path,
-                     out_image: pathlib.Path) -> None:
+                     out_image: pathlib.Path, display_name: str) -> None:
     """Recover a clean game image from a Steam-DRM-wrapped executable.
 
     The DRM decryptor is 32-bit Intel code that only runs under the compat
@@ -48,20 +89,37 @@ def unwrap_steam_drm(loader: pathlib.Path, drm_executable: pathlib.Path,
     writes a retail-equivalent image the normal load path accepts.
     """
     ensure_steam_running()
-    with tempfile.TemporaryDirectory(prefix='pegglesilicon-unwrap-') as tmp:
-        staged = pathlib.Path(tmp)/'Peggle.image'
+    with tempfile.TemporaryDirectory(prefix='popsilicon-unwrap-') as tmp:
+        staged = pathlib.Path(tmp)/'game.image'
         # The loader finds libbass next to itself (make copies the dylib into
         # native/build), so no DYLD_* variables are needed; arch(1) would strip
         # them anyway.
-        env = dict(os.environ, LP32_UNWRAP_STEAM=str(staged))
-        result = subprocess.run(
-            ['arch', '-x86_64', str(loader), str(drm_executable)],
-            env=env, capture_output=True, text=True)
-        if result.returncode != 0 or not staged.is_file():
-            raise SystemExit(
-                'could not unwrap the Steam DRM copy of the game.\n'
-                f'{result.stdout}{result.stderr}'.strip())
-        shutil.move(str(staged), str(out_image))
+        env = dict(os.environ, LP32_UNWRAP_STEAM=str(staged),
+                   LP32_NO_SESSION_LOG='1')
+        deadline = time.monotonic() + STEAM_UNLOCK_WAIT_SECONDS
+        last_notice = None
+        while True:
+            result = subprocess.run(
+                ['arch', '-x86_64', str(loader), str(drm_executable)],
+                env=env, capture_output=True, text=True)
+            if result.returncode == 0 and staged.is_file():
+                shutil.move(str(staged), str(out_image))
+                return
+            output = f'{result.stdout}{result.stderr}'.strip()
+            refused = ('guest requested process exit' in output
+                       or 'left __text encrypted' in output)
+            if not refused:
+                raise SystemExit(
+                    f'could not unwrap the Steam DRM copy of {display_name}.\n'
+                    f'{unwrap_hint(output)}{output}')
+            now = time.monotonic()
+            if now >= deadline:
+                raise SystemExit(f'{steam_refused_message(display_name)}\n{output}')
+            if last_notice is None or now - last_notice >= 30:
+                print(f'==> Waiting for Steam to unlock {display_name} '
+                      '(sign in to the account that owns it)…', flush=True)
+                last_notice = now
+            time.sleep(3)
 
 
 def copy_clean(source: pathlib.Path, destination: pathlib.Path) -> None:
@@ -225,10 +283,10 @@ drm=is_steam_drm(executable)
 # regenerate it when the image is absent.
 if not image.exists() or (not drm and not payload and not filecmp.cmp(executable,image,shallow=False)):
  if drm:
-  print(f"{executable.name} is a Steam DRM copy of {game['display_name']}; unwrapping its game code…")
-  unwrap_steam_drm(loader,executable,image)
+  print(f"==> {executable.name} is a Steam DRM copy of {game['display_name']}; unwrapping its game code…", flush=True)
+  unwrap_steam_drm(loader,executable,image,game['display_name'])
  elif payload:
-  print(f"{executable.name} is a protected copy of {game['display_name']}; recovering its game code…")
+  print(f"==> {executable.name} is a protected copy of {game['display_name']}; recovering its game code…", flush=True)
   unswizzle_macprotect(payload,image)
  else:
   thin_i386(executable,image)

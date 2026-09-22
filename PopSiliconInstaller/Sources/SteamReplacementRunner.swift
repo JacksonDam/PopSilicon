@@ -6,7 +6,13 @@ enum SteamReplacementRunner {
     /// A target that is still Valve's copy is renamed to `.bak` first; a
     /// target that already holds PeggleSilicon is replaced in place, keeping
     /// whatever backup exists.
-    static func run(source: URL, target: URL, game: Game, projectRoot: URL) async -> BuildResult {
+    static func run(
+        source: URL,
+        target: URL,
+        game: Game,
+        projectRoot: URL,
+        onOutputLine: (@Sendable (String) -> Void)? = nil
+    ) async -> BuildResult {
         let fileManager = FileManager.default
         let parent = target.deletingLastPathComponent()
         let backup = target.appendingPathExtension("bak")
@@ -34,7 +40,8 @@ enum SteamReplacementRunner {
         let build = await BuildRunner.run(
             source: source,
             destination: temporaryOutput,
-            projectRoot: projectRoot
+            projectRoot: projectRoot,
+            onOutputLine: onOutputLine
         )
         guard build.succeeded else { return build }
 

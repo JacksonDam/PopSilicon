@@ -41,6 +41,12 @@ if it is still unavailable afterward, install Python 3 from python.org or
 Homebrew. Building the graphical installer itself additionally needs `swiftc`,
 which the same Command Line Tools package provides.
 
+On Apple silicon the loader also needs Rosetta 2: it is an Intel binary that
+runs the game's 32-bit code inside an x86_64 process. The dependency check
+installs Rosetta (`softwareupdate --install-rosetta --agree-to-license`) when
+`arch -x86_64` cannot run; a Mac that has only ever run native apps, including
+today's Steam client, does not have it yet.
+
 Build the game from the supplied game copy:
 
 ```sh
@@ -98,7 +104,11 @@ by the compatibility runtime itself, which executes Valve's own decryptor to
 recover the original code. That decryptor verifies ownership through a live
 handshake with the Steam client, so for those games **Steam must be running
 and signed in to the account that owns the game** during installation;
-the build starts Steam if it is not already running. The Bejeweled, Chuzzle and
+the build starts Steam if it is not already running and waits up to three
+minutes for the client to finish signing in. If Steam still has not unlocked
+the game by then (the login window is open, a client update is running, or the
+signed-in account does not own it), the build stops with a message saying so
+rather than a bare unwrap error. The Bejeweled, Chuzzle and
 Zuma Steam copies are not DRM-wrapped, so they install without Steam running.
 (Bejeweled 2's, Chuzzle's and Zuma's carry an extra `__STEAM` segment holding
 Valve's

@@ -671,6 +671,10 @@ static int write_clean_image(const char *drm_path, const char *output_path)
         { free(buf); return fail("could not locate image structures"); }
 
     /* Overwrite __text with the decrypted bytes from mapped guest memory. */
+    if (memcmp(buf + text_off, (const void *)(uintptr_t)text_addr, text_size) == 0) {
+        free(buf);
+        return fail("decryptor left __text encrypted; Steam did not unlock the game");
+    }
     memcpy(buf + text_off, (const void *)(uintptr_t)text_addr, text_size);
 
     /* Shrink __LINKEDIT to the retail layout (drop the appended DRM blob) and

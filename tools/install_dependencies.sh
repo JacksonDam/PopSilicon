@@ -16,6 +16,22 @@ if ! /usr/bin/xcode-select -p >/dev/null 2>&1; then
     exit 74
 fi
 
+if ! /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+    echo "==> Installing Rosetta 2, which PopSilicon needs to run the game's Intel code…"
+    if ! /usr/sbin/softwareupdate --install-rosetta --agree-to-license; then
+        echo "Rosetta 2 could not be installed automatically. Install it in Terminal with:"
+        echo "    softwareupdate --install-rosetta --agree-to-license"
+        echo "then run the installation again."
+        exit 1
+    fi
+    if ! /usr/bin/arch -x86_64 /usr/bin/true >/dev/null 2>&1; then
+        echo "Rosetta 2 still cannot run Intel code. Install it in Terminal with:"
+        echo "    softwareupdate --install-rosetta --agree-to-license"
+        echo "then run the installation again."
+        exit 1
+    fi
+fi
+
 missing=""
 for command_name in make clang codesign ditto python3; do
     if ! command -v "$command_name" >/dev/null 2>&1; then
