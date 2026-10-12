@@ -135,3 +135,62 @@ official `bass24-osx.zip` into `native/vendor/bass` (ignored by git) and copies
 `libbass.dylib` into the app next to the loader; run the script yourself to
 prefetch, or unpack the package there by hand when offline. The resulting app
 is ad hoc signed for local use.
+
+
+## Steam Cloud for Plants vs. Zombies (experimental)
+
+The optional PvZ build bridges the original game's `STEAMREMOTESTORAGE_INTERFACE_VERSION002`
+methods to the real Steam client: writing, reading, file size/existence, enumeration and quota.
+It uses Steam's storage API, not direct edits to `userdata` or `remotecache.vdf`. Steam handles
+uploading and conflicts. This does not add Cloud to the Peggle or Zuma games, and other
+Steam interfaces (including achievements) retain the existing runtime stubs.
+
+Back up both your local PvZ saves and the Steam Cloud copies before the first gameplay run.
+The game can write to the existing Cloud namespace for app 3590. Version-12 `userN.dat` profiles are validated and converted to Mac format on read and
+Windows format on write, preserving the Zen Garden and Zombatar tail. Unknown layouts or
+nonzero fields that would be lost during conversion are rejected. This does not convert
+in-progress `gameN_M.dat` level snapshots between platforms.
+
+Build from the original Steam app (use the `.app.bak` if PopSilicon is already installed):
+
+```sh
+python3 tools/build.py \
+  "$HOME/Library/Application Support/Steam/steamapps/common/Plants Vs Zombies/Plants vs. Zombies.app.bak" \
+  --steam-cloud --output build/PvZCloud.app
+```
+
+The build copies the current Steam client's x86_64-capable API library into the local app.
+Steam must be installed in its normal macOS location. No Valve binary is included in this
+repository; do not commit your generated game or libraries. The `steam-cloud` marker in
+`Contents/SharedSupport` enables the bridge. Missing API symbols/library, a wrong app ID,
+logged-out Steam or disabled Cloud stops the Cloud build with an error rather than pretending
+it synced. Ordinary builds retain their existing behavior. The graphical installer does not
+yet expose this opt-in flag.
+
+Test without starting gameplay or writing any Cloud saves:
+
+```sh
+LP32_STEAM_CLOUD_SELFTEST=1 build/PvZCloud.app/Contents/MacOS/PeggleSilicon
+```
+
+This exercises the real i386 gateway, enumerates and reads every Cloud file, and verifies
+32-bit quota outputs. It does not test uploads or save-format compatibility. For isolated
+write/read failure tests, including all seven legacy vtable slots:
+
+```sh
+clang -arch x86_64 -Wl,-pagezero_size,0x1000 -Wall -Wextra -Werror \
+  -I native/src native/tests/test_steam_cloud.c native/src/pvz_save.c -o /tmp/test-steam-cloud
+/tmp/test-steam-cloud
+```
+
+The legacy slot order is documented in
+[RemoteStorage002](https://github.com/SteamRE/open-steamworks/blob/master/Open%20Steamworks/ISteamRemoteStorage002.h)
+and was checked against PvZ 1.0.41's i386 call sites. The native side uses Valve's
+[flat RemoteStorage API](https://partner.steamgames.com/doc/api/ISteamRemoteStorage).
+
+Profile conversion tests (optional filename checks an existing Windows profile without modifying it):
+
+```sh
+clang -Wall -Wextra -Werror -I native/src native/tests/test_pvz_save.c native/src/pvz_save.c -o /tmp/test-pvz-save
+/tmp/test-pvz-save
+```
