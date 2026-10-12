@@ -41,6 +41,8 @@ enum SteamReplacementRunner {
             source: source,
             destination: temporaryOutput,
             projectRoot: projectRoot,
+            steamCloud: fileManager.fileExists(atPath:
+                target.appendingPathComponent("Contents/SharedSupport/steam-cloud").path),
             onOutputLine: onOutputLine
         )
         guard build.succeeded else { return build }

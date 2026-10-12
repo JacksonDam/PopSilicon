@@ -22,4 +22,6 @@ int objc_bridge32_run_window_geometry_self_test(void);
 int objc_bridge32_run_gl_buffer_self_test(void);
 int objc_bridge32_run_gl_texture_self_test(void);
 
+int objc_bridge32_run_cf_lifetime_self_test(void);
+
 #endif

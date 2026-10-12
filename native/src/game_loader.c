@@ -52,7 +52,7 @@ static void flush_guest_instruction(uintptr_t address);
 static int selftest_requested(void)
 {
     static const char *const variables[] = {
-        "LP32_STEAM_CLOUD_SELFTEST",
+        "LP32_STEAM_CLOUD_SELFTEST", "LP32_CF_LIFETIME_SELFTEST",
         "LP32_AUDIO_SELFTEST",        "LP32_HEAP_SELFTEST",
         "LP32_FILE_SELFTEST",         "LP32_CG_SELFTEST",
         "LP32_SYNC_SELFTEST",         "LP32_STRING_SELFTEST",
@@ -958,6 +958,11 @@ int main(int argc, char **argv)
     }
     if (unwrap_output) {
         int result = steam_unwrap_run(image_path, unwrap_output);
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_CF_LIFETIME_SELFTEST")) {
+        int result = objc_bridge32_run_cf_lifetime_self_test();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }

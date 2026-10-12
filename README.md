@@ -165,7 +165,8 @@ repository; do not commit your generated game or libraries. The `steam-cloud` ma
 `Contents/SharedSupport` enables the bridge. Missing API symbols/library, a wrong app ID,
 logged-out Steam or disabled Cloud stops the Cloud build with an error rather than pretending
 it synced. Ordinary builds retain their existing behavior. The graphical installer does not
-yet expose this opt-in flag.
+yet expose this opt-in flag, but repairing an existing Cloud-enabled Steam installation
+preserves it.
 
 Test without starting gameplay or writing any Cloud saves:
 
@@ -193,4 +194,12 @@ Profile conversion tests (optional filename checks an existing Windows profile w
 ```sh
 clang -Wall -Wextra -Werror -I native/src native/tests/test_pvz_save.c native/src/pvz_save.c -o /tmp/test-pvz-save
 /tmp/test-pvz-save
+```
+
+The CoreFoundation lifetime regression reproduces repeated garden locale-string creation
+through the i386 gateway and checks shared-object release ownership:
+
+```sh
+LP32_CF_LIFETIME_SELFTEST=1 build/PvZCloud.app/Contents/MacOS/PeggleSilicon
+python3 -m unittest discover -s tools/tests
 ```
