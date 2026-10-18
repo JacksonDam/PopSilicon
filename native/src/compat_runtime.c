@@ -1,4 +1,5 @@
 #include "compat_runtime.h"
+#include "steam_cloud.h"
 #include "audio_bridge.h"
 #include "game_profile.h"
 #include "objc_bridge.h"
@@ -5703,6 +5704,7 @@ static uint64_t dispatch_named_import(uint32_t import_id, const char *name,
     if (import_is(name, "_IODeregisterForSystemPower") ||
         import_is(name, "_IOAllowPowerChange") ||
         import_is(name, "_IOCancelPowerChange")) return 0;
+    if (steam_cloud_dispatch(name, arguments, &peggle_result)) return peggle_result;
     /* Steamworks (Bejeweled 3 links libsteam_api.dylib for stats/achievements/
        cloud, all optional).  Report Steam unavailable so the game runs without
        it; the interface accessors return null and are never used because Init

@@ -5334,6 +5334,43 @@ lp32_fast_import_fn objc_bridge32_fast_import(const char *import_name)
 }
 
 #include "peggle_mac.inc"
+
+int objc_bridge32_run_cf_lifetime_self_test(void)
+{
+    uint32_t create = compat_runtime32_guest_callback("_CFStringCreateWithCString");
+    uint32_t release = compat_runtime32_guest_callback("_CFRelease");
+    uint32_t text = compat_runtime32_copy_cstring("en_US");
+    uint32_t first = 0;
+    /* Match the garden's repeated creation without intervening releases. */
+    for (unsigned i = 0; i < 100000; ++i) {
+        uint32_t a[4] = {0, text, kCFStringEncodingUTF8, 0};
+        uint32_t handle = compat_runtime32_call(create, a, 4);
+        if (!handle || compat_runtime32_last_call_trapped()) return -1;
+        if (!first) first = handle;
+        if (handle != first) return -1;
+    }
+    for (unsigned i = 0; i < 100000; ++i) {
+        uint32_t a[4] = {first, 0, 0, 0};
+        compat_runtime32_call(release, a, 4);
+        if (compat_runtime32_last_call_trapped()) return -1;
+        if ((pg_cf_object(first) != NULL) != (i < 99999)) return -1;
+    }
+    compat_runtime32_deallocate(text);
+    /* Also check shared ownership of a real allocated, mutable object. */
+    CFMutableStringRef object = CFStringCreateMutable(NULL, 0);
+    uint32_t one = pg_cf_register(object);
+    uint32_t two = pg_cf_register(CFRetain(object));
+    if (!one || one != two || !pg_cf_retain(one)) return -1;
+    pg_cf_release(one);
+    pg_cf_release(two);
+    CFStringAppend(object, CFSTR("still alive"));
+    if (CFStringGetLength((CFStringRef)pg_cf_object(one)) != 11) return -1;
+    pg_cf_release(one);
+    if (pg_cf_object(one)) return -1;
+    puts("CoreFoundation lifetime self-test: 100000 repeated locale strings and shared ownership PASS");
+    return 0;
+}
+
 #include "objc_guest_class.inc"
 #include "objc_guest_class_tests.inc"
 

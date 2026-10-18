@@ -108,6 +108,14 @@ static uint32_t pg_cf_cursor;
 static uint32_t pg_cf_register(CFTypeRef object) /* takes over the caller's reference */
 {
     if (!object) return 0;
+    /* Create/Copy can return the same native object (notably PvZ's en_US string). */
+    for (uint32_t i = 0; i < kPgCfCapacity; ++i) {
+        if (pg_cf_table[i].object != object) continue;
+        if (pg_cf_table[i].refs == UINT32_MAX) abort();
+        ++pg_cf_table[i].refs;
+        CFRelease(object); /* The table keeps one native reference for all guest owners. */
+        return kPgCfBase + i * kPgCfStride;
+    }
     for (uint32_t step = 0; step < kPgCfCapacity; ++step) {
         uint32_t i = (pg_cf_cursor + step) % kPgCfCapacity;
         if (pg_cf_table[i].object) continue;

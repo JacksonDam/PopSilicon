@@ -255,6 +255,8 @@ parser.add_argument(
     default=None,
     help='destination app bundle (default: build/<game>.app)',
 )
+parser.add_argument('--steam-cloud', action='store_true',
+                    help='enable the real Steam Cloud API for Plants vs. Zombies (requires Steam)')
 args = parser.parse_args()
 
 source=args.source.expanduser()
@@ -267,12 +269,26 @@ executable=payload or source/'Contents/MacOS'/source_info.get('CFBundleExecutabl
 if not executable.is_file():
     raise SystemExit(f'game executable not found: {executable}')
 
+steam_api = None
+if args.steam_cloud:
+    if source_info.get('CFBundleIdentifier') != 'com.popcap.plantsvszombies':
+        raise SystemExit('--steam-cloud currently supports only Plants vs. Zombies')
+    legacy = source/'Contents/MacOS/libsteam_api.dylib'
+    if not legacy.is_file() or b'STEAMREMOTESTORAGE_INTERFACE_VERSION002\0' not in legacy.read_bytes():
+        raise SystemExit('PvZ must supply the original RemoteStorage002 Steam library')
+    steam_api = pathlib.Path.home()/'Library/Application Support/Steam/Steam.AppBundle/Steam/Contents/MacOS/Frameworks/Steam Helper.app/Contents/MacOS/libsteam_api.dylib'
+    if not steam_api.is_file():
+        raise SystemExit('Steam client API library missing; install/update Steam before building with Cloud')
+    subprocess.run(['lipo', str(steam_api), '-verify_arch', 'x86_64'], check=True)
+
 subprocess.run(['make','-C',str(root/'native'),'-j4'],check=True)
 loader=root/'native/build/game_loader'
 
 bundle=(args.output.expanduser() if args.output
         else root/'build'/game['output_name'])
 c=bundle/'Contents'
+if (c/'SharedSupport/steam-cloud').exists() and not args.steam_cloud:
+    raise SystemExit('This output already has Steam Cloud enabled; rebuild with --steam-cloud or choose a new output')
 bundle.parent.mkdir(parents=True,exist_ok=True)
 for d in ('MacOS','Resources','SharedSupport'): (c/d).mkdir(parents=True,exist_ok=True)
 
@@ -290,7 +306,7 @@ if not image.exists() or (not drm and not payload and not filecmp.cmp(executable
   unswizzle_macprotect(payload,image)
  else:
   thin_i386(executable,image)
- subprocess.run(['ditto','--noextattr','--noqtn',str(source/game.get('resources','Contents/Resources')),str(c/'Resources')],check=True)
+subprocess.run(['ditto','--noextattr','--noqtn',str(source/game.get('resources','Contents/Resources')),str(c/'Resources')],check=True)
 
 # A game that reaches part of itself through a second i386 library (Zuma's
 # Revenge and SmartDX) gets that binary beside its image, where the loader
@@ -304,6 +320,9 @@ if 'companion' in game:
 
 copy_clean(loader,c/'MacOS/PeggleSilicon')
 copy_clean(root/'native/vendor/bass/libbass.dylib',c/'MacOS/libbass.dylib')
+if steam_api:
+    copy_clean(steam_api, c/'MacOS/lp32_steam_api.dylib')
+    (c/'SharedSupport/steam-cloud').write_text('3590 RemoteStorage002\n')
 p=dict(source_info);p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier=game['bundle_identifier'],CFBundleName=game['bundle_name'],LSMinimumSystemVersion='11.0',NSHighResolutionCapable=False)
 (c/'Info.plist').write_bytes(plistlib.dumps(p))
 subprocess.run(['xattr','-cr',str(bundle)],check=True)

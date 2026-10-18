@@ -58,6 +58,7 @@ enum BuildRunner {
         source: URL,
         destination: URL,
         projectRoot: URL,
+        steamCloud: Bool = false,
         onOutputLine: (@Sendable (String) -> Void)? = nil
     ) async -> BuildResult {
         await withCheckedContinuation { continuation in
@@ -71,7 +72,7 @@ enum BuildRunner {
                 source.path,
                 "--output",
                 destination.path,
-            ]
+            ] + (steamCloud ? ["--steam-cloud"] : [])
             build.process.currentDirectoryURL = projectRoot
             build.process.standardOutput = build.pipe
             build.process.standardError = build.pipe

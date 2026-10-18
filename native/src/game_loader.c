@@ -1,5 +1,6 @@
 #include "audio_bridge.h"
 #include "compat_runtime.h"
+#include "steam_cloud.h"
 #include "game_profile.h"
 #include "macho_loader.h"
 #include "objc_bridge.h"
@@ -43,6 +44,7 @@ static volatile sig_atomic_t guest_null_deref_recoveries;
     } while (0)
 
 static void flush_guest_instruction(uintptr_t address);
+#include "steam_cloud_selftest.inc"
 
 /* True when the run is one of the self-tests below.  They all return before the
    game starts, so they need nothing from the persistent session log -- and must
@@ -50,6 +52,7 @@ static void flush_guest_instruction(uintptr_t address);
 static int selftest_requested(void)
 {
     static const char *const variables[] = {
+        "LP32_STEAM_CLOUD_SELFTEST", "LP32_CF_LIFETIME_SELFTEST",
         "LP32_AUDIO_SELFTEST",        "LP32_HEAP_SELFTEST",
         "LP32_FILE_SELFTEST",         "LP32_CG_SELFTEST",
         "LP32_SYNC_SELFTEST",         "LP32_STRING_SELFTEST",
@@ -955,6 +958,16 @@ int main(int argc, char **argv)
     }
     if (unwrap_output) {
         int result = steam_unwrap_run(image_path, unwrap_output);
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_CF_LIFETIME_SELFTEST")) {
+        int result = objc_bridge32_run_cf_lifetime_self_test();
+        macho_image32_unload(&image);
+        return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+    if (getenv("LP32_STEAM_CLOUD_SELFTEST")) {
+        int result = steam_cloud_selftest();
         macho_image32_unload(&image);
         return result == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
     }
