@@ -7708,6 +7708,22 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             return 1;
         }
         id receiver = object_for_receiver(arguments[0]);
+        /* A handle from the proxy range that no longer resolves is a borrowed
+           callback argument used after its callback returned.  Bejeweled 3's
+           -viewFrameChanged: hit one while switching screen mode; trapping
+           there unwound the whole switch, so the Options toggle took several
+           tries.  Answer it as a message to nil, which is what it now is. */
+        if (!receiver && arguments[0] >= kProxyBase &&
+            arguments[0] < kProxyLimit) {
+            static unsigned stale_reports;
+            if (stale_reports++ < 8) {
+                fprintf(stderr, "compat32: stale proxy 0x%08x sent %s; "
+                        "answering nil\n", arguments[0],
+                        selector_name ? selector_name : "?");
+            }
+            *result = 0;
+            return 1;
+        }
         if (selector_name && strcmp(selector_name, "retain") == 0) {
             int32_t retained = proxy_index_for_handle(arguments[0]);
             if (retained >= 0) proxies[retained].callback_scoped = false;
