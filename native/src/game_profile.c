@@ -162,6 +162,61 @@ static const struct lp32_game_profile zumas_revenge_profile = {
     .null_deref_resume2 = 0x00189dbd,
 };
 
+static const struct lp32_game_profile peggle_cd_profile = {
+    .title = LP32_TITLE_PEGGLE,
+    .name = "PeggleSilicon",
+    .display_name = "Peggle Deluxe",
+    .log_directory = "PeggleSilicon",
+    .image_file = "Peggle.image",
+    .entry_eip = 0x00002760,
+    .image_end = 0x0042f000,
+    .main_address = 0,
+};
+
+static const struct lp32_game_profile peggle_nights_cd_profile = {
+    .title = LP32_TITLE_PEGGLE_NIGHTS,
+    .name = "PeggleNights",
+    .display_name = "Peggle Nights",
+    .log_directory = "PeggleNights",
+    .image_file = "PeggleNights.image",
+    .entry_eip = 0x00002070,
+    .image_end = 0x004a5000,
+    .main_address = 0,
+};
+
+static const struct lp32_game_profile bejeweled2_cd_profile = {
+    .title = LP32_TITLE_BEJEWELED2,
+    .name = "Bejeweled2",
+    .display_name = "Bejeweled 2 Deluxe",
+    .log_directory = "Bejeweled2",
+    .image_file = "Bejeweled2.image",
+    .entry_eip = 0x000021dc,
+    .image_end = 0x002cd000,
+    .main_address = 0,
+};
+
+static const struct lp32_game_profile zuma_cd_profile = {
+    .title = LP32_TITLE_ZUMA,
+    .name = "Zuma",
+    .display_name = "Zuma Deluxe",
+    .log_directory = "Zuma",
+    .image_file = "Zuma.image",
+    .entry_eip = 0x0000299c,
+    .image_end = 0x002eb000,
+    .main_address = 0,
+};
+
+static const struct lp32_game_profile plantsvszombies_goty_cd_profile = {
+    .title = LP32_TITLE_PLANTSVSZOMBIES,
+    .name = "PlantsVsZombies",
+    .display_name = "Plants vs. Zombies",
+    .log_directory = "PlantsVsZombies",
+    .image_file = "PlantsVsZombies.image",
+    .entry_eip = 0x000085b0,
+    .image_end = 0x00445088,
+    .main_address = 0,
+};
+
 static const struct lp32_game_profile unknown_profile = {
     .title = LP32_TITLE_UNKNOWN,
     .name = "unknown",
@@ -182,6 +237,11 @@ static const struct lp32_game_profile *const known_profiles[] = {
     &bookworm_profile,
     &feeding_frenzy_profile,
     &zumas_revenge_profile,
+    &peggle_cd_profile,
+    &peggle_nights_cd_profile,
+    &bejeweled2_cd_profile,
+    &zuma_cd_profile,
+    &plantsvszombies_goty_cd_profile,
 };
 
 static const struct lp32_game_profile *current_profile = &unknown_profile;
@@ -295,8 +355,11 @@ int lp32_profile_select(const struct macho_image32 *image)
             fprintf(stderr, "game_loader: unknown LP32_GAME profile: %s\n", override);
             return -1;
         }
-        if (image->entry_eip != forced->entry_eip ||
-            image->max_address != forced->image_end) {
+        const struct lp32_game_profile *detected = detect_profile(image);
+        if (detected && detected->title == forced->title) {
+            forced = detected;
+        } else if (image->entry_eip != forced->entry_eip ||
+                   image->max_address != forced->image_end) {
             fprintf(stderr,
                     "compat32: warning: image (entry=0x%08x end=0x%08x) does not "
                     "match forced profile %s (entry=0x%08x end=0x%08x)\n",

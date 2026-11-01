@@ -8,7 +8,8 @@ CFLAGS := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0 -O2 -g -Wall -
 # on macOS 26 a negative offset wraps and the first dlsym() that searches the
 # main executable (AppKit does one during window setup) reads 0x180000000+
 # and the game dies with SIGSEGV right after entering main.
-LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segaddr,__LEGACY,0x1000,-segprot,__LEGACY,rwx,rwx,-segaddr,__LINKEDIT,0x110000000
+NO_HUGE := $(shell printf 'int main(void){return 0;}\n' | $(CLANG) -arch x86_64 -isysroot $(SDK) -x c - -Wl,-no_huge -o /dev/null >/dev/null 2>&1 && echo ,-no_huge)
+LDFLAGS := -Wl,-no_pie,-pagezero_size,0x1000,-segaddr,__TEXT,0x100000000,-segaddr,__LEGACY,0x1000,-segprot,__LEGACY,rwx,rwx,-segaddr,__LINKEDIT,0x110000000$(NO_HUGE)
 
 .PHONY: all clean run
 
@@ -43,6 +44,11 @@ $(BUILD_DIR)/game_loader: Makefile $(wildcard src/*.h src/*.inc) src/game_loader
 	linkedit=$$(otool -l $@ | awk '/segname __LINKEDIT$$/ { getline; print $$2; exit }'); \
 	if [ -z "$$text" ] || [ -z "$$linkedit" ] || [ $$((linkedit)) -le $$((text)) ]; then \
 		echo "game_loader: __LINKEDIT ($$linkedit) must be above __TEXT ($$text); this linker ignored -segaddr __LINKEDIT" >&2; \
+		rm -f $@; exit 1; \
+	fi
+	@legacy=$$(otool -l $@ | awk '/segname __LEGACY$$/ { getline; getline; print $$2; exit }'); \
+	if [ -z "$$legacy" ] || [ $$((legacy)) -eq 0 ]; then \
+		echo "game_loader: the linker moved the __LEGACY reservation into __DATA,__huge, which macOS refuses to run (Killed: 9); update the Command Line Tools so the linker accepts -no_huge" >&2; \
 		rm -f $@; exit 1; \
 	fi
 	codesign --force --sign - $@

@@ -19,6 +19,11 @@ basic play testing.
 - **FeedingFrenzySilicon** for Feeding Frenzy Deluxe 1.0. Passes basic 
 play testing.
 
+The loader also recognises the CD releases of Peggle Deluxe 1.0.3, Peggle
+Nights 1.0, Bejeweled 2 Deluxe 1.0, Zuma Deluxe 1.0 and Plants vs. Zombies GOTY
+1.0.25, and a Bookworm Deluxe app without the protected payload. These have not
+been play tested here.
+
 A single loader serves all nine titles; it detects which game an image is and
 applies the right profile.
 

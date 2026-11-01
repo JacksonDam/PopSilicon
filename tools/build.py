@@ -265,6 +265,8 @@ if not source.is_dir():
 source_info=plistlib.loads((source/'Contents/Info.plist').read_bytes())
 game=game_for_source(source_info)
 payload=source/game['payload'] if 'payload' in game else None
+if payload and not payload.is_file(): payload=None
+resource_dir=game['resources'] if payload and 'resources' in game else 'Contents/Resources'
 executable=payload or source/'Contents/MacOS'/source_info.get('CFBundleExecutable','')
 if not executable.is_file():
     raise SystemExit(f'game executable not found: {executable}')
@@ -306,7 +308,7 @@ if not image.exists() or (not drm and not payload and not filecmp.cmp(executable
   unswizzle_macprotect(payload,image)
  else:
   thin_i386(executable,image)
-subprocess.run(['ditto','--noextattr','--noqtn',str(source/game.get('resources','Contents/Resources')),str(c/'Resources')],check=True)
+subprocess.run(['ditto','--noextattr','--noqtn',str(source/resource_dir),str(c/'Resources')],check=True)
 
 # A game that reaches part of itself through a second i386 library (Zuma's
 # Revenge and SmartDX) gets that binary beside its image, where the loader
