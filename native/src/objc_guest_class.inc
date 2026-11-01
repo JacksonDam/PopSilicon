@@ -582,6 +582,11 @@ static bool guest_super_init(struct guest_objc_instance *inst,
     if (!done) { inst->companion = nil; return false; }
     inst->companion = done;   /* the initializer may substitute the instance */
     [done retain];            /* long-lived; the guest may autorelease the block */
+    /* Render at backing resolution; the GL viewport and scissor bridge
+       scales the game's point-sized values to match. */
+    if (retina_rendering_enabled() && [done isKindOfClass:[NSOpenGLView class]]) {
+        [(NSOpenGLView *)done setWantsBestResolutionOpenGLSurface:YES];
+    }
     fprintf(stderr, "compat32: created %s companion %p for guest block 0x%08x via %s\n",
             inst->cls->name, (void *)done, inst->block, selector);
     return true;

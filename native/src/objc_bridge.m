@@ -4789,6 +4789,66 @@ static void trace_guest_callers(const char *what, const uint32_t *arguments)
     static uint64_t fast_##name(const uint32_t *arguments, \
                                 uint32_t return_address)
 
+/*
+ * Retina rendering (Bejeweled 3).  The game's SexyOpenGLView gets a
+ * best-resolution surface, so the window-system framebuffer is in backing
+ * pixels while the game still sizes its viewport and scissor from view bounds
+ * in points.  Keep the guest's values in points and scale them whenever the
+ * default framebuffer is bound; the game's own FBOs (sized in texels) pass
+ * through untouched.  Re-applying on every framebuffer bind keeps this right
+ * whichever order the game sets viewport and binding in.  LP32_NO_RETINA=1
+ * turns it off.
+ */
+static bool retina_rendering_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = lp32_profile()->title == LP32_TITLE_BEJEWELED3 &&
+                  !getenv("LP32_NO_RETINA");
+    }
+    return enabled;
+}
+static GLint retina_guest_viewport[4];
+static GLint retina_guest_scissor[4];
+static bool retina_have_viewport, retina_have_scissor;
+static bool retina_default_framebuffer = true;
+
+static double retina_backing_scale(void)
+{
+    static double cached = 1.0;
+    static uint64_t cached_swap = UINT64_MAX;
+    if (cached_swap == objc_bridge_swap_count) return cached;
+    cached_swap = objc_bridge_swap_count;
+    cached = 1.0;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    NSView *view = [[NSOpenGLContext currentContext] view];
+    if (view && [view wantsBestResolutionOpenGLSurface]) {
+        NSRect bounds = [view bounds];
+        if (bounds.size.width > 0) {
+            cached = [view convertRectToBacking:bounds].size.width /
+                     bounds.size.width;
+        }
+    }
+#pragma clang diagnostic pop
+    return cached;
+}
+static void retina_apply_rect(const GLint *rect, bool viewport)
+{
+    double scale = retina_default_framebuffer ? retina_backing_scale() : 1.0;
+    GLint x = (GLint)lround(rect[0] * scale), y = (GLint)lround(rect[1] * scale);
+    GLsizei width = (GLsizei)lround(rect[2] * scale);
+    GLsizei height = (GLsizei)lround(rect[3] * scale);
+    if (viewport) glViewport(x, y, width, height);
+    else glScissor(x, y, width, height);
+}
+static void retina_framebuffer_bound(GLuint framebuffer)
+{
+    retina_default_framebuffer = framebuffer == 0;
+    if (retina_have_viewport) retina_apply_rect(retina_guest_viewport, true);
+    if (retina_have_scissor) retina_apply_rect(retina_guest_scissor, false);
+}
+
 FAST_GL(glVertexAttribPointer)
 {
     (void)return_address;
@@ -5096,11 +5156,34 @@ FAST_GL(glCullFace)   { (void)return_address; glCullFace(arguments[0]); return 0
 FAST_GL(glDepthFunc)  { (void)return_address; glDepthFunc(arguments[0]); return 0; }
 FAST_GL(glDepthMask)  { (void)return_address; glDepthMask(arguments[0]); return 0; }
 FAST_GL(glFrontFace)  { (void)return_address; glFrontFace(arguments[0]); return 0; }
-FAST_GL(glScissor)    { (void)return_address; glScissor(arguments[0], arguments[1], arguments[2], arguments[3]); return 0; }
+FAST_GL(glScissor)    {
+    (void)return_address;
+    if (retina_rendering_enabled()) {
+        for (int i = 0; i < 4; ++i) retina_guest_scissor[i] = (GLint)arguments[i];
+        retina_have_scissor = true;
+        retina_apply_rect(retina_guest_scissor, false);
+        return 0;
+    }
+    glScissor(arguments[0], arguments[1], arguments[2], arguments[3]);
+    return 0;
+}
 FAST_GL(glStencilFunc){ (void)return_address; glStencilFunc(arguments[0], arguments[1], arguments[2]); return 0; }
 FAST_GL(glStencilMask){ (void)return_address; glStencilMask(arguments[0]); return 0; }
 FAST_GL(glStencilOp)  { (void)return_address; glStencilOp(arguments[0], arguments[1], arguments[2]); return 0; }
-FAST_GL(glGetIntegerv){ (void)return_address; glGetIntegerv(arguments[0], (GLint *)(uintptr_t)arguments[1]); return 0; }
+FAST_GL(glGetIntegerv){
+    (void)return_address;
+    GLint *values = (GLint *)(uintptr_t)arguments[1];
+    glGetIntegerv(arguments[0], values);
+    /* Report the viewport and scissor box in the points the game set. */
+    if (retina_rendering_enabled() && values) {
+        if (arguments[0] == GL_VIEWPORT && retina_have_viewport) {
+            memcpy(values, retina_guest_viewport, sizeof(retina_guest_viewport));
+        } else if (arguments[0] == GL_SCISSOR_BOX && retina_have_scissor) {
+            memcpy(values, retina_guest_scissor, sizeof(retina_guest_scissor));
+        }
+    }
+    return 0;
+}
 FAST_GL(glGetFloatv)  { (void)return_address; glGetFloatv(arguments[0], (GLfloat *)(uintptr_t)arguments[1]); return 0; }
 /* Hot per-draw entry points on Bejeweled 3's board (client-array sprites).
    Kept on the fast path so the thousands of calls per frame skip the name
@@ -5201,6 +5284,13 @@ FAST_GL(glViewport) {
     (void)return_address;
     GLint x = (GLint)arguments[0], y = (GLint)arguments[1];
     GLsizei width = (GLsizei)arguments[2], height = (GLsizei)arguments[3];
+    if (retina_rendering_enabled()) {
+        retina_guest_viewport[0] = x; retina_guest_viewport[1] = y;
+        retina_guest_viewport[2] = width; retina_guest_viewport[3] = height;
+        retina_have_viewport = true;
+        retina_apply_rect(retina_guest_viewport, true);
+        return 0;
+    }
     pg_adjust_fullscreen_viewport(&x, &y, &width, &height);
     glViewport(x, y, width, height);
     return 0;
@@ -5237,7 +5327,16 @@ FAST_GL(glUseProgram) { (void)return_address; glUseProgram(arguments[0]); return
 FAST_GL(glUniform1i) { (void)return_address; glUniform1i((GLint)arguments[0], (GLint)arguments[1]); return 0; }
 FAST_GL(glUniform4fv) { (void)return_address; glUniform4fv((GLint)arguments[0], (GLsizei)arguments[1], (const GLfloat *)(uintptr_t)arguments[2]); return 0; }
 FAST_GL(glUniformMatrix4fv) { (void)return_address; glUniformMatrix4fv((GLint)arguments[0], (GLsizei)arguments[1], (GLboolean)arguments[2], (const GLfloat *)(uintptr_t)arguments[3]); return 0; }
-FAST_GL(glBindFramebufferEXT) { (void)return_address; glBindFramebufferEXT(arguments[0], arguments[1]); return 0; }
+FAST_GL(glBindFramebufferEXT) {
+    (void)return_address;
+    glBindFramebufferEXT(arguments[0], arguments[1]);
+    if (retina_rendering_enabled() &&
+        (arguments[0] == GL_FRAMEBUFFER_EXT ||
+         arguments[0] == GL_DRAW_FRAMEBUFFER_EXT)) {
+        retina_framebuffer_bound(arguments[1]);
+    }
+    return 0;
+}
 
 #undef FAST_GL
 
@@ -6296,6 +6395,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     arguments[0], arguments[1]);
         }
         glBindFramebuffer(arguments[0], arguments[1]);
+        if (retina_rendering_enabled() &&
+            (arguments[0] == GL_FRAMEBUFFER || arguments[0] == GL_DRAW_FRAMEBUFFER)) {
+            retina_framebuffer_bound(arguments[1]);
+        }
         *result = 0; return 1;
     }
     /* Bejeweled 3's renderer (unlike Peggle's fixed-function path) drives
@@ -6308,7 +6411,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         *result = 0; return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glBindFramebufferEXT")) {
-        glBindFramebufferEXT(arguments[0], arguments[1]); *result = 0; return 1;
+        *result = fast_glBindFramebufferEXT(arguments, 0); return 1;
     }
     if (LP32_NAME_IS(import_name, import_length, "_glDeleteFramebuffersEXT")) {
         glDeleteFramebuffersEXT((GLsizei)arguments[0], (const GLuint *)(uintptr_t)arguments[1]);
@@ -6851,11 +6954,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                     (GLint)arguments[0], (GLint)arguments[1],
                     (GLsizei)arguments[2], (GLsizei)arguments[3]);
         }
-        GLint x = (GLint)arguments[0], y = (GLint)arguments[1];
-        GLsizei width = (GLsizei)arguments[2], height = (GLsizei)arguments[3];
-        pg_adjust_fullscreen_viewport(&x, &y, &width, &height);
-        glViewport(x, y, width, height);
-        *result = 0; return 1;
+        *result = fast_glViewport(arguments, 0); return 1;
     }
     /* Fixed-function immediate mode used by the legacy display path for
        its loading/letterbox quads. */
