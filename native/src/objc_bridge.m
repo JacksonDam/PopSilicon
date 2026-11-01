@@ -4790,6 +4790,71 @@ static void trace_guest_callers(const char *what, const uint32_t *arguments)
                                 uint32_t return_address)
 
 /*
+ * Green-button fullscreen (Bejeweled 3).  The window's green button sends
+ * -toggleFullScreen:, which would start AppKit's own fullscreen behind the
+ * game's back.  Instead it queues the game's own screen-mode switch, the one
+ * its Options checkbox and windowed button run, and the event pump below
+ * makes the call between frames.  The game's fullscreen covers the whole
+ * screen at backing resolution (see enterFullScreenMode:withOptions:).
+ * Addresses are Bejeweled 3 1.1.12.4196: Bej3App::SwitchScreenMode(bool
+ * wantWindowed, bool is3D, bool force) is slot 67 of the Bej3App vtable, and
+ * the app object is reached through the global the game itself reads it from.
+ */
+static bool bj3_game_fullscreen;
+static bool bj3_mode_switch_pending;
+static NSWindow *bj3_game_window;
+
+static void bj3_toggle_full_screen(id self, SEL _cmd, id sender)
+{
+    (void)self; (void)sender;
+    if (getenv("LP32_TRACE_DISPLAY"))
+        fprintf(stderr, "compat32: window %s\n", sel_getName(_cmd));
+    bj3_mode_switch_pending = true;
+}
+
+static void bj3_run_pending_mode_switch(void)
+{
+    if (!bj3_mode_switch_pending) return;
+    bj3_mode_switch_pending = false;
+    enum {
+        kBej3AppGlobal = 0x00ab835c,
+        kBej3AppVtable = 0x00aad5e8,
+        kBej3SwitchScreenMode = 0x000addbe,
+        kGuestHeapFloor = 0x02000000,
+    };
+    uint32_t app = *(volatile const uint32_t *)(uintptr_t)kBej3AppGlobal;
+    if (app < kGuestHeapFloor ||
+        *(const uint32_t *)(uintptr_t)app != kBej3AppVtable) {
+        fprintf(stderr, "compat32: green-button fullscreen: no Bej3App at "
+                "0x%08x\n", app);
+        return;
+    }
+    uint32_t call[4] = {app, bj3_game_fullscreen ? 1u : 0u, 1u, 0u};
+    fprintf(stderr, "compat32: green-button fullscreen: switching to %s\n",
+            bj3_game_fullscreen ? "windowed" : "fullscreen");
+    compat_runtime32_call(kBej3SwitchScreenMode, call, 4);
+}
+
+/* LP32_TEST_GREEN_BUTTON_SWAPS=a,b,...: press the window's green button at
+   those swap counts, through the same -toggleFullScreen: a click sends. */
+static void bj3_run_test_green_button(void)
+{
+    static const char *list = (const char *)1;
+    if (list == (const char *)1) list = getenv("LP32_TEST_GREEN_BUTTON_SWAPS");
+    if (!list || !bj3_game_window) return;
+    for (const char *cursor = list; *cursor;) {
+        char *end = NULL;
+        unsigned long long swap = strtoull(cursor, &end, 10);
+        if (end == cursor) break;
+        if (swap == objc_bridge_swap_count) {
+            fprintf(stderr, "compat32: test green button at swap %llu\n", swap);
+            [bj3_game_window toggleFullScreen:nil];
+        }
+        cursor = *end ? end + 1 : end;
+    }
+}
+
+/*
  * Retina rendering (Bejeweled 3).  The game's SexyOpenGLView gets a
  * best-resolution surface, so the window-system framebuffer is in backing
  * pixels while the game still sizes its viewport and scissor from view bounds
@@ -7872,6 +7937,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 NSWindow *gl_window = [[gl_context view] window];
 #pragma clang diagnostic pop
                 present_frame_with_stats(gl_context, gl_window, true);
+                bj3_run_test_green_button();
                 *result = 0;
                 return 1;
             }
@@ -8043,6 +8109,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (strcmp(selector_name, "exitFullScreenModeWithOptions:") == 0 &&
             [receiver isKindOfClass:[NSView class]]) {
             trace_guest_callers("exitFullScreenModeWithOptions:", arguments);
+            bj3_game_fullscreen = false;
             NSWindow *source = objc_getAssociatedObject(receiver, &guest_fullscreen_source_key);
             [(NSView *)receiver exitFullScreenModeWithOptions:object_for_argument(arguments[2])];
             if (source) {
@@ -8104,6 +8171,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 objc_setAssociatedObject(source, &guest_fullscreen_content_key, receiver, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(receiver, &guest_fullscreen_source_key, source, OBJC_ASSOCIATION_ASSIGN);
             }
+            if (entered) bj3_game_fullscreen = true;
             *result = entered ? 1 : 0;
             return 1;
         }
@@ -8121,6 +8189,9 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (strcmp(selector_name,
                    "nextEventMatchingMask:untilDate:inMode:dequeue:") == 0 &&
             [receiver isKindOfClass:[NSApplication class]]) {
+            /* Between frames, in the game's own event loop: the safe point
+               for a queued green-button mode switch. */
+            bj3_run_pending_mode_switch();
             /*
              * The guest pumps its own event loop (mask 0xffffffff, default
              * mode) after finishLaunching and never enters -[NSApplication

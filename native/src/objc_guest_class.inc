@@ -587,6 +587,77 @@ static bool guest_super_init(struct guest_objc_instance *inst,
     if (retina_rendering_enabled() && [done isKindOfClass:[NSOpenGLView class]]) {
         [(NSOpenGLView *)done setWantsBestResolutionOpenGLSurface:YES];
     }
+    /* Give Bejeweled 3's window a working green button and resizable edges.
+       The button runs the game's own fullscreen switch rather than AppKit's;
+       edge resizing keeps the 4:3 shape the game's own resize grip keeps. */
+    if (lp32_profile()->title == LP32_TITLE_BEJEWELED3 &&
+        [done isKindOfClass:[NSWindow class]]) {
+        NSWindow *window = (NSWindow *)done;
+        bj3_game_window = window;
+        /* The window's traffic lights see their clicks reach NSWindow
+           (through the game's -sendEvent: and its super call) yet never act
+           on them, so answer clicks on them here: close, minimize, and the
+           game's own fullscreen switch for green (Option-green zooms). */
+        static id traffic_light_clicks;
+        if (!traffic_light_clicks) {
+            traffic_light_clicks = [[NSEvent
+                addLocalMonitorForEventsMatchingMask:NSEventMaskLeftMouseDown |
+                                                     NSEventMaskLeftMouseUp
+                handler:^NSEvent *(NSEvent *event) {
+                    static bool swallow_up;
+                    if ([event type] == NSEventTypeLeftMouseUp) {
+                        bool swallow = swallow_up;
+                        swallow_up = false;
+                        return swallow ? nil : event;
+                    }
+                    NSWindow *target = [event window];
+                    if (target != bj3_game_window) return event;
+                    const NSWindowButton kinds[3] = {
+                        NSWindowCloseButton, NSWindowMiniaturizeButton,
+                        NSWindowZoomButton};
+                    for (int i = 0; i < 3; ++i) {
+                        NSButton *button = [target standardWindowButton:kinds[i]];
+                        if (!button || [button isHidden] || ![button isEnabled]) continue;
+                        NSPoint point = [button convertPoint:[event locationInWindow]
+                                                    fromView:nil];
+                        if (!NSPointInRect(point, [button bounds])) continue;
+                        swallow_up = true;
+                        if (i == 0) [target performClose:nil];
+                        else if (i == 1) [target miniaturize:nil];
+                        else if ([event modifierFlags] & NSEventModifierFlagOption)
+                            [target zoom:nil];
+                        else bj3_mode_switch_pending = true;
+                        return nil;
+                    }
+                    return event;
+                }] retain];
+        }
+        /* Control-Command-F toggles fullscreen, as in any native app. */
+        static id fullscreen_shortcut;
+        if (!fullscreen_shortcut) {
+            fullscreen_shortcut = [[NSEvent
+                addLocalMonitorForEventsMatchingMask:NSEventMaskKeyDown
+                handler:^NSEvent *(NSEvent *event) {
+                    NSEventModifierFlags flags = [event modifierFlags] &
+                        NSEventModifierFlagDeviceIndependentFlagsMask;
+                    if ((flags & ~NSEventModifierFlagFunction) ==
+                            (NSEventModifierFlagControl | NSEventModifierFlagCommand) &&
+                        [[event charactersIgnoringModifiers]
+                            caseInsensitiveCompare:@"f"] == NSOrderedSame) {
+                        bj3_mode_switch_pending = true;
+                        return nil;
+                    }
+                    return event;
+                }] retain];
+        }
+        class_replaceMethod(object_getClass(window), @selector(toggleFullScreen:),
+                            (IMP)bj3_toggle_full_screen, "v@:@");
+        [window setStyleMask:[window styleMask] | NSWindowStyleMaskResizable];
+        [window setCollectionBehavior:[window collectionBehavior] |
+                                      NSWindowCollectionBehaviorFullScreenPrimary];
+        [window setContentAspectRatio:NSMakeSize(4, 3)];
+        [window setContentMinSize:NSMakeSize(640, 480)];
+    }
     fprintf(stderr, "compat32: created %s companion %p for guest block 0x%08x via %s\n",
             inst->cls->name, (void *)done, inst->block, selector);
     return true;
