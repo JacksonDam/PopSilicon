@@ -66,6 +66,19 @@ static int peggle_graphics_dispatch(const char *n, const uint32_t *a, uint64_t *
         RET(CGRectContainsPoint(pg_cgrect(a),
                                 CGPointMake(pg_float(a[4]), pg_float(a[5]))));
     }
+    /* Bejeweled 3 checks its window rectangle against the screen's visible
+       frame with these while resizing; unbound, the first drag of its resize
+       grip trapped and crashed the game. */
+    if (IS("_CGRectContainsRect")) RET(CGRectContainsRect(pg_cgrect(a), pg_cgrect(a + 4)));
+    if (IS("_CGRectIntersection")) {
+        /* Returned by value: hidden buffer first, popped by the callee. */
+        CGRect i = CGRectIntersection(pg_cgrect(a + 1), pg_cgrect(a + 5));
+        float f[4] = {(float)i.origin.x, (float)i.origin.y,
+                      (float)i.size.width, (float)i.size.height};
+        if (a[0]) memcpy(P(0), f, sizeof(f));
+        compat_runtime32_struct_return();
+        RET(a[0]);
+    }
     if (IS("_CGContextConcatCTM")) {
         CGContextRef context = (CGContextRef)CG(0);
         CGAffineTransform t = CGAffineTransformMake(
