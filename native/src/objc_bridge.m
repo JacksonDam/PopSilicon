@@ -8072,6 +8072,31 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             NSWindow *source = [(NSView *)receiver window];
             BOOL entered = [(NSView *)receiver enterFullScreenMode:screen
                                                        withOptions:options];
+            /* On a notched display AppKit sizes the fullscreen window to the
+               area below the camera housing, while the game lays out for the
+               whole screen frame, so the picture came out squashed.  Cover
+               the whole screen, notch area included. */
+            NSWindow *fullscreen_window = [(NSView *)receiver window];
+            if (entered && fullscreen_window && screen &&
+                !NSEqualRects([fullscreen_window frame], [screen frame])) {
+                [fullscreen_window setFrame:[screen frame] display:YES];
+            }
+            if (entered) {
+                double safe_top = 0;
+                if (@available(macOS 12.0, *)) safe_top = [screen safeAreaInsets].top;
+                NSRect view_frame = [(NSView *)receiver frame];
+                NSRect backing = [(NSView *)receiver convertRectToBacking:
+                                      [(NSView *)receiver bounds]];
+                fprintf(stderr,
+                        "compat32: fullscreen screen=%.0fx%.0f safe-top=%.0f "
+                        "window=%.0fx%.0f view=%.0fx%.0f backing=%.0fx%.0f\n",
+                        [screen frame].size.width, [screen frame].size.height,
+                        safe_top,
+                        [fullscreen_window frame].size.width,
+                        [fullscreen_window frame].size.height,
+                        view_frame.size.width, view_frame.size.height,
+                        backing.size.width, backing.size.height);
+            }
             /* Modern AppKit detaches the content view from its source window.
                Bejeweled still finds its fullscreen view through that window's
                contentView, including for input and the top-right toggle. */
