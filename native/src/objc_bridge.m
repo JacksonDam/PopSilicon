@@ -4855,6 +4855,254 @@ static void bj3_run_test_green_button(void)
 }
 
 /*
+ * Fullscreen title bar (Bejeweled 3).  The game's fullscreen is an NSView
+ * fullscreen window with no title bar, which left no traffic lights to get
+ * out with.  Behave like a native app's fullscreen instead: when the pointer
+ * reaches the top edge, the auto-hidden menu bar drops down and a title bar
+ * with close / hide / windowed buttons slides in beneath it; it goes away
+ * again once the pointer moves back into the game.  Polled once per frame
+ * from the present path.  Control-Command-F toggles fullscreen as well.
+ */
+static void bj3_controls_close(void) { [bj3_game_window performClose:nil]; }
+static void bj3_controls_hide(void) { [NSApp hide:nil]; }
+static void bj3_controls_windowed(void) { bj3_mode_switch_pending = true; }
+
+@interface LP32FullscreenTitlePanel : NSPanel
+@end
+@implementation LP32FullscreenTitlePanel
+/* Standard window buttons send their actions to their own window. */
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (void)performClose:(id)sender { (void)sender; bj3_controls_close(); }
+- (void)performMiniaturize:(id)sender { (void)sender; bj3_controls_hide(); }
+- (void)performZoom:(id)sender { (void)sender; bj3_controls_windowed(); }
+- (void)zoom:(id)sender { (void)sender; bj3_controls_windowed(); }
+- (void)toggleFullScreen:(id)sender { (void)sender; bj3_controls_windowed(); }
+- (void)closeGame:(id)sender { (void)sender; bj3_controls_close(); }
+- (void)hideGame:(id)sender { (void)sender; bj3_controls_hide(); }
+- (void)leaveFullscreen:(id)sender { (void)sender; bj3_controls_windowed(); }
+@end
+
+/* AppKit's standard window buttons draw grey in a window that is not key,
+   and this panel must never take key status from the game, so the three
+   buttons are drawn here in their usual colours, with the glyphs shown while
+   the pointer is over the group. */
+@interface LP32TrafficLight : NSView {
+@public
+    int kind_;
+    BOOL hover_, pressed_;
+    id target_;
+    SEL action_;
+}
+@end
+@implementation LP32TrafficLight
+- (void)drawRect:(NSRect)dirty
+{
+    (void)dirty;
+    static const CGFloat colours[3][3] = {
+        {1.00, 0.373, 0.341}, {0.996, 0.737, 0.180}, {0.157, 0.784, 0.251}};
+    CGFloat shade = pressed_ ? 0.8 : 1.0;
+    NSRect circle = NSInsetRect([self bounds], 1, 1);
+    NSBezierPath *path = [NSBezierPath bezierPathWithOvalInRect:circle];
+    [[NSColor colorWithSRGBRed:colours[kind_][0] * shade
+                         green:colours[kind_][1] * shade
+                          blue:colours[kind_][2] * shade alpha:1] setFill];
+    [path fill];
+    [[NSColor colorWithWhite:0 alpha:0.18] setStroke];
+    [path setLineWidth:0.5];
+    [path stroke];
+    if (!hover_) return;
+    [[NSColor colorWithWhite:0 alpha:0.55] set];
+    NSPoint c = NSMakePoint(NSMidX(circle), NSMidY(circle));
+    CGFloat r = NSWidth(circle) * 0.22;
+    NSBezierPath *glyph = [NSBezierPath bezierPath];
+    [glyph setLineWidth:1.2];
+    [glyph setLineCapStyle:NSLineCapStyleRound];
+    if (kind_ == 0) {
+        [glyph moveToPoint:NSMakePoint(c.x - r, c.y - r)];
+        [glyph lineToPoint:NSMakePoint(c.x + r, c.y + r)];
+        [glyph moveToPoint:NSMakePoint(c.x - r, c.y + r)];
+        [glyph lineToPoint:NSMakePoint(c.x + r, c.y - r)];
+        [glyph stroke];
+    } else if (kind_ == 1) {
+        [glyph moveToPoint:NSMakePoint(c.x - r - 1, c.y)];
+        [glyph lineToPoint:NSMakePoint(c.x + r + 1, c.y)];
+        [glyph stroke];
+    } else {
+        /* Leave fullscreen: two corner triangles pointing inward. */
+        CGFloat q = r + 1.2, g = 0.6;
+        [glyph moveToPoint:NSMakePoint(c.x - g, c.y + g)];
+        [glyph lineToPoint:NSMakePoint(c.x - q, c.y + g)];
+        [glyph lineToPoint:NSMakePoint(c.x - g, c.y + q)];
+        [glyph closePath];
+        [glyph moveToPoint:NSMakePoint(c.x + g, c.y - g)];
+        [glyph lineToPoint:NSMakePoint(c.x + q, c.y - g)];
+        [glyph lineToPoint:NSMakePoint(c.x + g, c.y - q)];
+        [glyph closePath];
+        [glyph fill];
+    }
+}
+- (BOOL)acceptsFirstMouse:(NSEvent *)event { (void)event; return YES; }
+- (void)mouseDown:(NSEvent *)event { (void)event; pressed_ = YES; [self setNeedsDisplay:YES]; }
+- (void)mouseUp:(NSEvent *)event
+{
+    pressed_ = NO;
+    [self setNeedsDisplay:YES];
+    NSPoint point = [self convertPoint:[event locationInWindow] fromView:nil];
+    if (NSPointInRect(point, [self bounds]) && action_)
+        [NSApp sendAction:action_ to:target_ from:self];
+}
+@end
+
+@interface LP32TrafficLightGroup : NSView {
+    NSTrackingArea *tracking_;
+}
+@end
+@implementation LP32TrafficLightGroup
+- (void)updateTrackingAreas
+{
+    if (tracking_) {
+        [self removeTrackingArea:tracking_];
+        [tracking_ release];
+    }
+    tracking_ = [[NSTrackingArea alloc]
+        initWithRect:NSZeroRect
+             options:NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways |
+                     NSTrackingInVisibleRect
+               owner:self userInfo:nil];
+    [self addTrackingArea:tracking_];
+    [super updateTrackingAreas];
+}
+- (void)dealloc { [tracking_ release]; [super dealloc]; }
+- (void)setHover:(BOOL)hover
+{
+    for (LP32TrafficLight *light in [self subviews]) {
+        light->hover_ = hover;
+        [light setNeedsDisplay:YES];
+    }
+}
+- (void)mouseEntered:(NSEvent *)event { (void)event; [self setHover:YES]; }
+- (void)mouseExited:(NSEvent *)event { (void)event; [self setHover:NO]; }
+@end
+
+static NSPanel *bj3_title_panel;
+static NSScreen *bj3_title_screen;
+static bool bj3_title_visible;
+enum { kBj3TitleBarHeight = 28 };
+
+static double bj3_menu_bar_height(NSScreen *screen)
+{
+    double height = [[NSStatusBar systemStatusBar] thickness];
+    if (@available(macOS 12.0, *)) {
+        if ([screen safeAreaInsets].top > height) height = [screen safeAreaInsets].top;
+    }
+    return height;
+}
+
+static void bj3_hide_fullscreen_controls(void)
+{
+    if (!bj3_title_panel) return;
+    [bj3_title_panel orderOut:nil];
+    [bj3_title_panel release];
+    bj3_title_panel = nil;
+    bj3_title_screen = nil;
+    bj3_title_visible = false;
+}
+
+static void bj3_set_title_visible(bool visible)
+{
+    if (!bj3_title_panel || visible == bj3_title_visible) return;
+    bj3_title_visible = visible;
+    [[bj3_title_panel animator] setAlphaValue:visible ? 1.0 : 0.0];
+    [bj3_title_panel setIgnoresMouseEvents:!visible];
+}
+
+static void bj3_show_fullscreen_controls(NSScreen *screen, NSWindow *over)
+{
+    bj3_hide_fullscreen_controls();
+    if (!screen || getenv("LP32_NO_FULLSCREEN_TITLE")) return;
+    NSRect screen_frame = [screen frame];
+    NSRect frame = NSMakeRect(NSMinX(screen_frame),
+                              NSMaxY(screen_frame) - bj3_menu_bar_height(screen) -
+                                  kBj3TitleBarHeight,
+                              NSWidth(screen_frame), kBj3TitleBarHeight);
+    LP32FullscreenTitlePanel *panel = [[LP32FullscreenTitlePanel alloc]
+        initWithContentRect:frame
+                  styleMask:NSWindowStyleMaskBorderless |
+                            NSWindowStyleMaskNonactivatingPanel
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    [panel setOpaque:NO];
+    [panel setBackgroundColor:[NSColor clearColor]];
+    [panel setHasShadow:YES];
+    [panel setHidesOnDeactivate:YES];
+    [panel setFloatingPanel:YES];
+    [panel setLevel:(over ? [over level] : NSStatusWindowLevel) + 1];
+    [panel setCollectionBehavior:NSWindowCollectionBehaviorFullScreenAuxiliary |
+                                 NSWindowCollectionBehaviorStationary];
+    NSVisualEffectView *bar = [[NSVisualEffectView alloc]
+        initWithFrame:NSMakeRect(0, 0, frame.size.width, frame.size.height)];
+    [bar setMaterial:NSVisualEffectMaterialTitlebar];
+    [bar setBlendingMode:NSVisualEffectBlendingModeBehindWindow];
+    [bar setState:NSVisualEffectStateActive];
+    NSString *window_title = [bj3_game_window title];
+    NSTextField *title = [NSTextField labelWithString:
+        [window_title length] ? window_title : @"Bejeweled 3"];
+    [title setFont:[NSFont titleBarFontOfSize:0]];
+    [title setTextColor:[NSColor labelColor]];
+    [title sizeToFit];
+    [title setFrameOrigin:NSMakePoint(floor((frame.size.width - NSWidth([title frame])) / 2),
+                                      floor((kBj3TitleBarHeight - NSHeight([title frame])) / 2))];
+    [bar addSubview:title];
+    const SEL actions[3] = {
+        @selector(closeGame:), @selector(hideGame:), @selector(leaveFullscreen:)};
+    enum { kLight = 14, kLightPitch = 20 };
+    LP32TrafficLightGroup *group = [[LP32TrafficLightGroup alloc]
+        initWithFrame:NSMakeRect(8, floor((kBj3TitleBarHeight - kLight) / 2),
+                                 2 * kLightPitch + kLight, kLight)];
+    for (int i = 0; i < 3; ++i) {
+        LP32TrafficLight *light = [[LP32TrafficLight alloc]
+            initWithFrame:NSMakeRect(i * kLightPitch, 0, kLight, kLight)];
+        light->kind_ = i;
+        light->target_ = panel;
+        light->action_ = actions[i];
+        [group addSubview:light];
+        [light release];
+    }
+    [bar addSubview:group];
+    [group release];
+    [panel setContentView:bar];
+    [bar release];
+    [panel setAlphaValue:0.0];
+    [panel setIgnoresMouseEvents:YES];
+    [panel orderFrontRegardless];
+    bj3_title_panel = panel;
+    bj3_title_screen = screen;
+    bj3_title_visible = false;
+    if (getenv("LP32_TEST_SHOW_FULLSCREEN_TITLE")) bj3_set_title_visible(true);
+}
+
+/* Per frame: reveal at the top edge, as AppKit reveals the menu bar; keep it
+   while the pointer is over the menu bar or title bar. */
+static void bj3_poll_fullscreen_title(void)
+{
+    if (!bj3_title_panel || !bj3_title_screen ||
+        getenv("LP32_TEST_SHOW_FULLSCREEN_TITLE")) return;
+    NSPoint mouse = [NSEvent mouseLocation];
+    NSRect screen_frame = [bj3_title_screen frame];
+    if (mouse.x < NSMinX(screen_frame) || mouse.x >= NSMaxX(screen_frame)) {
+        bj3_set_title_visible(false);
+        return;
+    }
+    double from_top = NSMaxY(screen_frame) - mouse.y;
+    if (from_top <= 2) {
+        bj3_set_title_visible(true);
+    } else if (from_top > bj3_menu_bar_height(bj3_title_screen) +
+                              kBj3TitleBarHeight + 8) {
+        bj3_set_title_visible(false);
+    }
+}
+
+/*
  * Retina rendering (Bejeweled 3).  The game's SexyOpenGLView gets a
  * best-resolution surface, so the window-system framebuffer is in backing
  * pixels while the game still sizes its viewport and scissor from view bounds
@@ -7937,6 +8185,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 NSWindow *gl_window = [[gl_context view] window];
 #pragma clang diagnostic pop
                 present_frame_with_stats(gl_context, gl_window, true);
+                bj3_poll_fullscreen_title();
                 bj3_run_test_green_button();
                 *result = 0;
                 return 1;
@@ -8110,6 +8359,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             [receiver isKindOfClass:[NSView class]]) {
             trace_guest_callers("exitFullScreenModeWithOptions:", arguments);
             bj3_game_fullscreen = false;
+            bj3_hide_fullscreen_controls();
             NSWindow *source = objc_getAssociatedObject(receiver, &guest_fullscreen_source_key);
             [(NSView *)receiver exitFullScreenModeWithOptions:object_for_argument(arguments[2])];
             if (source) {
@@ -8127,7 +8377,8 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                the operator out (no Cmd-Tab) and hides the surface from screen
                capture.  Present fullscreen on the current Space instead:
                auto-hide the dock/menu bar but keep switching enabled and do
-               not grab all screens. */
+               not grab all screens.  A title bar with traffic lights drops in
+               under the revealed menu bar (bj3_show_fullscreen_controls). */
             NSScreen *screen = object_for_argument(arguments[2]);
             if (!screen) screen = preferred_game_screen();
             NSDictionary *options = @{
@@ -8171,7 +8422,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 objc_setAssociatedObject(source, &guest_fullscreen_content_key, receiver, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
                 objc_setAssociatedObject(receiver, &guest_fullscreen_source_key, source, OBJC_ASSOCIATION_ASSIGN);
             }
-            if (entered) bj3_game_fullscreen = true;
+            if (entered) {
+                bj3_game_fullscreen = true;
+                bj3_show_fullscreen_controls(screen, fullscreen_window);
+            }
             *result = entered ? 1 : 0;
             return 1;
         }
