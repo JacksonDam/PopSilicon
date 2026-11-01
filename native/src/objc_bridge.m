@@ -4770,6 +4770,21 @@ static int objc_bridge32_dispatch_body(const char *import_name,
  * dispatch_named_import and objc_bridge32_dispatch_body entirely.  The chain
  * cases below call these same functions; keep them the only implementation.
  */
+/* LP32_TRACE_GUEST_CALLERS: list the guest code addresses on the stack above
+   a call's arguments, a cheap backtrace for the stripped guest image. */
+static void trace_guest_callers(const char *what, const uint32_t *arguments)
+{
+    if (!getenv("LP32_TRACE_GUEST_CALLERS") || !arguments) return;
+    uint32_t text_end = lp32_profile()->image_end;
+    fprintf(stderr, "compat32: guest callers of %s:", what);
+    for (int i = -1; i < 160; ++i) {
+        uint32_t value = arguments[i];
+        if (value >= 0x2000 && value < text_end && value < 0x00685000)
+            fprintf(stderr, " [%d]0x%08x", i, value);
+    }
+    fprintf(stderr, "\n");
+}
+
 #define FAST_GL(name) \
     static uint64_t fast_##name(const uint32_t *arguments, \
                                 uint32_t return_address)
@@ -7928,6 +7943,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         }
         if (strcmp(selector_name, "exitFullScreenModeWithOptions:") == 0 &&
             [receiver isKindOfClass:[NSView class]]) {
+            trace_guest_callers("exitFullScreenModeWithOptions:", arguments);
             NSWindow *source = objc_getAssociatedObject(receiver, &guest_fullscreen_source_key);
             [(NSView *)receiver exitFullScreenModeWithOptions:object_for_argument(arguments[2])];
             if (source) {
@@ -7939,6 +7955,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
             return 1;
         }
         if (strcmp(selector_name, "enterFullScreenMode:withOptions:") == 0) {
+            trace_guest_callers("enterFullScreenMode:withOptions:", arguments);
             /* Bejeweled 3 asks NSView to go fullscreen with options that
                capture the display and disable process switching, which locks
                the operator out (no Cmd-Tab) and hides the surface from screen

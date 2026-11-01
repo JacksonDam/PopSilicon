@@ -539,9 +539,10 @@ static bool guest_super_init(struct guest_objc_instance *inst,
     const float *r = (const float *)init_args;
     NSRect rect = NSMakeRect(r[0], r[1], r[2], r[3]);
     if (getenv("LP32_TRACE_DISPLAY"))
-        fprintf(stderr, "compat32: %s %s rect=(%.0f,%.0f %.0fx%.0f)\n",
+        fprintf(stderr, "compat32: %s %s rect=(%.0f,%.0f %.0fx%.0f) style=0x%x\n",
                 inst->cls->name, selector, rect.origin.x, rect.origin.y,
-                rect.size.width, rect.size.height);
+                rect.size.width, rect.size.height,
+                strncmp(selector, "initWithContentRect:", 20) == 0 ? init_args[4] : 0);
     id obj = [host alloc];
     if (!obj) return false;
     /* Map the companion to the guest block BEFORE running the initializer.
@@ -607,6 +608,8 @@ static bool guest_objc_super_message(struct guest_objc_instance *inst,
                                      const uint32_t *args, uint64_t *out)
 {
     if (!inst || !inst->companion || !selector) return false;
+    if (getenv("LP32_TRACE_OBJC_SELECTORS"))
+        fprintf(stderr, "compat32: guest super -[%s %s]\n", inst->cls->name, selector);
     Class superclass = class_getSuperclass(inst->cls->host_class);
     SEL sel = sel_registerName(selector);
     Method method = class_getInstanceMethod(superclass, sel);
