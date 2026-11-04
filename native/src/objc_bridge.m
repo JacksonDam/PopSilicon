@@ -95,6 +95,8 @@ static bool logged_proxy_exhaustion;
 static uint64_t objc_bridge_swap_count;
 static char guest_fullscreen_content_key;
 static char guest_fullscreen_source_key;
+static NSView *guest_fullscreen_view;
+static NSWindow *guest_fullscreen_windowed;
 
 /*
  * O(1) object -> proxy-index map (open addressing, append-only).  The
@@ -1167,6 +1169,24 @@ static NSScreen *preferred_game_screen(void)
             display_id_for_screen(screen) == primary_id ? " (primary fallback)" :
                                                           " (secondary)");
     return screen;
+}
+
+static bool guest_fullscreen_rect(NSScreen *screen, NSRect *rect)
+{
+    NSView *view = guest_fullscreen_view;
+    NSWindow *window = [view window];
+    if (!window || window == guest_fullscreen_windowed || [window screen] != screen)
+        return false;
+    *rect = [window convertRectToScreen:[view convertRect:[view bounds] toView:nil]];
+    rect->size = [view frame].size;
+    return true;
+}
+
+static void clear_guest_fullscreen_view(void)
+{
+    [guest_fullscreen_view release];
+    guest_fullscreen_view = nil;
+    guest_fullscreen_windowed = nil;
 }
 
 static CGDirectDisplayID preferred_game_display_id(void)
@@ -7913,6 +7933,7 @@ static int objc_bridge32_dispatch_body(const char *import_name,
         if (strcmp(selector_name, "exitFullScreenModeWithOptions:") == 0 &&
             [receiver isKindOfClass:[NSView class]]) {
             NSWindow *source = objc_getAssociatedObject(receiver, &guest_fullscreen_source_key);
+            if (guest_fullscreen_view == receiver) clear_guest_fullscreen_view();
             [(NSView *)receiver exitFullScreenModeWithOptions:object_for_argument(arguments[2])];
             if (source) {
                 if ([source contentView] != receiver) [source setContentView:receiver];
@@ -7938,8 +7959,20 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 NSFullScreenModeAllScreens : @NO,
             };
             NSWindow *source = [(NSView *)receiver window];
+            clear_guest_fullscreen_view();
+            guest_fullscreen_view = [receiver retain];
+            guest_fullscreen_windowed = source;
             BOOL entered = [(NSView *)receiver enterFullScreenMode:screen
                                                        withOptions:options];
+            if (!entered) clear_guest_fullscreen_view();
+            NSRect view_rect;
+            if (entered && guest_fullscreen_rect([[(NSView *)receiver window] screen], &view_rect)) {
+                NSRect screen_frame = [[[(NSView *)receiver window] screen] frame];
+                fprintf(stderr, "compat32: fullscreen view %.0fx%.0f at %.0f,%.0f on a %.0fx%.0f screen\n",
+                        view_rect.size.width, view_rect.size.height,
+                        view_rect.origin.x, view_rect.origin.y,
+                        screen_frame.size.width, screen_frame.size.height);
+            }
             /* Modern AppKit detaches the content view from its source window.
                Bejeweled still finds its fullscreen view through that window's
                contentView, including for input and the top-right toggle. */
@@ -8097,7 +8130,10 @@ static int objc_bridge32_dispatch_body(const char *import_name,
                 rect = NSMakeRect(0, 0, guest_display_mode.width,
                                   guest_display_mode.height);
             } else if (strcmp(selector_name, "frame") == 0) {
-                rect = [(NSScreen *)receiver frame];
+                if (![receiver isKindOfClass:[NSScreen class]] ||
+                    !guest_fullscreen_rect(receiver, &rect)) {
+                    rect = [(NSScreen *)receiver frame];
+                }
             } else {
                 rect = [(NSScreen *)receiver visibleFrame];
             }
