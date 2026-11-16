@@ -17,6 +17,12 @@ _run_compat32:
     pushq %r14
     pushq %r15
     subq $24, %rsp
+    cmpb $0, _lp32_load_data_segments(%rip)
+    je 1f
+    movw %ss, %ax
+    movw %ax, %ds
+    movw %ax, %es
+1:
     movl %edi, (%rsp)
     movl %edx, 4(%rsp)
     movl %esi, %r14d

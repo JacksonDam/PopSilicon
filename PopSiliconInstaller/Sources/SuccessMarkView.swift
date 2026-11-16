@@ -19,6 +19,6 @@ struct SuccessMarkView: View {
                 .animation(.easeOut(duration: 0.75), value: progress)
         }
         .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Installed successfully")
+        .compatAccessibilityLabel("Installed successfully")
     }
 }

@@ -6,7 +6,7 @@ struct SteamInstallationView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             if model.steamReplacementSucceeded {
-                Label("\(model.productName) \(model.steamCompletionLabel)", systemImage: "checkmark.circle.fill")
+                CompatLabel("\(model.productName) \(model.steamCompletionLabel)", systemImage: "checkmark.circle.fill")
                     .foregroundColor(.green)
                 if let backupURL = model.steamBackupURL {
                     Text("Original saved as \(backupURL.lastPathComponent).")
@@ -14,7 +14,7 @@ struct SteamInstallationView: View {
                         .foregroundColor(.gray)
                 }
             } else if let steamInstallationURL = model.steamInstallationURL {
-                Label(headline, systemImage: symbol)
+                CompatLabel(headline, systemImage: symbol)
                     .font(.headline)
                 Text(steamInstallationURL.path)
                     .font(.caption)

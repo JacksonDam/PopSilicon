@@ -9,7 +9,7 @@ struct ProductPickerView: View {
             VStack(alignment: .leading, spacing: 6) {
                 Text("PopSilicon Installer")
                     .font(.largeTitle.bold())
-                Text("Run the classic 32-bit PopCap Mac games on Apple silicon. Choose what to install.")
+                Text("Run the classic 32-bit PopCap Mac games on Apple silicon and Intel Macs. Choose what to install.")
                     .foregroundColor(.gray)
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -18,7 +18,7 @@ struct ProductPickerView: View {
             // lives here rather than behind a product and its game menu.
             if !model.updatableSteamGames.isEmpty || model.bulkUpdateSummary != nil {
                 VStack(alignment: .leading, spacing: 8) {
-                    Label(model.bulkUpdateHeadline, systemImage: model.bulkUpdateSymbol)
+                    CompatLabel(model.bulkUpdateHeadline, systemImage: model.bulkUpdateSymbol)
                         .font(.headline)
                     if let detail = model.bulkUpdateDetail {
                         Text(detail)
@@ -30,7 +30,7 @@ struct ProductPickerView: View {
                         Button(model.bulkUpdateActionTitle, action: model.requestBulkSteamUpdate)
                             .disabled(!model.canBulkUpdateSteam)
                         if model.isBulkUpdating {
-                            ProgressView().controlSize(.small)
+                            CompatSpinner()
                         }
                     }
                 }
@@ -60,12 +60,12 @@ struct ProductPickerView: View {
             model.selectProduct(product)
         } label: {
             HStack(spacing: 16) {
-                Image(systemName: product.symbol)
+                SymbolImage(product.symbol, size: 30)
                     .font(.system(size: 30))
                     .frame(width: 44)
                 VStack(alignment: .leading, spacing: 4) {
                     Text(product.displayName)
-                        .font(.title2.bold())
+                        .font(Font.compatTitle2.bold())
                     Text(product.gameList)
                         .foregroundColor(.gray)
                     if let note = steamNote(for: product) {
@@ -75,7 +75,7 @@ struct ProductPickerView: View {
                     }
                 }
                 Spacer()
-                Image(systemName: "chevron.right")
+                SymbolImage("chevron.right", size: 12)
                     .foregroundColor(.gray)
             }
             .padding(18)
@@ -91,7 +91,7 @@ struct ProductPickerView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("Install \(product.displayName)")
+        .compatAccessibilityLabel("Install \(product.displayName)")
     }
 
     private func steamNote(for product: Product) -> String? {

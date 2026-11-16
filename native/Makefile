@@ -1,7 +1,7 @@
 BUILD_DIR := build
 CLANG := $(shell xcrun --find clang)
 SDK := $(shell xcrun --sdk macosx --show-sdk-path)
-CFLAGS := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=11.0 -O2 -g -Wall -Wextra -Werror
+CFLAGS := -arch x86_64 -isysroot $(SDK) -mmacosx-version-min=10.15 -O2 -g -Wall -Wextra -Werror
 # __LINKEDIT must sit above the Mach header.  Left to itself the linker places
 # it directly after the __LEGACY reservation, at 0x80000000, below __TEXT.
 # dyld keeps the header-relative position of the export trie in 32 bits, so
@@ -48,7 +48,7 @@ $(BUILD_DIR)/game_loader: Makefile $(wildcard src/*.h src/*.inc) src/game_loader
 	fi
 	@legacy=$$(otool -l $@ | awk '/segname __LEGACY$$/ { getline; getline; print $$2; exit }'); \
 	if [ -z "$$legacy" ] || [ $$((legacy)) -eq 0 ]; then \
-		echo "game_loader: the linker moved the __LEGACY reservation into __DATA,__huge, which macOS refuses to run (Killed: 9); update the Command Line Tools so the linker accepts -no_huge" >&2; \
+		echo "game_loader: the linker moved the __LEGACY reservation into __DATA,__huge, which macOS refuses to run (Killed: 9)" >&2; \
 		rm -f $@; exit 1; \
 	fi
 	codesign --force --sign - $@

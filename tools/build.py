@@ -325,7 +325,7 @@ copy_clean(root/'native/vendor/bass/libbass.dylib',c/'MacOS/libbass.dylib')
 if steam_api:
     copy_clean(steam_api, c/'MacOS/lp32_steam_api.dylib')
     (c/'SharedSupport/steam-cloud').write_text('3590 RemoteStorage002\n')
-p=dict(source_info);p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier=game['bundle_identifier'],CFBundleName=game['bundle_name'],LSMinimumSystemVersion='11.0',NSHighResolutionCapable=False)
+p=dict(source_info);p.update(CFBundleExecutable='PeggleSilicon',CFBundleIdentifier=game['bundle_identifier'],CFBundleName=game['bundle_name'],LSMinimumSystemVersion='10.15.4',NSHighResolutionCapable=False)
 (c/'Info.plist').write_bytes(plistlib.dumps(p))
 subprocess.run(['xattr','-cr',str(bundle)],check=True)
 subprocess.run(['codesign','--force','--deep','--sign','-',str(bundle)],check=True)

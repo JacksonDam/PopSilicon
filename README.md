@@ -1,9 +1,11 @@
 # PopSilicon
 
-PopSilicon runs the original 32-bit Intel PopCap Mac games on Apple silicon by
-loading their i386 Mach-O image through Rosetta and translating the legacy
-Carbon, CoreFoundation, OpenGL, audio, libc, pthread, and C++ ABI calls to
-current macOS APIs. It ships as seven products built from the same runtime:
+PopSilicon runs the original 32-bit Intel PopCap Mac games on Apple silicon,
+and on Intel Macs running macOS 10.15.4 Catalina or later, by loading their
+i386 Mach-O image into an x86_64 process (through Rosetta on Apple silicon) and
+translating the legacy Carbon, CoreFoundation, OpenGL, audio, libc, pthread,
+and C++ ABI calls to current macOS APIs. It ships as seven products built from
+the same runtime:
 
 - **PeggleSilicon** for Peggle Deluxe 1.0.5 and Peggle Nights 1.0.4. Peggle Deluxe has been playtested through all of Adventure Mode stages and works well. Peggle Nights has been tested up to Stage 3-5 and seems to work well.
 - **BejeweledSilicon** for Bejeweled 3 1.1.12 and Bejeweled 2 Deluxe 1.0.0.
@@ -52,6 +54,19 @@ installs Rosetta (`softwareupdate --install-rosetta --agree-to-license`) when
 `arch -x86_64` cannot run; a Mac that has only ever run native apps, including
 today's Steam client, does not have it yet.
 
+### Intel Macs (experimental)
+
+On an Intel Mac the same loader runs natively, without Rosetta. It needs
+macOS 10.15.4 or later: earlier Catalina releases do not let a 64-bit app
+create the 32-bit code segment the games run in. macOS 10.14 and earlier still
+run these games directly and do not need PopSilicon. Intel support is early
+and has not been fully tested. When reporting a problem, it would be good if
+you could include the installer's **Build output** and the game's log from
+`~/Library/Logs` (for example `~/Library/Logs/Bejeweled3/last-run.log`), which
+states whether the loader ran natively or under Rosetta. The graphical
+installer cannot be built on macOS older than 14.5, including Catalina, so use
+the command-line build below there.
+
 Build the game from the supplied game copy:
 
 ```sh
@@ -83,7 +98,9 @@ python3 tools/build_installer.py
 open "build/PopSilicon Installer.app"
 ```
 
-The installer targets macOS 11 or newer.
+Building the installer needs Swift 6, which comes with the Command Line Tools
+for Xcode 16 or later (macOS 14.5 or newer). On an older macOS, use the
+command-line build above instead.
 Keep the helper app inside this repository so it can find the native runtime
 and build script.
 
@@ -122,7 +139,7 @@ Mac OS X 10.4 dyld's private globals and cannot run here, so the loader skips
 it — and, because the stub took over the executable's first module initializer,
 recovers the one it displaced from the tail jump every copy of the stub ends
 with, so the game's own initializer still runs.) After confirmation, the
-original Steam app is renamed to `<name>.app.bak` and the Apple silicon build
+original Steam app is renamed to `<name>.app.bak` and the PopSilicon build
 takes its place under the executable name Steam launches (`Peggle` for Deluxe,
 `Peggle Nights` for Nights, `Bejeweled3` for Bejeweled 3, `Bejeweled 2` for
 Bejeweled 2, `Chuzzle` for Chuzzle, `PlantsvsZombies` for Plants vs. Zombies,

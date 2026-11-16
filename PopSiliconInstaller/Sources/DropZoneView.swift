@@ -1,5 +1,4 @@
 import SwiftUI
-import UniformTypeIdentifiers
 
 struct DropZoneView: View {
     @ObservedObject var model: InstallerModel
@@ -11,7 +10,7 @@ struct DropZoneView: View {
                 Text("Installed \(model.productName) successfully!")
                     .font(.headline)
             } else {
-                Image(systemName: "arrow.down.app")
+                SymbolImage("arrow.down.app", size: 34)
                     .font(.system(size: 34))
                     .foregroundColor(.accentColor)
 
@@ -52,10 +51,9 @@ struct DropZoneView: View {
         )
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(model.selectedGame.displayName) application drop area")
-        .accessibilityHint("Drag the original \(model.selectedGame.displayName) application here")
-        .onDrop(
-            of: [UTType.fileURL],
+        .compatAccessibilityLabel("\(model.selectedGame.displayName) application drop area")
+        .compatAccessibilityHint("Drag the original \(model.selectedGame.displayName) application here")
+        .compatFileDrop(
             isTargeted: $model.isDropTargeted,
             perform: model.acceptDrop(providers:)
         )

@@ -53,12 +53,12 @@ struct ContentView: View {
                     Button {
                         model.chooseAnotherProduct()
                     } label: {
-                        Label("PopSilicon", systemImage: "chevron.left")
+                        CompatLabel("PopSilicon", systemImage: "chevron.left", iconSize: 11)
                     }
                     .disabled(model.isBuilding)
-                    .help("Choose a different product")
+                    .compatHelp("Choose a different product")
                 }
-                Text("Run \(product.gameList) on Apple silicon")
+                Text("Run \(product.gameList) on Apple silicon and Intel Macs")
                     .foregroundColor(.gray)
             }
 
@@ -99,8 +99,7 @@ struct ContentView: View {
 
             HStack {
                 if model.isBuilding {
-                    ProgressView()
-                        .controlSize(.small)
+                    CompatSpinner()
                     Text(model.buildProgress ?? "Building \(product.displayName)…")
                         .foregroundColor(.gray)
                         .lineLimit(2)
@@ -114,18 +113,18 @@ struct ContentView: View {
 
                 Button("Install \(product.displayName)", action: model.export)
                 .buttonStyle(DefaultButtonStyle())
-                .controlSize(.large)
+                .compatLargeControlSize()
                 .disabled(!model.canExport)
             }
 
             if let errorMessage = model.errorMessage {
-                Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                CompatLabel(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .foregroundColor(.red)
                     .fixedSize(horizontal: false, vertical: true)
             }
 
             if let buildOutput = model.buildOutput, !buildOutput.isEmpty {
-                DisclosureGroup("Build output", isExpanded: $model.isBuildOutputExpanded) {
+                CompatDisclosureGroup("Build output", isExpanded: $model.isBuildOutputExpanded) {
                     ScrollView([.vertical, .horizontal]) {
                         Text(buildOutput)
                             .font(.system(.caption, design: .monospaced))
@@ -140,7 +139,10 @@ struct ContentView: View {
                             .stroke(Color.gray.opacity(0.3))
                     )
                 }
-                .onChange(of: model.isBuildOutputExpanded) { expanded in
+                .compatOnChange(
+                    of: model.isBuildOutputExpanded,
+                    publisher: model.$isBuildOutputExpanded
+                ) { expanded in
                     guard expanded else { return }
                     DispatchQueue.main.async {
                         expandWindowForBuildOutput()

@@ -1763,9 +1763,12 @@ static void activate_game_application(void)
         }];
     }
     [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 140000
     if (@available(macOS 14.0, *)) {
         [NSApp activate];
-    } else {
+    } else
+#endif
+    {
         [NSApp activateIgnoringOtherApps:YES];
     }
     /* A terminal-launched process may not truly become frontmost, so the real

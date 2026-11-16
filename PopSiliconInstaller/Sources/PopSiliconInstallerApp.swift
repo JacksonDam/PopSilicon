@@ -1,6 +1,6 @@
 import SwiftUI
 
-@main
+@available(macOS 11.0, *)
 struct PopSiliconInstallerApp: App {
     @StateObject private var model = InstallerModel()
 

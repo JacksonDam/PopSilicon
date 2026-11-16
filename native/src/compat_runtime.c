@@ -41,6 +41,7 @@ extern uint32_t run_compat32(uint32_t eip, uint32_t esp, uint16_t cs32);
 extern void lp32_import_gateway(void);
 
 uint16_t lp32_cs32;
+uint8_t lp32_load_data_segments;
 _Thread_local int lp32_leave_guest;
 static _Thread_local uint32_t lp32_stack_pop;
 void compat_runtime32_struct_return(void) { lp32_stack_pop = 4; }
@@ -1140,7 +1141,13 @@ static int allocate_cs32(void)
     entry.code.granular = DESC_GRAN_PAGE;
 
     const int index = 32;
-    if (i386_set_ldt(index, &entry, 1) < 0) return runtime_error("i386_set_ldt(cs32)");
+    if (i386_set_ldt(index, &entry, 1) < 0) {
+        if (errno == EPERM && !process_is_translated()) {
+            fprintf(stderr, "compat32: this macOS release does not let 64-bit apps "
+                            "run 32-bit code; update to macOS 10.15.4 or later\n");
+        }
+        return runtime_error("i386_set_ldt(cs32)");
+    }
     lp32_cs32 = (uint16_t)((index << 3) | 7);
     return 0;
 }
@@ -3428,10 +3435,13 @@ static void peggle_apply_relocations(struct macho_image32 *image);
 
 int compat_runtime32_initialize(struct macho_image32 *image)
 {
-    if (!process_is_translated()) {
-        errno = ENOTSUP;
-        return runtime_error("x86_64 host is not running through Rosetta");
-    }
+    const bool translated = process_is_translated();
+    const char *segments_text = getenv("LP32_LOAD_DATA_SEGMENTS");
+    lp32_load_data_segments = segments_text && segments_text[0] ?
+        strcmp(segments_text, "0") != 0 : !translated;
+    fprintf(stderr, "compat32: host is %s x86_64, data segments %s\n",
+            translated ? "Rosetta" : "native",
+            lp32_load_data_segments ? "loaded" : "left as is");
     current_image = image;
     import_stage_table = calloc(image->import_count ? image->import_count : 1,
                                 sizeof(*import_stage_table));

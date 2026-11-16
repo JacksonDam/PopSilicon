@@ -799,7 +799,9 @@ static void pg_enter_host_fullscreen(struct pg_win *w)
     [w->window setFrame:[screen frame] display:YES];
     if ([[w->window contentView] isKindOfClass:[PeggleLetterboxView class]]) {
         CGFloat inset = 0;
+#if __MAC_OS_X_VERSION_MAX_ALLOWED >= 120000
         if (@available(macOS 12.0, *)) inset = [screen safeAreaInsets].top;
+#endif
         [(PeggleLetterboxView *)[w->window contentView] setTopInset:inset];
     }
     if (w->render_view) [w->window makeFirstResponder:w->render_view];

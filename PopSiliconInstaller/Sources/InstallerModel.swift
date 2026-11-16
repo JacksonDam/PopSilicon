@@ -1,7 +1,6 @@
 import AppKit
 import Combine
 import Foundation
-import UniformTypeIdentifiers
 
 /// Which confirmation the installer's single alert presentation is showing.
 /// SwiftUI honours one alert per view hierarchy, and the chooser sits inside
@@ -321,7 +320,7 @@ final class InstallerModel: ObservableObject {
 
     func acceptDrop(providers: [NSItemProvider]) -> Bool {
         guard let provider = providers.first(where: {
-            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
+            $0.hasItemConformingToTypeIdentifier(fileURLTypeIdentifier)
         }) else {
             return false
         }

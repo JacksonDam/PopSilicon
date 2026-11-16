@@ -27,30 +27,50 @@ if not swift_sources:
 bundle = args.output.expanduser()
 bundle.parent.mkdir(parents=True, exist_ok=True)
 
+targets = {
+    'arm64': 'arm64-apple-macosx11.0',
+    'x86_64': 'x86_64-apple-macosx10.15',
+}
+
+swiftc = pathlib.Path(subprocess.run(
+    ['xcrun', '--find', 'swiftc'], check=True, capture_output=True, text=True
+).stdout.strip())
+concurrency_runtime = swiftc.parent.parent / 'lib/swift-5.5/macosx/libswift_Concurrency.dylib'
+if not concurrency_runtime.is_file():
+    raise SystemExit(f'missing the Swift concurrency back-deployment runtime: {concurrency_runtime}')
+
 with tempfile.TemporaryDirectory(prefix='popsilicon-installer-') as temporary:
+    slices = []
+    for arch, target in targets.items():
+        executable = pathlib.Path(temporary) / f'PopSiliconInstaller-{arch}'
+        subprocess.run(
+            [
+                'xcrun', 'swiftc',
+                '-swift-version', '6',
+                '-target', target,
+                '-O',
+                '-whole-module-optimization',
+                '-framework', 'AppKit',
+                '-framework', 'SwiftUI',
+                '-Xlinker', '-weak_framework', '-Xlinker', 'UniformTypeIdentifiers',
+                '-Xlinker', '-rpath', '-Xlinker', '@executable_path/../Frameworks',
+                *map(str, swift_sources),
+                '-o', str(executable),
+            ],
+            check=True,
+            cwd=root,
+        )
+        slices.append(executable)
     executable = pathlib.Path(temporary) / 'PopSiliconInstaller'
-    subprocess.run(
-        [
-            'xcrun', 'swiftc',
-            '-swift-version', '6',
-            '-target', 'arm64-apple-macosx11.0',
-            '-O',
-            '-whole-module-optimization',
-            '-framework', 'AppKit',
-            '-framework', 'SwiftUI',
-            '-framework', 'UniformTypeIdentifiers',
-            *map(str, swift_sources),
-            '-o', str(executable),
-        ],
-        check=True,
-        cwd=root,
-    )
+    subprocess.run(['lipo', '-create', *map(str, slices), '-output', str(executable)], check=True)
 
     if bundle.exists():
         shutil.rmtree(bundle)
     contents = bundle / 'Contents'
     (contents / 'MacOS').mkdir(parents=True)
+    (contents / 'Frameworks').mkdir()
     shutil.copy2(executable, contents / 'MacOS/PopSiliconInstaller')
+    shutil.copy2(concurrency_runtime, contents / 'Frameworks/libswift_Concurrency.dylib')
     shutil.copy2(source_root / 'Info.plist', contents / 'Info.plist')
 
 subprocess.run(['codesign', '--force', '--deep', '--sign', '-', str(bundle)], check=True)

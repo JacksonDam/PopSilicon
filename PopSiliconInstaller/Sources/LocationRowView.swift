@@ -7,7 +7,7 @@ struct LocationRowView: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
-            Label(title, systemImage: "folder")
+            CompatLabel(title, systemImage: "folder")
                 .frame(width: 140, alignment: .leading)
             Text(value)
                 .lineLimit(2)
